@@ -1,0 +1,70 @@
+version: '3.9'
+
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+# Requires: NVIDIA GPU with 16GB+ VRAM, HF_TOKEN env var
+
+services:
+  api:
+    environment:
+      AI_PROVIDER: vllm
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: khidmeti-vllm
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - '8000:8000'
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+    command: >
+      --model google/gemma-4-E4B-it
+      --limit-mm-per-prompt image=4,audio=1
+      --gpu-memory-utilization 0.90
+      --max-model-len 8192
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - khidmeti-network
+
+  # Embedding via Ollama (lighter than running full vLLM for embeddings)
+  ollama-embed:
+    image: ollama/ollama:latest
+    container_name: khidmeti-ollama-embed
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+    ports:
+      - '11434:11434'
+    volumes:
+      - ollama-embed-models:/root/.ollama
+    networks:
+      - khidmeti-network
+
+  ollama-embed-init:
+    image: ollama/ollama:latest
+    container_name: khidmeti-ollama-embed-init
+    depends_on:
+      - ollama-embed
+    networks:
+      - khidmeti-network
+    entrypoint: >
+      /bin/sh -c "
+        sleep 10;
+        ollama pull nomic-embed-text;
+        echo 'Embedding model ready.';
+        exit 0;
+      "
+    environment:
+      OLLAMA_HOST: http://ollama-embed:11434
+
+volumes:
+  vllm-models:
+  ollama-embed-models:
