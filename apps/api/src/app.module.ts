@@ -1,69 +1,40 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
-import { RedisModule } from '@nestjs-modules/ioredis';
-import Joi from 'joi';
-import { AppConfigModule } from './config/app.config';
-import { DatabaseConfigModule, DatabaseConfigService } from './config/database.config';
-import { FirebaseConfigModule } from './config/firebase.config';
-import { AuthModule } from './modules/auth/auth.module';
-import { UsersModule } from './modules/users/users.module';
-import { WorkersModule } from './modules/workers/workers.module';
-import { ServiceRequestsModule } from './modules/service-requests/service-requests.module';
-import { BidsModule } from './modules/bids/bids.module';
-import { NotificationsModule } from './modules/notifications/notifications.module';
-import { LocationModule } from './modules/location/location.module';
-import { AiModule } from './modules/ai/ai.module';
-import { MediaModule } from './modules/media/media.module';
+import { ThrottlerModule } from '@nestjs/throttler';
+import { DatabaseModule } from './database/database.module';
+import { QdrantModule } from './qdrant/qdrant.module';
 
 @Module({
   imports: [
-    // Config with validation — crashes on startup if required vars missing
+    // ── Config (env vars) ──────────────────────────────────────────────────
     ConfigModule.forRoot({
       isGlobal: true,
-      validationSchema: Joi.object({
-        NODE_ENV: Joi.string().valid('development', 'production', 'test').default('development'),
-        PORT: Joi.number().default(3000),
-        MONGODB_URI: Joi.string().required(),
-        REDIS_URL: Joi.string().required(),
-        REDIS_PASSWORD: Joi.string().required(),
-        FIREBASE_PROJECT_ID: Joi.string().required(),
-        FIREBASE_CLIENT_EMAIL: Joi.string().required(),
-        FIREBASE_PRIVATE_KEY: Joi.string().required(),
-        AI_PROVIDER: Joi.string().valid('gemini', 'ollama', 'vllm').default('gemini'),
-        MINIO_ENDPOINT: Joi.string().required(),
-        MINIO_ACCESS_KEY: Joi.string().required(),
-        MINIO_SECRET_KEY: Joi.string().required(),
-        QDRANT_URL: Joi.string().required(),
-      }),
+      envFilePath: '../../.env',
     }),
 
-    // MongoDB
+    // ── MongoDB ────────────────────────────────────────────────────────────
     MongooseModule.forRootAsync({
-      useClass: DatabaseConfigService,
-    }),
-
-    // Redis
-    RedisModule.forRootAsync({
-      useFactory: () => ({
-        type: 'single',
-        url: process.env['REDIS_URL'] ?? '',
-        options: { password: process.env['REDIS_PASSWORD'] },
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        uri: config.getOrThrow<string>('MONGO_URI'),
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000,
       }),
     }),
 
-    AppConfigModule,
-    DatabaseConfigModule,
-    FirebaseConfigModule,
-    AuthModule,
-    UsersModule,
-    WorkersModule,
-    ServiceRequestsModule,
-    BidsModule,
-    NotificationsModule,
-    LocationModule,
-    AiModule,
-    MediaModule,
+    // ── Rate limiting ──────────────────────────────────────────────────────
+    ThrottlerModule.forRoot([
+      { name: 'short', ttl: 1000, limit: 20 },
+      { name: 'medium', ttl: 10000, limit: 100 },
+      { name: 'long', ttl: 60000, limit: 300 },
+    ]),
+
+    // ── Domain modules ─────────────────────────────────────────────────────
+    DatabaseModule,
+    QdrantModule,
   ],
 })
 export class AppModule {}
