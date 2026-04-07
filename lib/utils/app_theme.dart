@@ -55,9 +55,11 @@ class AppTheme {
   //     e.g. darkBgAppBar = darkBackground @ 80 % opacity.
   //
   // Alpha reference (opacity → hex):
-  //   10% → 0x1A  |  15% → 0x26  |  20% → 0x33  |  35% → 0x59
-  //   50% → 0x80  |  60% → 0x99  |  70% → 0xB3  |  80% → 0xCC
-  //   90% → 0xE6
+  //   4%  → 0x0A  |  6%  → 0x0F  |  7%  → 0x12  |  8%  → 0x14
+  //   10% → 0x1A  |  12% → 0x1F  |  15% → 0x26  |  18% → 0x2E
+  //   20% → 0x33  |  25% → 0x40  |  30% → 0x4D  |  35% → 0x59
+  //   45% → 0x73  |  50% → 0x80  |  60% → 0x99  |  70% → 0xB3
+  //   80% → 0xCC  |  90% → 0xE6
   // ==========================================================
 
   // ── Dark — app bar background (darkBackground @ 80%) ─────────────────────
@@ -86,8 +88,12 @@ class AppTheme {
   static const Color darkErrorSubtle = Color(0x1AF87171);
 
   // ── Dark — muted error icon color (darkError @ 60%) ──────────────────────
-  // [C10]: used in SettingsErrorView icon color, dark branch.
   static const Color darkErrorMuted = Color(0x99F87171);
+
+  // ── Dark — social button surface (darkSurface @ 50%) ─────────────────────
+  // FIX [Col-OPAC]: darkSurface.withOpacity(0.5) → pre-baked const token.
+  // darkSurface #141028 @ 50% → alpha 0x80
+  static const Color darkSurfaceHalf = Color(0x80141028);
 
   // ── Light — app bar background (lightBackground @ 90%) ───────────────────
   static const Color lightBgAppBar = Color(0xE6F8F7FF);
@@ -111,59 +117,107 @@ class AppTheme {
   static const Color lightErrorSubtle = Color(0x1ADC2626);
 
   // ── Light — muted error icon color (lightError @ 60%) ────────────────────
-  // [C11]: used in SettingsErrorView icon color, light branch.
   static const Color lightErrorMuted = Color(0x99DC2626);
+
+  // ==========================================================
+  // 🎨 AUTH / SHEET OPACITY-BAKED TOKENS
+  // ==========================================================
+
+  // ── Auth background radial halo ───────────────────────────────────────────
+  // darkAccent #4F46E5 @ 18% → alpha 0x2E
+  static const Color darkAccentHalo  = Color(0x2E4F46E5);
+  // lightAccent #4F46E5 @ 7%  → alpha 0x12
+  static const Color lightAccentHalo = Color(0x124F46E5);
+
+  // ── Accent box-shadow colour (darkAccent @ 35%) ───────────────────────────
+  // Used for logo orb, auth submit button, and any elevated accent surface.
+  // NOTE: same hex value as profileCardShadow (Color(0x594F46E5)). Kept as
+  // a separate named token to allow future divergence between profile card
+  // shadows and auth element shadows without a breaking rename.
+  // darkAccent #4F46E5 @ 35% → alpha 0x59
+  static const Color accentShadow = Color(0x594F46E5);
+
+  // ── Accent disabled background (darkAccent @ 45%) ─────────────────────────
+  // Used for the auth submit button in its disabled state.
+  // darkAccent #4F46E5 @ 45% → alpha 0x73
+  static const Color accentDisabledFill = Color(0x734F46E5);
+
+  // ── Accent selected tile fill (accent @ 15%) ─────────────────────────────
+  // Used in ProfessionPickerSheet selected tile background.
+  // Both themes share the same accent colour today (#4F46E5).
+  // accent #4F46E5 @ 15% → alpha 0x26
+  static const Color accentSelectedFill = Color(0x264F46E5);
+
+  // ── Sheet drag handle ─────────────────────────────────────────────────────
+  // white @ 15% → alpha 0x26
+  static const Color sheetHandleDark  = Color(0x26FFFFFF);
+  // black @ 12% → alpha 0x1F
+  static const Color sheetHandleLight = Color(0x1F000000);
+
+  // ── Warning subtle fill — lockout / rate-limit banner ────────────────────
+  // darkWarning #FBBF24 @ 8% → alpha 0x14
+  static const Color darkWarningSubtle  = Color(0x14FBBF24);
+  // lightWarning #D97706 @ 8% → alpha 0x14
+  static const Color lightWarningSubtle = Color(0x14D97706);
+
+  // ── Warning border — lockout / rate-limit banner ──────────────────────────
+  // darkWarning #FBBF24 @ 30% → alpha 0x4D
+  static const Color darkWarningBorder  = Color(0x4DFBBF24);
+  // lightWarning #D97706 @ 30% → alpha 0x4D
+  static const Color lightWarningBorder = Color(0x4DD97706);
+
+  // ── Surface tile unselected fill ──────────────────────────────────────────
+  // white @ 6% → alpha 0x0F
+  static const Color darkTileFill  = Color(0x0FFFFFFF);
+  // black @ 4% → alpha 0x0A
+  static const Color lightTileFill = Color(0x0A000000);
+
+  // ── Surface tile unselected border ────────────────────────────────────────
+  // white @ 10% → alpha 0x1A
+  static const Color darkTileBorder  = Color(0x1AFFFFFF);
+  // black @ 8% → alpha 0x14
+  static const Color lightTileBorder = Color(0x14000000);
+
+  // ── Social button border (dark theme) ────────────────────────────────────
+  // white @ 18% → alpha 0x2E
+  static const Color darkSocialBorder = Color(0x2EFFFFFF);
+
+  // ── Back button circular container fill ───────────────────────────────────
+  // white @ 8% → alpha 0x14
+  static const Color darkBackButtonFill  = Color(0x14FFFFFF);
+  // black @ 6% → alpha 0x0F
+  static const Color lightBackButtonFill = Color(0x0F000000);
+
+  // ── Checkbox unchecked border ─────────────────────────────────────────────
+  // white @ 25% → alpha 0x40
+  static const Color darkCheckboxBorder  = Color(0x40FFFFFF);
+  // black @ 20% → alpha 0x33
+  static const Color lightCheckboxBorder = Color(0x33000000);
 
   // ==========================================================
   // 🎨 OVERLAY TOKENS
   // ==========================================================
 
-  // ── Full-screen loading overlay (black @ 35%) ─────────────────────────────
-  // [C1]: used in SettingsScreen._FullScreenOverlay during sign-out / delete.
-  // Replaces colorScheme.scrim.withOpacity(0.35) — pre-baked as a const token.
-  static const Color overlayScrim35 = Color(0x59000000); // black @35%
+  static const Color overlayScrim35 = Color(0x59000000);
 
   // ==========================================================
   // 🎨 PROFILE CARD TOKENS
   // ==========================================================
 
-  // ── Card border stroke (white @ 20%) ─────────────────────────────────────
-  // [C2]: used for the card Container border.all colour.
-  static const Color profileCardBorder = Color(0x33FFFFFF); // white @20%
-
-  // ── Badge fill (white @ 20%) ─────────────────────────────────────────────
-  // [W9]: semantically distinct from profileCardBorder even though the current
-  // value is identical (white @20%). Separate token prevents future divergence
-  // if the badge fill and card border colours are updated independently.
-  static const Color profileCardBadgeFill = Color(0x33FFFFFF); // white @20%
-
-  // ── Card drop-shadow colour (darkAccent @ 35%) ────────────────────────────
-  // [C3]: used in ProfileCard BoxShadow. Baked from darkAccent #4F46E5 @35%.
-  static const Color profileCardShadow = Color(0x594F46E5); // darkAccent @35%
-
-  // ── Avatar border ring (white @ 50%) ─────────────────────────────────────
-  // [C4]: passed to AppUserAvatar.borderColor.
-  static const Color profileCardAvatarBorder = Color(0x80FFFFFF); // white @50%
-
-  // ── Rating text colour (white @ 90%) ─────────────────────────────────────
-  // [C5]: used for the star-rating TextStyle colour.
-  static const Color profileCardRatingText = Color(0xE6FFFFFF); // white @90%
+  static const Color profileCardBorder      = Color(0x33FFFFFF);
+  static const Color profileCardBadgeFill   = Color(0x33FFFFFF);
+  static const Color profileCardShadow      = Color(0x594F46E5);
+  static const Color profileCardAvatarBorder= Color(0x80FFFFFF);
+  static const Color profileCardRatingText  = Color(0xE6FFFFFF);
 
   // ==========================================================
   // 🎨 SETTINGS ICON COLOUR TOKENS
   // ==========================================================
 
-  // [C6]: notifications tile icon — indigo-400 from the Tailwind palette.
-  static const Color iconIndigo = Color(0xFF6366F1);
-
-  // [C7]: theme tile icon — violet-500 from the Tailwind palette.
-  static const Color iconViolet = Color(0xFF8B5CF6);
-
-  // [C8]: edit-profile tile icon — emerald-500 from the Tailwind palette.
+  static const Color iconIndigo  = Color(0xFF6366F1);
+  static const Color iconViolet  = Color(0xFF8B5CF6);
   static const Color iconEmerald = Color(0xFF10B981);
-
-  // [C9]: help tile icon — pink-500 from the Tailwind palette.
-  static const Color iconPink = Color(0xFFEC4899);
+  static const Color iconPink    = Color(0xFFEC4899);
 
   // ==========================================================
   // 🎨 TOKENS — misc
@@ -177,24 +231,12 @@ class AppTheme {
     Shadow(color: Color(0xAA000000), blurRadius: 8, offset: Offset(0, 2)),
   ];
 
-  static const Color promoBlueDark          = Color(0xFF60A5FA);
-  static const Color promoBlueLight         = Color(0xFF2563EB);
+  static const Color promoBlueDark  = Color(0xFF60A5FA);
+  static const Color promoBlueLight = Color(0xFF2563EB);
 
-  // [W8] darkSecondaryTextWcag: used in dark textTheme for slots ≤ 13sp to
-  // satisfy WCAG AA contrast (≥ 4.5:1) against darkBackground (#080510).
-  //
-  // Contrast analysis:
-  //   darkSecondaryText  (#7A6E96) vs #080510 ≈ 4.54:1  — passes AA by thin margin
-  //   darkSecondaryTextWcag (#9B91C0) vs #080510 ≈ 6.1:1 — comfortable AA pass
-  //
-  // At small sizes (≤ 13sp, weight ≤ 600) the 4.5:1 threshold applies, so the
-  // thin margin of darkSecondaryText is a compliance risk. WCAG token is wired
-  // to titleSmall (13sp/w600), bodySmall (12sp), and labelMedium (12sp/w600)
-  // in the dark textTheme. labelSmall uses darkText (high-contrast) and is
-  // unaffected.
-  static const Color darkSecondaryTextWcag  = Color(0xFF9B91C0);
+  static const Color darkSecondaryTextWcag = Color(0xFF9B91C0);
 
-  static const Color overlayDark            = Color(0x73000000);
+  static const Color overlayDark = Color(0x73000000);
 
   // ==========================================================
   // 🎨 MODAL SHADOW TOKENS
@@ -243,50 +285,18 @@ class AppTheme {
   static const Color darkAuthHeroTop    = Color(0xFF120820);
 
   // ==========================================================
-  // 🎨 STATUS COLOUR TOKENS — complete semantic set
-  //
-  // Design contract:
-  //   • Every ServiceStatus lifecycle phase gets its own dark + light token.
-  //   • getStatusColor() references ONLY these tokens — no inline
-  //     .withOpacity() calls, no accent re-use at the call site.
-  //   • Opacity-baked tokens encode their alpha directly in the hex value
-  //     so the tokens remain compile-time constants.
-  //   • Adding a new ServiceStatus: (1) add tokens here, (2) add a case in
-  //     getStatusColor(), (3) the compiler will enforce exhaustiveness.
-  //
-  // Lifecycle:
-  //   open / pending
-  //     → awaitingSelection
-  //     → bidSelected / accepted
-  //     → inProgress
-  //     → completed
-  //     ↘ cancelled / declined / expired
+  // 🎨 STATUS COLOUR TOKENS
   // ==========================================================
 
-  /// open / pending — dimmed accent; "waiting, no action yet".
-  /// Alpha 0xCC = 204 ≈ 80% — baked in so the token is const-safe.
-  /// Both themes share the same hue (darkAccent == lightAccent == #4F46E5).
   static const Color statusOpenDark  = Color(0xCC4F46E5);
   static const Color statusOpenLight = Color(0xCC4F46E5);
 
-  /// awaiting selection — warning amber; client must choose a bid urgently.
-  /// Delegates to darkWarning / lightWarning (no separate alias needed).
-
-  /// bid selected / accepted — calm blue; a worker is confirmed.
-  /// bidSelected and accepted share this token: both mean "a specific worker
-  /// is engaged" and distinguishing them visually adds no user value.
   static const Color statusAcceptedDark  = Color(0xFF60A5FA);
   static const Color statusAcceptedLight = Color(0xFF2563EB);
 
-  /// in progress — violet; active work underway, distinct from "confirmed".
   static const Color statusInProgressDark  = Color(0xFFA78BFA);
   static const Color statusInProgressLight = Color(0xFF7C3AED);
 
-  /// completed — success green. Delegates to darkSuccess / lightSuccess.
-
-  /// cancelled / declined / expired — muted red; terminal negative outcome.
-  /// All three share this token: the distinction between them is handled by
-  /// status labels and icons, not colour.
   static const Color statusCancelledDark  = Color(0xFFF87171);
   static const Color statusCancelledLight = Color(0xFFDC2626);
 
@@ -367,7 +377,7 @@ class AppTheme {
           elevation:       0,
           minimumSize:     const Size(double.infinity, AppConstants.buttonHeight),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppConstants.radiusLg)),
-          textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: -0.2, fontFamily: 'Inter'),
+          textStyle: const TextStyle(fontSize: AppConstants.buttonFontSize, fontWeight: FontWeight.w700, letterSpacing: -0.2, fontFamily: 'Inter'),
         ),
       ),
       textButtonTheme: TextButtonThemeData(
@@ -558,7 +568,7 @@ class AppTheme {
           elevation:       0,
           minimumSize:     const Size(double.infinity, AppConstants.buttonHeight),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppConstants.radiusLg)),
-          textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: -0.2, fontFamily: 'Inter'),
+          textStyle: const TextStyle(fontSize: AppConstants.buttonFontSize, fontWeight: FontWeight.w700, letterSpacing: -0.2, fontFamily: 'Inter'),
         ),
       ),
       textButtonTheme: TextButtonThemeData(
@@ -681,7 +691,6 @@ class AppTheme {
   // 🎨 HELPER METHODS
   // ==========================================================
 
-  /// Returns the semantic colour for a given [ServiceStatus].
   static Color getStatusColor(ServiceStatus status, bool isDark) {
     switch (status) {
       case ServiceStatus.open:
