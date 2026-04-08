@@ -7,6 +7,13 @@ import { QdrantModule } from './qdrant/qdrant.module';
 import { FirebaseConfigModule } from './config/firebase.config';
 import { AiModule } from './modules/ai/ai.module';
 import { MediaModule } from './modules/media/media.module';
+import { UsersModule } from './modules/users/users.module';
+import { WorkersModule } from './modules/workers/workers.module';
+import { ServiceRequestsModule } from './modules/service-requests/service-requests.module';
+import { BidsModule } from './modules/bids/bids.module';
+import { LocationModule } from './modules/location/location.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
+import { HealthController } from './health.controller';
 
 @Module({
   imports: [
@@ -24,10 +31,10 @@ import { MediaModule } from './modules/media/media.module';
       imports:    [ConfigModule],
       inject:     [ConfigService],
       useFactory: (config: ConfigService) => ({
-        uri:                       config.getOrThrow<string>('MONGODB_URI'),
-        maxPoolSize:               10,
-        serverSelectionTimeoutMS:  5000,
-        socketTimeoutMS:           45000,
+        uri:                      config.getOrThrow<string>('MONGODB_URI'),
+        maxPoolSize:              10,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS:          45000,
       }),
     }),
 
@@ -43,6 +50,13 @@ import { MediaModule } from './modules/media/media.module';
     QdrantModule,
     AiModule,
     MediaModule,
+    UsersModule,
+    WorkersModule,
+    ServiceRequestsModule,
+    BidsModule,
+    LocationModule,
+    NotificationsModule,
   ],
+  controllers: [HealthController],
 })
 export class AppModule {}
