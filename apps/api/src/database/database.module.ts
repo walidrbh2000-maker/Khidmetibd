@@ -8,12 +8,12 @@ import { Notification, NotificationSchema } from '../schemas/notification.schema
 import { GeographicCell, GeographicCellSchema } from '../schemas/geographic-cell.schema';
 
 const MODELS = MongooseModule.forFeature([
-  { name: User.name, schema: UserSchema },
-  { name: Worker.name, schema: WorkerSchema },
-  { name: ServiceRequest.name, schema: ServiceRequestSchema },
-  { name: WorkerBid.name, schema: WorkerBidSchema },
-  { name: Notification.name, schema: NotificationSchema },
-  { name: GeographicCell.name, schema: GeographicCellSchema },
+  { name: User.name,             schema: UserSchema },
+  { name: Worker.name,           schema: WorkerSchema },
+  { name: ServiceRequest.name,   schema: ServiceRequestSchema },
+  { name: WorkerBid.name,        schema: WorkerBidSchema },
+  { name: Notification.name,     schema: NotificationSchema },
+  { name: GeographicCell.name,   schema: GeographicCellSchema },
 ]);
 
 @Global()
