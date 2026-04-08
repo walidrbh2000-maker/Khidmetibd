@@ -4,7 +4,6 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../services/native_channel_service.dart';
-import '../services/firestore_service.dart';
 import '../services/auth_service.dart';
 import 'core_providers.dart';
 import 'app_lifecycle_provider.dart' show AppLifecycleNotifier;
