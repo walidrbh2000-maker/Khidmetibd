@@ -14,7 +14,7 @@ import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 import '../models/user_model.dart';
 import '../models/worker_model.dart';
 import '../utils/constants.dart';
-import 'firestore_service.dart';
+import 'api_service.dart';
 
 class AuthService extends ChangeNotifier {
   static const Duration _authInitTimeout = Duration(seconds: 10);
@@ -25,21 +25,16 @@ class AuthService extends ChangeNotifier {
   static const int _minPasswordLength = AppConstants.minPasswordLength;
 
   // FIX (Auth Security P1): unified with AppConstants.emailRegex.
-  // The previous local pattern `r'^[^@]+@[^@]+\.[^@]+$'` was too permissive
-  // and could accept malformed addresses that FormValidators would then reject,
-  // creating a confusing UX mismatch. Single canonical regex everywhere.
   static final RegExp _emailRegex = AppConstants.emailRegex;
 
-  // Algerian phone number patterns:
-  //   International: +213 followed by 9 digits
-  //   Local: 05xx/06xx/07xx (10 digits total)
-  // Allows optional spaces and dashes for readability.
+  // Algerian phone number patterns
   static final RegExp _phoneRegex = RegExp(
     r'^(\+213[\s\-]?[567]\d{8}|0[567]\d{8})$',
   );
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirestoreService _firestoreService;
+  // STEP 6 FIX: replaced FirestoreService with ApiService
+  final ApiService _firestoreService;
 
   User? _user;
   bool _isLoading = false;
@@ -84,9 +79,6 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<void> waitForInitialization() async {
-    // FIX (Architect P0): A logged-out user with _isInitialized=true is a
-    // perfectly valid state. Resetting caused a redundant authStateChanges()
-    // call on every cold launch for non-authenticated users.
     if (_isInitialized) return;
 
     try {
@@ -330,8 +322,6 @@ class AuthService extends ChangeNotifier {
         id: user.uid,
         name: fallbackName,
         email: user.email ?? '',
-        // FIX (Schema gap — README1): null instead of '' so that
-        // .isNotEmpty checks on phoneNumber correctly detect absence.
         phoneNumber: '',
         lastUpdated: DateTime.now(),
       );
@@ -429,10 +419,6 @@ class AuthService extends ChangeNotifier {
 
       await _updateUserProfile(credential.user!, username);
 
-      // FIX (Race condition P0 — README1): atomicCreateUserProfile MUST
-      // succeed before sendEmailVerification. If Firestore write fails,
-      // _cleanupFailedSignUp deletes the Auth account BEFORE any email
-      // is sent — user never receives a link for a non-existent account.
       await _firestoreService.atomicCreateUserProfile(
         user: profession == null || profession.trim().isEmpty
             ? UserModel(
@@ -458,9 +444,6 @@ class AuthService extends ChangeNotifier {
             : null,
       );
 
-      // FIX (P0 — README1): email only sent after Firestore profile
-      // is confirmed. If the previous step threw, _cleanupFailedSignUp
-      // removes the Auth account — no orphan verification email.
       await credential.user!.sendEmailVerification();
 
       if (!keepLoggedIn) {
@@ -508,13 +491,6 @@ class AuthService extends ChangeNotifier {
     return null;
   }
 
-  // FIX [1/3]: Wrapped _updateUserProfile body in try/on FirebaseAuthException
-  // catch. Previously an uncaught FirebaseAuthException from updateDisplayName()
-  // would propagate through signUp() and trigger _cleanupFailedSignUp, deleting
-  // the Auth account even though the display-name update is non-critical and
-  // the profile write had already succeeded. The fix logs and rethrows so
-  // signUp()'s outer catch can still clean up, but the specific error type is
-  // captured for diagnostics rather than silently swallowed.
   Future<void> _updateUserProfile(User user, String username) async {
     try {
       await user.updateDisplayName(username.trim());
@@ -630,10 +606,6 @@ class AuthService extends ChangeNotifier {
   DateTime? _lastVerificationCheck;
   static const Duration _verificationCheckCooldown = Duration(seconds: 3);
 
-  /// Reloads the Firebase user and checks email verification status.
-  ///
-  /// FIX [A1]: added [forceReload] parameter. When `true` the 3-second
-  /// cooldown is bypassed, which is required for manual user-triggered checks.
   Future<bool> reloadAndCheckEmailVerification({
     bool forceReload = false,
   }) async {
