@@ -80,6 +80,9 @@ services:
       retries: 5
 
   # ── Qdrant v1.9 ──────────────────────────────────────────────────────────
+  # ROOT CAUSE FIX: qdrant/qdrant:v1.9.0 is a minimal Debian-slim image
+  # with NO curl or wget. Using bash built-in /dev/tcp for TCP-level health
+  # probe — zero external tool dependency, works in any POSIX shell with bash.
   qdrant:
     image: qdrant/qdrant:v1.9.0
     container_name: khidmeti-qdrant
@@ -92,11 +95,13 @@ services:
     networks:
       - khidmeti-network
     healthcheck:
-      test: ['CMD', 'curl', '-f', 'http://localhost:6333/healthz']
+      test:
+        - CMD-SHELL
+        - bash -c ':> /dev/tcp/127.0.0.1/6333' 2>/dev/null && exit 0 || exit 1
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 30s
 
   # ── MinIO (S3-compatible object storage) ─────────────────────────────────
   minio:
