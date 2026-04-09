@@ -7,7 +7,7 @@ import '../models/geographic_cell.dart';
 import '../models/wilaya_model.dart';
 import '../utils/model_extensions.dart';
 import '../utils/geo_cell_utils.dart';
-import 'firestore_service.dart';
+import 'api_service.dart';
 import 'wilaya_manager.dart';
 import 'geographic_grid_service_interface.dart';
 
@@ -49,7 +49,7 @@ class GeographicGridService implements GeographicGridServiceInterface {
   // Geohash precision-6 ≈ 1.2 × 0.6 km — matches the ~5 km cell radius well.
   static const int geohashPrecision = 6;
 
-  final FirestoreService firestoreService;
+  final ApiService firestoreService;
   final WilayaManager wilayaManager;
 
   final Map<String, _CachedCell> _cellsCache = {};
@@ -187,9 +187,6 @@ class GeographicGridService implements GeographicGridServiceInterface {
       }
 
       // FIX: replaced fake coordinate-string hash with standard base32 geohash.
-      // Old implementation stored '{(lat*1000).round()}_{(lng*1000).round()}'
-      // which cannot be range-queried on Firestore and does not encode
-      // geographic proximity in its sort order.
       final geoHash = GeoHashHelper.encode(latitude, longitude,
           precision: geohashPrecision);
 
@@ -264,8 +261,6 @@ class GeographicGridService implements GeographicGridServiceInterface {
       final lat = double.parse(parts[1]);
       final lng = double.parse(parts[2]);
 
-      // FIX: delegate to GeoCellUtils.ringCellIds which uses the correct
-      // 0.01° step rather than the mismatched 0.05° that left a gap.
       return GeoCellUtils.ringCellIds(
         centerLat:   lat,
         centerLng:   lng,
@@ -315,8 +310,6 @@ class GeographicGridService implements GeographicGridServiceInterface {
     return (coordinate * multiplier).round() / multiplier;
   }
 
-  // _calculateAdjacentCellIds is kept for backward compatibility but now
-  // delegates to GeoCellUtils so the step size is correct everywhere.
   List<String> _calculateAdjacentCellIds(
     double lat,
     double lng,
@@ -352,11 +345,6 @@ class GeographicGridService implements GeographicGridServiceInterface {
   double _toRadians(double degrees) {
     return degrees * math.pi / 180.0;
   }
-
-  // FIX: _generateGeoHash replaced by GeoHashHelper.encode (called from
-  // assignWorkerToCell above). The old implementation stored a coordinate-pair
-  // string that cannot be used for Firestore geohash range queries.
-  // Method removed to prevent accidental use of the broken implementation.
 
   void _validateCoordinates(double lat, double lng) {
     if (!_isValidLatitude(lat)) {
@@ -433,21 +421,6 @@ class GeographicGridService implements GeographicGridServiceInterface {
 
     if (oldestKey != null) {
       _cellsCache.remove(oldestKey);
-    }
-  }
-
-  void _cleanExpiredCache() {
-    final expiredKeys = _cellsCache.entries
-        .where((entry) => entry.value.isExpired)
-        .map((entry) => entry.key)
-        .toList();
-
-    for (final key in expiredKeys) {
-      _cellsCache.remove(key);
-    }
-
-    if (expiredKeys.isNotEmpty) {
-      _logInfo('Cleaned ${expiredKeys.length} expired cache entries');
     }
   }
 

@@ -17,7 +17,7 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../models/service_request_enhanced_model.dart';
 import '../models/message_enums.dart';
-import 'firestore_service.dart';
+import 'api_service.dart';
 import 'media_service.dart';
 import 'geographic_grid_service.dart';
 
@@ -48,7 +48,7 @@ class ServiceRequestService {
   static const double minPrice = 0.0;
   static const double maxPrice = 1000000.0;
 
-  final FirestoreService firestoreService;
+  final ApiService firestoreService;
   final MediaService mediaService;
   final GeographicGridService geographicGridService;
 
@@ -217,14 +217,6 @@ class ServiceRequestService {
   }
 
   /// [AUTO FIX] Status guard updated: ServiceStatus.accepted → bidSelected.
-  ///
-  /// In the hybrid bid model the request transitions:
-  ///   open → awaitingSelection → bidSelected → inProgress → completed
-  ///
-  /// `accepted` is a legacy status that is never written in the current flow.
-  /// The old guard (`accepted || inProgress`) made completeServiceRequest
-  /// unreachable via the normal worker-completes-job path because the request
-  /// would always be in `bidSelected` or `inProgress` — never `accepted`.
   Future<void> completeServiceRequest({
     required String requestId,
     String? workerNotes,
@@ -258,8 +250,6 @@ class ServiceRequestService {
         );
       }
 
-      // [AUTO FIX] Accept bidSelected (hybrid model) OR inProgress.
-      // Legacy `accepted` status is never set in the hybrid bid flow.
       if (request.status != ServiceStatus.bidSelected &&
           request.status != ServiceStatus.inProgress) {
         throw ServiceRequestServiceException(
@@ -566,11 +556,6 @@ class ServiceRequestService {
   }
 
   /// [AUTO FIX] Added zero-coordinate guard (lat=0.0, lng=0.0).
-  ///
-  /// (0.0, 0.0) is "Null Island" in the Gulf of Guinea — the default value
-  /// returned by position APIs before a real GPS fix is obtained. Submitting
-  /// a request with these coordinates assigns it to the wrong wilaya and makes
-  /// it invisible to workers in the client's actual location.
   void _validateCoordinates(double latitude, double longitude) {
     if (latitude == 0.0 && longitude == 0.0) {
       throw ServiceRequestServiceException(

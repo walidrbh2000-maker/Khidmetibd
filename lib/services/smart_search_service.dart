@@ -2,7 +2,7 @@
 //
 // ALGO FIX (parallelise adjacent cells): _searchAdjacentCells previously
 // awaited each cell lookup + search sequentially inside a for-loop.
-// Each Firestore round-trip adds ~100–300 ms. For a typical cell with 8
+// Each REST round-trip adds ~100–300 ms. For a typical cell with 8
 // neighbours that's up to 2.4 s of serial latency that can be fully
 // parallelised. Replaced with Future.wait.
 //
@@ -28,7 +28,7 @@ import '../models/search_result_model.dart';
 import '../models/geographic_cell.dart';
 import '../utils/model_extensions.dart';
 import '../utils/ranking_utils.dart';
-import 'firestore_service.dart';
+import 'api_service.dart';
 import 'geographic_grid_service.dart';
 import 'wilaya_manager.dart';
 import 'smart_search_service_interface.dart';
@@ -61,7 +61,7 @@ class SmartSearchService implements SmartSearchServiceInterface {
   static const int maxCacheSize = 50;
   static const Duration minSearchInterval = Duration(seconds: 1);
 
-  final FirestoreService firestoreService;
+  final ApiService firestoreService;
   final GeographicGridService geographicGridService;
   final WilayaManager wilayaManager;
 
@@ -256,12 +256,6 @@ class SmartSearchService implements SmartSearchServiceInterface {
 
   /// FIX: replaced sequential for-loop with Future.wait to parallelise all
   /// adjacent cell lookups + searches.
-  ///
-  /// OLD (serial): each cell fetched one at a time — O(n) sequential
-  /// Firestore round-trips (~100–300 ms each → up to 2.4 s for 8 cells).
-  ///
-  /// NEW (parallel): all cells fetched concurrently — wall-clock time
-  /// determined by the single slowest cell fetch, not their sum.
   Future<List<GeoSearchResult<WorkerModel>>> _searchAdjacentCells(
     GeographicCell currentCell,
     String serviceType,
@@ -275,8 +269,7 @@ class SmartSearchService implements SmartSearchServiceInterface {
 
     _logInfo('Searching ${uncheckedIds.length} adjacent cells (parallel)');
 
-    // FIX: fetch + search all adjacent cells concurrently.
-    final perCellResults = await Future.wait(
+    final perCellResults = await Future.wait<List<GeoSearchResult<WorkerModel>>>(
       uncheckedIds.map((adjacentCellId) async {
         try {
           final cell = await geographicGridService.getCell(adjacentCellId);
@@ -285,7 +278,6 @@ class SmartSearchService implements SmartSearchServiceInterface {
             return <GeoSearchResult<WorkerModel>>[];
           }
           final cellResults = await _searchInCell(cell, serviceType, context);
-          // Re-tag source as adjacentCell.
           return cellResults
               .map((r) => GeoSearchResult<WorkerModel>(
                     data:       r.data,
@@ -352,18 +344,7 @@ class SmartSearchService implements SmartSearchServiceInterface {
 
   /// FIX (A1): replaced sequential for-loop with Future.wait to parallelise
   /// all neighboring wilaya searches.
-  ///
-  /// OLD (serial): each wilaya awaited one at a time.
-  ///   With 4–8 neighbours × ~100–300 ms per Firestore fetch = 400–2400 ms
-  ///   of pure serial latency baked into every search that expands beyond the
-  ///   user's own wilaya.
-  ///
-  /// NEW (parallel): all wilaya fetches run concurrently via Future.wait.
-  ///   Wall-clock time = slowest single wilaya fetch, regardless of count.
-  ///   Typical improvement: 3–8× faster for the neighboring-wilaya stage.
-  ///
-  /// Note: searchedWilayaCodes is still updated after results arrive to avoid
-  /// duplicate fetches on future expansion stages.
+  /// FIX: explicit generic type on Future.wait to prevent List<dynamic> inference.
   Future<List<GeoSearchResult<WorkerModel>>> _searchNeighboringWilayas(
     String serviceType,
     SearchContext context,
@@ -379,8 +360,9 @@ class SmartSearchService implements SmartSearchServiceInterface {
 
     _logInfo('Searching ${unchecked.length} neighboring wilayas (parallel)');
 
-    // FIX: fetch all neighboring wilayas concurrently.
-    final perWilayaResults = await Future.wait(
+    // FIX: explicit Future.wait<List<GeoSearchResult<WorkerModel>>> prevents
+    // the compiler from inferring List<dynamic> for the expand result.
+    final perWilayaResults = await Future.wait<List<GeoSearchResult<WorkerModel>>>(
       unchecked.map((wilaya) async {
         try {
           final workers = await firestoreService.getWorkersInWilaya(
@@ -389,7 +371,6 @@ class SmartSearchService implements SmartSearchServiceInterface {
             onlineOnly: true,
           );
 
-          // Mark as searched regardless of result count to prevent re-fetch.
           context.searchedWilayaCodes.add(wilaya.code);
 
           return workers
@@ -414,31 +395,18 @@ class SmartSearchService implements SmartSearchServiceInterface {
       }),
     );
 
-    final results = perWilayaResults.expand((r) => r).toList();
+    final List<GeoSearchResult<WorkerModel>> results =
+        perWilayaResults.expand((r) => r).toList();
     _logInfo('Found ${results.length} workers in neighboring wilayas');
     return results;
   }
 
   /// FIX: replaced pure distance sort with composite score ranking.
-  ///
-  /// OLD: `unique.sort((a, b) => a.distance.compareTo(b.distance))`
-  /// This ranked a worker with 1★ at 0.5 km above a 5★ worker at 1.2 km —
-  /// a bad user experience and a business-logic defect.
-  ///
-  /// NEW: RankingUtils.workerScore weights:
-  ///   40% Bayesian rating, 35% proximity, 15% response rate, 10% recency.
-  ///
-  /// ALGO FIX (A5): pass reviewCount so that workers with zero reviews use
-  /// the globalAverage cold-start fallback rather than being penalised with
-  /// a zero rating score.
-  ///
-  /// Workers without response rate or last-active data use safe defaults
-  /// (responseRate=1.0, daysSinceActive=0) so they are not penalised.
+  /// FIX (A5): pass reviewCount for cold-start guard.
   List<GeoSearchResult<WorkerModel>> _sortAndLimit(
     List<GeoSearchResult<WorkerModel>> results,
     SearchContext context,
   ) {
-    // Deduplicate by worker ID — keep first occurrence (usually closer source).
     final seen   = <String>{};
     final unique = results.where((result) {
       if (seen.contains(result.data.id)) return false;
@@ -446,23 +414,22 @@ class SmartSearchService implements SmartSearchServiceInterface {
       return true;
     }).toList();
 
-    // FIX (A5): composite score — pass ratingCount for cold-start guard.
     unique.sort((a, b) {
       final scoreA = RankingUtils.workerScore(
         bayesianRatingValue: a.data.averageRating,
         distanceKm:          a.distance,
-        reviewCount:         a.data.ratingCount,   // FIX (A5)
+        reviewCount:         a.data.ratingCount,
         responseRate:        a.data.responseRate,
         daysSinceActive:     a.data.daysSinceActive,
       );
       final scoreB = RankingUtils.workerScore(
         bayesianRatingValue: b.data.averageRating,
         distanceKm:          b.distance,
-        reviewCount:         b.data.ratingCount,   // FIX (A5)
+        reviewCount:         b.data.ratingCount,
         responseRate:        b.data.responseRate,
         daysSinceActive:     b.data.daysSinceActive,
       );
-      return scoreB.compareTo(scoreA); // descending
+      return scoreB.compareTo(scoreA);
     });
 
     return unique.take(context.maxResults).toList();
