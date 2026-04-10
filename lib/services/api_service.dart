@@ -1,20 +1,22 @@
 // lib/services/api_service.dart
 //
+// FIX (Registration P0): createOrUpdateUser / createOrUpdateWorker now build
+// the HTTP payload field-by-field instead of spreading user.toMap().
+//
+// ROOT CAUSE: NestJS ValidationPipe is configured with
+//   { whitelist: true, forbidNonWhitelisted: true }
+// which means ANY field not declared in CreateUserDto / CreateWorkerDto
+// (e.g. lastUpdated, cellId, wilayaCode, geoHash coming from toMap())
+// causes a 400 Bad Request. This silently killed every new registration:
+//   1. Firebase user created ✓
+//   2. POST /users → 400 (extra fields) → ApiServiceException thrown
+//   3. catch block in signUp() → _cleanupFailedSignUp() → Firebase user deleted
+//   4. User sees "can't create account"
+//
+// FIX: explicit whitelisted payload — only fields present in CreateUserDto /
+// CreateWorkerDto. No toMap() spreading anywhere in write paths.
+//
 // STEP 5 MIGRATION: Replaces FirestoreService + all Firestore repositories.
-//
-// Drop-in replacement — identical method signatures to FirestoreService so
-// every provider, controller, and service that previously called
-// firestoreServiceProvider continues to work after a one-line import swap.
-//
-// HTTP layer:
-//   • All requests carry  Authorization: Bearer <Firebase ID token>
-//   • Token is refreshed before every call (Firebase SDK caches it 1 h)
-//   • JSON body for write endpoints, multipart for file uploads
-//   • Throws ApiServiceException(message, code) on any non-2xx response
-//
-// Streaming:
-//   • Stream methods delegate to the injected RealtimeService (WebSocket)
-//   • REST fallback via periodic polling when socket is disconnected
 
 import 'dart:async';
 import 'dart:convert';
@@ -60,7 +62,6 @@ class ApiService {
   final RealtimeService _realtime;
   final http.Client    _http;
 
-  // In-memory TTL caches — same TTL / maxSize as original repositories
   final ApiCache<UserModel>                       _userCache;
   final ApiCache<WorkerModel>                     _workerCache;
   final ApiCache<ServiceRequestEnhancedModel>     _requestCache;
@@ -72,8 +73,6 @@ class ApiService {
   bool _isDisposed = false;
   Timer? _cacheCleanupTimer;
 
-  // Collection name constants — kept for compatibility with code that
-  // references FirestoreService.workersCollection etc.
   static const String usersCollection           = 'users';
   static const String workersCollection         = 'workers';
   static const String serviceRequestsCollection = 'service_requests';
@@ -164,7 +163,6 @@ class ApiService {
     if (response.statusCode >= 200 && response.statusCode < 300) {
       if (response.body.isEmpty) return null;
       final decoded = jsonDecode(response.body);
-      // NestJS ResponseInterceptor wraps in { success, data, timestamp }
       if (decoded is Map && decoded['success'] == true && decoded.containsKey('data')) {
         return decoded['data'];
       }
@@ -208,9 +206,25 @@ class ApiService {
 
   Future<void> setUser(UserModel user) => createOrUpdateUser(user);
 
+  /// FIX: explicit whitelisted payload matching CreateUserDto exactly.
+  /// No toMap() spreading — avoids 400 from forbidNonWhitelisted.
   Future<void> createOrUpdateUser(UserModel user) async {
     _ensureNotDisposed();
-    final data = await _post('/users', {'id': user.id, ...user.toMap()});
+
+    // Build payload with ONLY fields declared in NestJS CreateUserDto.
+    // forbidNonWhitelisted=true will 400 any extra key (lastUpdated, cellId, etc.)
+    final payload = <String, dynamic>{
+      'id':    user.id,
+      'name':  user.name,
+      'email': user.email,
+    };
+    if (user.phoneNumber?.isNotEmpty == true) payload['phoneNumber']     = user.phoneNumber;
+    if (user.latitude        != null)         payload['latitude']        = user.latitude;
+    if (user.longitude       != null)         payload['longitude']       = user.longitude;
+    if (user.profileImageUrl != null)         payload['profileImageUrl'] = user.profileImageUrl;
+    if (user.fcmToken        != null)         payload['fcmToken']        = user.fcmToken;
+
+    final data = await _post('/users', payload);
     if (data != null) {
       final updated = UserModel.fromJson(data as Map<String, dynamic>);
       _userCache.set(user.id, updated);
@@ -262,9 +276,26 @@ class ApiService {
 
   Future<void> setWorker(WorkerModel worker) => createOrUpdateWorker(worker);
 
+  /// FIX: explicit whitelisted payload matching CreateWorkerDto exactly.
+  /// No toMap() spreading — avoids 400 from forbidNonWhitelisted.
   Future<void> createOrUpdateWorker(WorkerModel worker) async {
     _ensureNotDisposed();
-    final data = await _post('/workers', {'id': worker.id, ...worker.toMap()});
+
+    // Build payload with ONLY fields declared in NestJS CreateWorkerDto.
+    final payload = <String, dynamic>{
+      'id':         worker.id,
+      'name':       worker.name,
+      'email':      worker.email,
+      'profession': worker.profession,
+      'isOnline':   worker.isOnline,
+    };
+    if (worker.phoneNumber?.isNotEmpty == true) payload['phoneNumber']     = worker.phoneNumber;
+    if (worker.latitude        != null)         payload['latitude']        = worker.latitude;
+    if (worker.longitude       != null)         payload['longitude']       = worker.longitude;
+    if (worker.profileImageUrl != null)         payload['profileImageUrl'] = worker.profileImageUrl;
+    if (worker.fcmToken        != null)         payload['fcmToken']        = worker.fcmToken;
+
+    final data = await _post('/workers', payload);
     if (data != null) {
       final updated = WorkerModel.fromJson(data as Map<String, dynamic>);
       _workerCache.set(worker.id, updated);
@@ -473,7 +504,6 @@ class ApiService {
 
   Future<void> createNotification(NotificationModel notification) async {
     _ensureNotDisposed();
-    // Notifications are server-push only — no client-side create endpoint
     _logInfo('createNotification: no-op (server-push only in new stack)');
   }
 
@@ -481,7 +511,6 @@ class ApiService {
 
   Future<void> saveCell(GeographicCell cell) async {
     _ensureNotDisposed();
-    // Cells are created server-side via LocationService
     _logInfo('saveCell: no-op (server-side only in new stack)');
   }
 
@@ -490,7 +519,6 @@ class ApiService {
     try {
       final data = await _get('/location/cells/$cellId/adjacent');
       if (data == null) return null;
-      // Return a minimal cell with the adjacentCellIds from the response
       final adjacentIds = (data['adjacentCellIds'] as List?)
           ?.map((e) => e.toString())
           .toList() ?? [];
@@ -543,11 +571,6 @@ class ApiService {
     _requestCache.cleanExpired();
   }
 
-  // ── Firestore compat stub (for WorkerBidService direct access) ────────────
-
-  /// Direct HTTP client — replaces FirestoreService.firestore
-  /// Used by WorkerBidService for the bid-marker atomic write.
-  /// Returns a lightweight proxy that executes the same patterns via REST.
   _ApiDirectClient get firestore => _ApiDirectClient(this);
 
   // ── Dispose ────────────────────────────────────────────────────────────────
@@ -573,8 +596,7 @@ class ApiService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// _ApiDirectClient — shim used by WorkerBidService's `_firestore.collection()`
-// calls. Re-routes to the REST API so WorkerBidService needs no changes.
+// _ApiDirectClient shim (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _ApiDirectClient {
@@ -620,7 +642,6 @@ class _DocRef {
   }
 
   Future<void> delete() async {
-    // Use patch with a sentinel to mark deleted — server handles via status
     if (kDebugMode) debugPrint('[ApiDirectClient] delete not fully implemented for $_collection/$_id');
   }
 }
