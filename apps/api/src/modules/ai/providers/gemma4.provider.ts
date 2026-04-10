@@ -1,16 +1,13 @@
 /**
- * Gemma4Provider — نموذج واحد لكل شيء
+ * Gemma4Provider — Google AI API (@google/genai v1.x)
  *
- * Demo  → gemma-4-31b-it via Google AI API  (GEMINI_API_KEY)
- * Prod  → نفس الكود، فقط تغيير GEMMA4_BASE_URL + GEMMA4_MODEL
- *          → Ollama local: GEMMA4_MODEL=gemma4:27b
- *          → vLLM   local: GEMMA4_MODEL=google/gemma-4-27b-it
- *
- * نموذج واحد يتولى: النص + الصورة + الصوت + التضمين (embeddings)
+ * Fix: ThinkingMode n'existe pas dans @google/genai v1.0.0 (enum interne non exporté).
+ *      thinkingConfig retiré — le modèle raisonne par défaut avec gemma-4-31b-it.
+ *      Interface publique inchangée — aucun autre fichier à modifier.
  */
 
 import { Injectable, Logger } from '@nestjs/common';
-import { GoogleGenAI, ThinkingMode } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import type { Content, Part, GenerateContentConfig } from '@google/genai';
 
 export interface AudioResult {
@@ -23,8 +20,8 @@ export class Gemma4Provider {
   private readonly logger = new Logger(Gemma4Provider.name);
   private readonly ai: GoogleGenAI;
 
-  private readonly MODEL:       string;
-  private readonly EMBED_MODEL  = 'text-embedding-004'; // 768-dim, même dimension Qdrant
+  private readonly MODEL:      string;
+  private readonly EMBED_MODEL = 'text-embedding-004'; // 768-dim
 
   constructor() {
     const apiKey = process.env['GEMINI_API_KEY'];
@@ -47,7 +44,6 @@ export class Gemma4Provider {
       systemInstruction: systemPrompt,
       temperature:       opts.temperature ?? 0.05,
       maxOutputTokens:   opts.maxTokens   ?? 600,
-      thinkingConfig:    { thinkingMode: ThinkingMode.ENABLED },
       tools:             [{ googleSearch: {} }],
     };
 
@@ -67,7 +63,6 @@ export class Gemma4Provider {
     prompt:      string,
     opts: { temperature?: number; maxTokens?: number } = {},
   ): Promise<string> {
-    // Image BEFORE text — Gemma-4 multimodal best practice
     const contents: Content[] = [{
       role:  'user',
       parts: [
@@ -80,7 +75,6 @@ export class Gemma4Provider {
       model:    this.MODEL,
       contents,
       config: {
-        thinkingConfig:  { thinkingMode: ThinkingMode.ENABLED },
         temperature:     opts.temperature ?? 0.05,
         maxOutputTokens: opts.maxTokens   ?? 600,
       },
@@ -90,14 +84,12 @@ export class Gemma4Provider {
   }
 
   // ── Audio ────────────────────────────────────────────────────────────────────
-  // Gemma-4 gère l'audio nativement — pas de Whisper, pas de conteneur séparé
 
   async processAudio(
     audioBuffer: Buffer,
     mime:        string,
     opts: { temperature?: number; maxTokens?: number } = {},
   ): Promise<AudioResult> {
-    // Audio BEFORE text — Gemma-4 multimodal best practice
     const contents: Content[] = [{
       role:  'user',
       parts: [
@@ -124,8 +116,6 @@ export class Gemma4Provider {
   }
 
   // ── Embedding ────────────────────────────────────────────────────────────────
-  // text-embedding-004 : 768-dim — même dimension que les collections Qdrant
-  // En production sur votre serveur: nomic-embed-text via Ollama (aussi 768-dim)
 
   async generateEmbedding(text: string): Promise<number[]> {
     const response = await this.ai.models.embedContent({
