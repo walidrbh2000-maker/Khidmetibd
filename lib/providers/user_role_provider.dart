@@ -1,102 +1,90 @@
 // lib/providers/user_role_provider.dart
+//
+// OPTIMISATION — REQUÊTE UNIQUE
+// ────────────────────────────────────────────────────────────────────────────
+// Avant la migration, currentUserRoleProvider effectuait jusqu'à DEUX
+// requêtes pour déterminer le rôle d'un utilisateur :
+//   1. GET /workers/:uid  → si 404, l'utilisateur n'est pas worker
+//   2. GET /users/:uid    → pour confirmer qu'il est client
+//
+// Après la fusion de la collection, GET /users/:uid retourne le document
+// unifié avec le champ `role`. Une seule requête suffit. L'économie est
+// significative : moins de latence, moins de tokens Firebase, moins de
+// charge serveur.
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core_providers.dart';
 
-// ============================================================================
-// USER ROLE ENUM
-// ============================================================================
+// ─────────────────────────────────────────────────────────────────────────────
+// UserRole — enum applicatif (avec unknown pour l'état de chargement)
+// ─────────────────────────────────────────────────────────────────────────────
+// distinct de la valeur `role` dans UserModel (String 'client'|'worker')
+// pour permettre la notion d'état indéterminé nécessaire à l'UI.
 
-/// User role enum (renamed from UserType to avoid conflict with constants.dart)
 enum UserRole {
   client,
   worker,
+  /// État transitoire : non encore résolu (démarrage) ou non authentifié.
   unknown,
 }
 
-// ============================================================================
-// ASYNC ROLE PROVIDER (Firestore lookup — use sparingly)
-// ============================================================================
-
-/// Provider that determines if current user is a worker or client.
-/// Makes a live Firestore call — prefer cachedUserRoleProvider for sync reads.
-///
-/// FIX (P4 — W3): replaced ref.watch(authServiceProvider) with
-/// ref.watch(currentUserProvider). authServiceProvider is a
-/// ChangeNotifierProvider that fires notifyListeners() on every isLoading
-/// change (e.g. during sign-in), which previously caused this provider to
-/// make a new Firestore call on every such notification.
-/// currentUserProvider only changes when the UID actually changes, so
-/// Firestore is only re-queried on real auth state transitions.
+// ─────────────────────────────────────────────────────────────────────────────
+// currentUserRoleProvider — lookup Firestore en direct
+// ─────────────────────────────────────────────────────────────────────────────
+// Usage : uniquement quand le cache (cachedUserRoleProvider) n'est pas encore
+// résolu. Préférer cachedUserRoleProvider pour les lectures synchrones.
+//
+// OPTIMISATION (post-migration) :
+//   Une seule requête GET /users/:uid suffit — le champ `role` du document
+//   retourné discrimine client vs worker. Avant la fusion, deux requêtes
+//   pouvaient être nécessaires (getWorker + getUser).
+//
+// FIX (P4 — W3) : ref.watch(currentUserProvider) au lieu de authServiceProvider
+// évite les rebuilds sur isLoading. Seul un vrai changement d'UID déclenche
+// une nouvelle requête Firestore.
 final currentUserRoleProvider = FutureProvider.autoDispose<UserRole>((ref) async {
-  // FIX (P4): watch the UID-scoped provider instead of the full AuthService
-  // ChangeNotifier to avoid spurious Firestore re-fetches on isLoading changes.
-  final user = ref.watch(currentUserProvider);
+  final user             = ref.watch(currentUserProvider);
   final firestoreService = ref.watch(firestoreServiceProvider);
 
   if (user == null) return UserRole.unknown;
 
   try {
-    final worker = await firestoreService.getWorker(user.uid);
-    if (worker != null) return UserRole.worker;
-
-    final client = await firestoreService.getUser(user.uid);
-    if (client != null) return UserRole.client;
-
-    return UserRole.unknown;
-  } catch (e) {
+    // OPTIMISATION : une seule requête — le champ `role` est dans le document.
+    final userDoc = await firestoreService.getUser(user.uid);
+    if (userDoc == null) return UserRole.unknown;
+    return userDoc.isWorker ? UserRole.worker : UserRole.client;
+  } catch (_) {
+    // Dégradation gracieuse : traiter comme client en cas d'erreur réseau.
     return UserRole.client;
   }
 });
 
-// ============================================================================
-// ACCOUNT TYPE PROVIDER  (cachedUserRoleProvider)
-// ============================================================================
+// ─────────────────────────────────────────────────────────────────────────────
+// cachedUserRoleProvider — cache en mémoire du rôle résolu
+// ─────────────────────────────────────────────────────────────────────────────
+// Écrit par : SplashController, LoginController, RegisterController
+// Lu par    : router (redirect guard), SettingsNotifier, WorkerHomeController
 //
-// PURPOSE: Represents the Firebase account type — is this user registered
-// as a worker in Firestore?
-//
-// WRITTEN BY:
-//   - SplashController._resolveAndCacheRole()  (cold launch)
-//   - LoginController._resolveAndPersistRole() (email/social login)
-//   - RegisterController._cacheRole()          (registration)
-//
-// FIX (Cross-Screen Flow P1 — shared state conflict guard):
-// cachedUserRoleProvider can be written concurrently by LoginController and
-// RegisterController in edge cases where a partial OAuth session exists
-// (e.g. user starts social registration, back-navigates, then logs in).
-// The guard below prevents an already-resolved role from being overwritten
-// by a stale unknown write. Controllers should check this before writing:
-//
-//   final current = ref.read(cachedUserRoleProvider);
-//   if (current != UserRole.unknown) return; // already resolved, skip
-//
-// This contract is documented here and enforced at write sites.
-// The StateProvider itself cannot enforce it — callers must respect the guard.
+// CONTRAT D'ÉCRITURE — OBLIGATOIRE pour tous les writers :
+//   N'écrire que si la valeur actuelle est `unknown`, OU si `force: true`.
+//   Ne jamais écraser un rôle résolu par `unknown` — cela provoque un
+//   redirect loop dans le router.
+//   → Utiliser setCachedUserRole(ref, role) et non .state = role directement.
+final cachedUserRoleProvider =
+    StateProvider<UserRole>((ref) => UserRole.unknown);
 
-/// Synchronous in-memory cache of the user's Firebase account type.
-///
-/// WRITE GUARD CONTRACT (callers must enforce):
-/// Only write if the current value is UserRole.unknown, OR if you are
-/// explicitly replacing a known role (e.g. worker upgrade).
-/// Never overwrite a non-unknown role with unknown.
-final cachedUserRoleProvider = StateProvider<UserRole>((ref) => UserRole.unknown);
-
-// ============================================================================
-// WRITE GUARD HELPER — use this in controllers instead of direct state write
-// ============================================================================
-
-/// Writes [role] to [cachedUserRoleProvider] only if the current value
-/// is [UserRole.unknown] OR [force] is true.
-///
-/// Usage in controllers:
-///   setCachedUserRole(ref, UserRole.worker);               // guarded
-///   setCachedUserRole(ref, UserRole.worker, force: true);  // forced (upgrade)
+// ─────────────────────────────────────────────────────────────────────────────
+// setCachedUserRole — helper thread-safe pour écrire dans le cache
+// ─────────────────────────────────────────────────────────────────────────────
+// [force: false] → écriture seulement si le rôle actuel est unknown
+// [force: true]  → écriture inconditionnelle (upgrade client→worker, etc.)
+//
+// Le flag force est nécessaire pour les cas de re-login ou d'upgrade de compte.
 void setCachedUserRole(Ref ref, UserRole role, {bool force = false}) {
   final current = ref.read(cachedUserRoleProvider);
   if (force || current == UserRole.unknown) {
     ref.read(cachedUserRoleProvider.notifier).state = role;
   }
-  // If current is already a known role and force is false, the write is
-  // silently skipped — the first writer wins, preventing race conditions.
+  // Si current != unknown et force == false → écriture silencieusement ignorée.
+  // Le premier writer gagne, les écrits concurrents sont idempotents.
 }
