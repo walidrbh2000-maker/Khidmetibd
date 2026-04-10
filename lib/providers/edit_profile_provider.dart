@@ -1,10 +1,22 @@
 // lib/providers/edit_profile_provider.dart
+//
+// FIX (MIGRATION — collection unifiée) :
+//   _load() ne branch plus sur prefs.getString(PrefKeys.accountRole) avant
+//   l'appel API. Ce pattern était fragile : sur un appareil neuf ou après
+//   réinstallation, les prefs sont vides → la branche worker ne s'exécutait
+//   jamais → professionLabel vide dans l'écran d'édition pour les travailleurs.
+//
+//   AVANT : lire prefs → si worker → getWorker(uid) / sinon → getUser(uid)
+//   APRÈS : getUser(uid) → brancher sur userDoc.isWorker
+//           (même pattern que settings_provider.dart et splash_controller.dart)
+//
+//   save() conserve le pattern existant (getWorker/getUser + copyWith merge)
+//   qui est correct architecturalement — aucun changement nécessaire là.
 
 import 'dart:io';
 
 import 'package:firebase_analytics/firebase_analytics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../providers/auth_providers.dart';
 import '../../providers/core_providers.dart';
@@ -80,6 +92,18 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
     _load();
   }
 
+  /// FIX (MIGRATION — collection unifiée) :
+  ///
+  /// AVANT — fragile, branché sur les prefs :
+  ///   1. prefs.getString(PrefKeys.accountRole) == UserType.worker
+  ///      → getWorker(uid)  (appel à l'ancienne collection via facade)
+  ///   2. sinon → getUser(uid)
+  ///   Problème : prefs absentes (réinstall, nouvel appareil) → branche client
+  ///   → professionLabel jamais chargé pour un worker.
+  ///
+  /// APRÈS — source unique, identique à settings_provider.dart :
+  ///   getUser(uid) → brancher sur userDoc.isWorker
+  ///   Le champ `role` du document unifié est la seule source de vérité.
   Future<void> _load() async {
     try {
       final authService      = _ref.read(authServiceProvider);
@@ -94,35 +118,42 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
         return;
       }
 
-      final prefs            = await SharedPreferences.getInstance();
-      final savedAccountRole = prefs.getString(PrefKeys.accountRole);
+      // Une seule requête — le document unifié porte le rôle et tous les champs.
+      final userDoc = await firestoreService.getUser(uid);
 
-      // Worker path.
-      if (savedAccountRole == UserType.worker) {
-        final worker = await firestoreService.getWorker(uid);
-        if (worker != null && mounted) {
-          state = state.copyWith(
-            status:          EditProfileStatus.idle,
-            name:            worker.name,
-            email:           authService.user?.email ?? worker.email,
-            phone:           worker.phoneNumber,
-            professionLabel: worker.profession,
-            profileImageUrl: worker.profileImageUrl,
-            isWorkerAccount: true,
-            errorMessage:    null,
-          );
-        }
+      if (!mounted) return;
+
+      if (userDoc == null) {
+        // Profil pas encore créé — fallback sur Firebase Auth.
+        state = state.copyWith(
+          status:          EditProfileStatus.idle,
+          name:            authService.user?.displayName ?? '',
+          email:           authService.user?.email       ?? '',
+          isWorkerAccount: false,
+          errorMessage:    null,
+        );
+        AppLogger.warning('EditProfileNotifier: userDoc null pour uid=$uid — fallback Firebase');
         return;
       }
 
-      // Client path.
-      final user = await firestoreService.getUser(uid);
-      if (user != null && mounted) {
+      if (userDoc.isWorker) {
         state = state.copyWith(
           status:          EditProfileStatus.idle,
-          name:            user.name,
-          email:           authService.user?.email ?? user.email,
-          phone:           user.phoneNumber ?? '',
+          name:            userDoc.name,
+          email:           authService.user?.email ?? userDoc.email,
+          phone:           userDoc.phoneNumber,
+          professionLabel: userDoc.profession,       // String? — champ unifié
+          profileImageUrl: userDoc.profileImageUrl,
+          isWorkerAccount: true,
+          errorMessage:    null,
+        );
+      } else {
+        state = state.copyWith(
+          status:          EditProfileStatus.idle,
+          name:            userDoc.name,
+          email:           authService.user?.email ?? userDoc.email,
+          phone:           userDoc.phoneNumber,
+          profileImageUrl: userDoc.profileImageUrl,
           isWorkerAccount: false,
           errorMessage:    null,
         );
@@ -146,7 +177,7 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
   ///   1. Load current document → apply changes via copyWith → write back.
   ///      FirestoreService has no partial-update method — uses
   ///      createOrUpdateWorker / createOrUpdateUser which call set(merge:true).
-  ///   2. MediaService.uploadImage(File) returns the Cloudinary URL.
+  ///   2. MediaService.uploadImage(File) returns the MinIO URL.
   ///   3. FirebaseAnalytics.instance.logEvent for profile_updated.
   Future<bool> save({
     required String name,
@@ -173,7 +204,6 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
       final trimmedPhone = phone.trim();
 
       // Upload image if user picked one.
-      // MediaService.uploadImage(File, {folder?}) → Future<String> (URL).
       String? uploadedImageUrl = state.profileImageUrl;
       if (newImagePath != null) {
         uploadedImageUrl = await _ref
@@ -186,7 +216,6 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
 
       if (state.isWorkerAccount) {
         // Load current worker, apply changes via copyWith, write back.
-        // createOrUpdateWorker calls set(merge:true) — safe for partial update.
         final current = await firestoreService.getWorker(uid);
         if (current != null) {
           await firestoreService.createOrUpdateWorker(
@@ -203,9 +232,9 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
         if (current != null) {
           await firestoreService.createOrUpdateUser(
             current.copyWith(
-              name:        trimmedName,
-              phoneNumber: trimmedPhone,
-              // UserModel.profileImageUrl — add to UserModel if missing.
+              name:            trimmedName,
+              phoneNumber:     trimmedPhone,
+              profileImageUrl: uploadedImageUrl,
             ),
           );
         }
@@ -214,15 +243,14 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
       // Sync Firebase Auth displayName so ProfileCard reflects the change.
       await authService.user?.updateDisplayName(trimmedName);
 
-      // FirebaseAnalytics.instance is available directly — AnalyticsService
-      // does not expose a generic logEvent (only domain-specific methods).
+      // fire-and-forget — never block save on analytics
       FirebaseAnalytics.instance.logEvent(
         name: 'profile_updated',
         parameters: {
           'account_type':  state.isWorkerAccount ? 'worker' : 'client',
           'image_changed': (newImagePath != null).toString(),
         },
-      ).ignore(); // fire-and-forget — never block save on analytics
+      ).ignore();
 
       if (mounted) {
         state = state.copyWith(

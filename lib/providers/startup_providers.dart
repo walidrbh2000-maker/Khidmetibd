@@ -1,4 +1,15 @@
 // lib/providers/startup_providers.dart
+//
+// FIX (MIGRATION — collection unifiée) :
+//   locationServiceAutoStartProvider appelait getWorker(user.uid) pour
+//   déterminer si l'utilisateur est un worker. Après la fusion des collections,
+//   getUser(uid) retourne le document unifié avec le champ `role`.
+//
+//   AVANT : getWorker(uid) → si non-null ET isOnline → démarrer service
+//   APRÈS : getUser(uid)   → si isWorker ET isOnline → démarrer service
+//
+//   Le résultat est identique car la facade getWorker fonctionne encore,
+//   mais getUser est la source canonique et évite un appel HTTP redondant.
 
 import 'dart:async';
 import 'package:flutter/foundation.dart';
@@ -28,15 +39,17 @@ final locationServiceAutoStartProvider =
     _logInfo('locationServiceAutoStart',
         'Checking worker status for user: ${user.uid}');
 
-    final workerDoc = await firestoreService
-        .getWorker(user.uid)
+    // FIX (MIGRATION) : getUser au lieu de getWorker.
+    // getUser retourne le document unifié avec `role` — une seule requête suffit.
+    final userDoc = await firestoreService
+        .getUser(user.uid)
         .timeout(AppLifecycleNotifier.locationServiceStartTimeout);
 
-    if (workerDoc == null) {
+    if (userDoc == null || !userDoc.isWorker) {
       _logInfo('locationServiceAutoStart', 'User is not a worker');
       return false;
     }
-    if (!workerDoc.isOnline) {
+    if (!userDoc.isOnline) {
       _logInfo('locationServiceAutoStart',
           'Worker is offline, skipping location service');
       return false;

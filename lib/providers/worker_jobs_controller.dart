@@ -14,6 +14,11 @@
 // before opening the stream and passes it to streamWorkerServiceRequests().
 // This scopes the internal openSub query to the worker's wilaya instead of
 // performing a platform-wide scan on every snapshot.
+//
+// FIX (MIGRATION — collection unifiée) :
+//   _fetchWilayaAndSubscribe appelait getWorker(workerId) pour lire wilayaCode.
+//   Remplacé par getUser(workerId) — même résultat car WorkerModel = UserModel,
+//   mais cohérent avec le reste du codebase (source unique).
 
 import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -142,16 +147,16 @@ class WorkerJobsController extends StateNotifier<WorkerJobsState> {
   // openSub query to this worker's wilaya instead of scanning all open
   // requests across the entire platform.
   //
-  // On failure the worker document might not exist yet (e.g. first login) or
-  // Firestore may be temporarily unavailable. In both cases we fall back to
-  // the unscoped stream (wilayaCode: null) which is now at least bounded to
-  // 50 documents by the repository-level .limit(50) fix.
+  // FIX (MIGRATION) : getUser au lieu de getWorker.
+  // getUser retourne le document unifié — WorkerModel = UserModel via typedef,
+  // donc wilayaCode est accessible sur les deux. Cohérent avec le reste.
   Future<void> _fetchWilayaAndSubscribe(String workerId) async {
     try {
-      final worker = await _ref
+      // Une seule requête vers /users/:id — retourne le document unifié.
+      final userDoc = await _ref
           .read(firestoreServiceProvider)
-          .getWorker(workerId);
-      _workerWilayaCode = worker?.wilayaCode;
+          .getUser(workerId);
+      _workerWilayaCode = userDoc?.wilayaCode;
     } catch (e) {
       AppLogger.error(
           'WorkerJobsController._fetchWilayaAndSubscribe', e);
