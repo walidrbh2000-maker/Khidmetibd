@@ -1,15 +1,23 @@
+// apps/api/src/modules/gateway/gateway.module.ts
+//
+// FIX (migration collection unifiée) :
+//   Remplacé l'import depuis '../../schemas/worker.schema' (fichier supprimé)
+//   par '../../schemas/user.schema'. WorkerLocationGateway utilise déjà
+//   UserDocument / UserRole en interne — seule la déclaration MongooseModule
+//   était encore ancrée sur l'ancien schéma Worker.
+
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import { Worker, WorkerSchema } from '../../schemas/worker.schema';
-import { WorkerLocationGateway } from './worker-location.gateway';
-import { ServiceRequestGateway } from './service-request.gateway';
-import { BidsGateway } from './bids.gateway';
+import { User, UserSchema }              from '../../schemas/user.schema';
+import { WorkerLocationGateway }         from './worker-location.gateway';
+import { ServiceRequestGateway }         from './service-request.gateway';
+import { BidsGateway }                   from './bids.gateway';
 
 @Module({
   imports: [
-    MongooseModule.forFeature([{ name: Worker.name, schema: WorkerSchema }]),
+    MongooseModule.forFeature([{ name: User.name, schema: UserSchema }]),
   ],
   providers: [WorkerLocationGateway, ServiceRequestGateway, BidsGateway],
-  exports: [WorkerLocationGateway, ServiceRequestGateway, BidsGateway],
+  exports:   [WorkerLocationGateway, ServiceRequestGateway, BidsGateway],
 })
 export class GatewayModule {}
