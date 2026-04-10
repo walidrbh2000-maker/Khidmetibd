@@ -204,14 +204,26 @@ export class GeminiStrategy implements IAiProvider {
 
   /**
    * Upload a buffer to the Gemini Files API and return the file metadata.
-   * The Files API accepts Blobs directly in Node ≥ 18 (our container uses Node 20).
+   *
+   * WHY `new Uint8Array(buffer)` instead of passing `buffer` directly?
+   *
+   * Node.js allocates `Buffer` instances from a shared memory pool backed by a
+   * `SharedArrayBuffer`. The `Blob` constructor (Web API, available in Node ≥ 18)
+   * only accepts `ArrayBuffer` — passing a `SharedArrayBuffer`-backed view causes:
+   *
+   *   TypeError: Type 'SharedArrayBuffer' is not assignable to type 'ArrayBuffer'
+   *
+   * `new Uint8Array(buffer)` performs a copy into a fresh, owned `ArrayBuffer`,
+   * breaking the shared-pool reference and satisfying the `Blob` contract.
+   * The copy is O(n) but unavoidable given the Web API constraint.
    */
   private async uploadToFilesApi(
     buffer:      Buffer,
     mimeType:    string,
     displayName: string,
   ): Promise<{ uri: string; mimeType: string; name: string }> {
-    const blob    = new Blob([buffer], { type: mimeType });
+    // Detach from Node's shared Buffer pool → guaranteed plain ArrayBuffer for Blob
+    const blob       = new Blob([new Uint8Array(buffer)], { type: mimeType });
     const uniqueName = `${displayName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     const uploaded = await this.ai.files.upload({
