@@ -2,7 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { GeographicCell, GeographicCellDocument } from '../../schemas/geographic-cell.schema';
-import { Worker, WorkerDocument } from '../../schemas/worker.schema';
+import { User, UserDocument, UserRole }            from '../../schemas/user.schema';
 
 export interface AssignCellResult {
   cellId: string;
@@ -11,29 +11,24 @@ export interface AssignCellResult {
 }
 
 /**
- * LocationService handles geographic cell assignment.
- * Computes a deterministic cellId from lat/lng (2dp precision ≈ 1.1km grid),
- * creates the cell document if absent, and returns the result to callers so
- * they can persist it on the worker / user document.
+ * LocationService handles geographic cell assignment for workers.
+ * All queries against workers use the unified 'users' collection with
+ * role='worker' filter.
  */
 @Injectable()
 export class LocationService {
   private readonly logger = new Logger(LocationService.name);
 
-  private static readonly CELL_PRECISION = 2; // decimal places → ~1.1km grid
+  private static readonly CELL_PRECISION    = 2;
   private static readonly DEFAULT_RADIUS_KM = 5.0;
 
   constructor(
     @InjectModel(GeographicCell.name)
     private readonly cellModel: Model<GeographicCellDocument>,
-    @InjectModel(Worker.name)
-    private readonly workerModel: Model<WorkerDocument>,
+    @InjectModel(User.name)
+    private readonly userModel: Model<UserDocument>,
   ) {}
 
-  /**
-   * Assign a worker to a geographic cell based on current GPS position.
-   * Creates the cell document if it does not yet exist.
-   */
   async assignWorkerToCell(
     workerId: string,
     latitude: number,
@@ -46,15 +41,10 @@ export class LocationService {
 
       await this.ensureCellExists(cellId, latitude, longitude, wilayaCode);
 
-      await this.workerModel
+      await this.userModel
         .updateOne(
-          { _id: workerId },
-          {
-            cellId,
-            wilayaCode,
-            geoHash,
-            lastCellUpdate: new Date(),
-          },
+          { _id: workerId, role: UserRole.Worker },
+          { cellId, wilayaCode, geoHash, lastCellUpdate: new Date() },
         )
         .exec();
 
@@ -65,38 +55,35 @@ export class LocationService {
     }
   }
 
-  /**
-   * Return workers in a given cell, optionally filtered by profession.
-   */
   async getWorkersInCell(
     cellId: string,
     serviceType?: string,
     onlineOnly = false,
     limit = 50,
-  ): Promise<WorkerDocument[]> {
+  ): Promise<UserDocument[]> {
     try {
-      const query: Partial<Record<string, unknown>> = { cellId };
+      const query: Partial<Record<string, unknown>> = {
+        cellId,
+        role: UserRole.Worker,
+      };
       if (serviceType) query['profession'] = serviceType;
       if (onlineOnly)  query['isOnline']   = true;
-      return await this.workerModel.find(query).limit(limit).exec();
+      return this.userModel.find(query).limit(limit).exec();
     } catch (err) {
       this.logger.error(`LocationService.getWorkersInCell(${cellId}) failed`, err);
       throw err;
     }
   }
 
-  /**
-   * Return adjacent cell IDs for a given center cell (ring of 8 neighbours).
-   */
   getAdjacentCellIds(cellId: string): string[] {
     const parts = cellId.split('_');
     if (parts.length !== 3) return [];
 
     const [wilayaCode, latStr, lngStr] = parts;
-    const lat   = parseFloat(latStr);
-    const lng   = parseFloat(lngStr);
-    const step  = Math.pow(10, -LocationService.CELL_PRECISION);
-    const prec  = LocationService.CELL_PRECISION;
+    const lat  = parseFloat(latStr);
+    const lng  = parseFloat(lngStr);
+    const step = Math.pow(10, -LocationService.CELL_PRECISION);
+    const prec = LocationService.CELL_PRECISION;
 
     const ids: string[] = [];
     for (let dLat = -1; dLat <= 1; dLat++) {
@@ -110,7 +97,7 @@ export class LocationService {
     return ids;
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────
+  // ── Private helpers ─────────────────────────────────────────────────────────
 
   private buildCellId(lat: number, lng: number, wilayaCode: number): string {
     const p    = LocationService.CELL_PRECISION;
@@ -144,9 +131,6 @@ export class LocationService {
     }
   }
 
-  /**
-   * Minimal standard geohash encoder — precision 6 ≈ 1.2 × 0.6 km.
-   */
   private encodeGeoHash(lat: number, lng: number, precision: number): string {
     const BASE32  = '0123456789bcdefghjkmnpqrstuvwxyz';
     let   hash    = '';
