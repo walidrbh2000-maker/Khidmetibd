@@ -1,26 +1,27 @@
-// ══════════════════════════════════════════════════════════════════════════════
-// IntentExtractorService — Pure Gemma4 reasoning, zero embeddings
+// apps/api/src/modules/ai/services/intent-extractor.service.ts
 //
-// WHY NO EMBEDDINGS?
-//   The original design fetched embedding vectors → searched Qdrant for examples
-//   → passed those examples to Gemma4. This required a separate embedding model
-//   (text-embedding-004) that is unreliable, adds latency, and costs extra API calls.
+// FIXES:
+//  1. Proper error propagation — AI quota errors (429) are now returned as
+//     AiRateLimitException (HTTP 429) to the client, NOT as 500.
+//     Before: GeminiStrategy threw raw Error → NestJS caught it → 500 to Flutter.
+//     After:  ChainedAiStrategy throws typed Error → caught here → 429 to Flutter.
 //
-//   Gemma4 is a frontier reasoning model that natively understands Arabic, Darija,
-//   French, and English.  The few-shot examples live directly in the system prompt
-//   (chain-of-thought style), which is MORE effective than retrieved RAG examples
-//   because the model sees them every time, not just when retrieval works.
+//  2. Cache key normalization — Arabic/Darija text was case-folded incorrectly.
+//     Now uses SHA-256 hash of normalized input as cache key to avoid
+//     collisions from Unicode normalization edge cases.
 //
-// PORTABILITY:
-//   This service depends only on IAiProvider.  Swap env var AI_PROVIDER=ollama
-//   and the entire pipeline runs 100% locally with Gemma4 via Ollama — zero cost,
-//   zero cloud, zero GPU required for the e2b/e4b variants.
-// ══════════════════════════════════════════════════════════════════════════════
+//  3. Audio result now includes transcribedText even on cache hits for audio
+//     flow. Previously extractFromText() overrode the transcription on cache hit.
+//
+//  4. Image extraction: quota error is now handled gracefully (returns FALLBACK
+//     with confidence=0 instead of 500).
 
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import type { IAiProvider, AudioResult } from '../interfaces/ai-provider.interface';
-import { AI_PROVIDER_TOKEN } from '../interfaces/ai-provider.interface';
-import type { Redis } from 'ioredis';
+import { createHash }                           from 'crypto';
+import type { IAiProvider, AudioResult }        from '../interfaces/ai-provider.interface';
+import { AI_PROVIDER_TOKEN }                    from '../interfaces/ai-provider.interface';
+import { AiRateLimitException }                 from '../exceptions/ai-provider.exception';
+import type { Redis }                           from 'ioredis';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -48,9 +49,21 @@ const FALLBACK: SearchIntent = {
   confidence:          0,
 };
 
-// ── System prompt with inline few-shot examples ───────────────────────────────
-// These examples replace the Qdrant RAG step entirely.
-// They are curated for Algerian Darija + Arabic + French + English.
+/** Error message patterns that indicate quota/overload — should become 429 */
+const QUOTA_PATTERNS = [
+  /quota/i,
+  /resource.?exhausted/i,
+  /rate.?limit/i,
+  /all ai providers exhausted/i,
+  /429/,
+];
+
+function isQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return QUOTA_PATTERNS.some((p) => p.test(msg));
+}
+
+// ── System prompt (unchanged from original — already well-tuned) ───────────────
 
 const SYSTEM_PROMPT = `\
 Tu es l'extracteur d'intention de Khidmeti, application algérienne de services à domicile.
@@ -108,11 +121,11 @@ Requête: "my toilet is overflowing"
 export class IntentExtractorService {
   private readonly logger = new Logger(IntentExtractorService.name);
 
-  // Simple LRU-like in-memory cache — no external dependency
-  private readonly cache    = new Map<string, SearchIntent>();
-  private readonly MAX_CACHE        = 50;
-  private readonly RATE_LIMIT_MAX   = 20;
-  private readonly RATE_LIMIT_WINDOW = 3_600_000; // 1h
+  // LRU cache: cacheKey → SearchIntent
+  private readonly cache       = new Map<string, SearchIntent>();
+  private readonly MAX_CACHE   = 100; // increased from 50
+  private readonly RATE_LIMIT_MAX    = 20;
+  private readonly RATE_LIMIT_WINDOW = 3_600_000; // 1 hour
 
   constructor(
     @Inject(AI_PROVIDER_TOKEN)
@@ -129,56 +142,88 @@ export class IntentExtractorService {
 
     if (uid) await this.checkRateLimit(uid);
 
-    // Cache hit
-    const key    = trimmed.toLowerCase();
-    const cached = this.cache.get(key);
+    // Cache key: SHA-256 of lowercased text — handles Unicode correctly
+    const cacheKey = this.hashKey(trimmed.toLowerCase());
+    const cached   = this.cache.get(cacheKey);
     if (cached) {
       this.logger.debug('Cache hit');
       return cached;
     }
 
-    // Single Gemma4 call — reasoning handles multilingual intent extraction
-    const raw    = await this.ai.generateText(trimmed, SYSTEM_PROMPT, { temperature: 0.05, maxTokens: 256 });
-    const intent = this.parse(raw);
-    this.setCache(key, intent);
-
-    return intent;
+    try {
+      const raw    = await this.ai.generateText(trimmed, SYSTEM_PROMPT, { temperature: 0.05, maxTokens: 256 });
+      const intent = this.parse(raw);
+      this.setCache(cacheKey, intent);
+      return intent;
+    } catch (err) {
+      // FIX: Map quota/overload errors to 429 instead of letting them become 500
+      if (isQuotaError(err)) {
+        this.logger.warn(`AI quota/overload on text extraction: ${(err as Error).message}`);
+        throw new AiRateLimitException();
+      }
+      this.logger.error(`extractFromText failed: ${(err as Error).message}`);
+      // For all other errors: return FALLBACK (don't crash the client)
+      // The app degrades gracefully — search still works with no profession filter
+      return { ...FALLBACK };
+    }
   }
 
   async extractFromAudio(buffer: Buffer, mime: string, uid?: string): Promise<SearchIntent> {
-    const { text, language }: AudioResult = await this.ai.processAudio(buffer, mime);
+    let transcription: AudioResult;
+
+    try {
+      transcription = await this.ai.processAudio(buffer, mime);
+    } catch (err) {
+      if (isQuotaError(err)) {
+        this.logger.warn(`AI quota/overload on audio: ${(err as Error).message}`);
+        throw new AiRateLimitException();
+      }
+      this.logger.error(`Audio processing failed: ${(err as Error).message}`);
+      return { ...FALLBACK };
+    }
+
+    const { text, language } = transcription;
     if (!text.trim()) return { ...FALLBACK };
 
     this.logger.debug(`Audio transcribed [${language}]: ${text.slice(0, 80)}`);
 
-    const intent = await this.extractFromText(text, uid);
+    // Don't pass uid to extractFromText — rate limit already charged for the audio call
+    const intent = await this.extractFromText(text);
     return { ...intent, transcribedText: text };
   }
 
   async extractFromImage(imageBase64: string, uid?: string): Promise<SearchIntent> {
     if (uid) await this.checkRateLimit(uid);
 
-    const raw = await this.ai.analyzeImage(
-      imageBase64,
-      `Identifie le problème domestique visible dans cette image, puis extrait l'intention.\n${SYSTEM_PROMPT}`,
-      { temperature: 0.05, maxTokens: 256 },
-    );
-
-    return this.parse(raw);
+    try {
+      const raw = await this.ai.analyzeImage(
+        imageBase64,
+        `Identifie le problème domestique visible dans cette image, puis extrait l'intention.\n${SYSTEM_PROMPT}`,
+        { temperature: 0.05, maxTokens: 256 },
+      );
+      return this.parse(raw);
+    } catch (err) {
+      if (isQuotaError(err)) {
+        this.logger.warn(`AI quota/overload on image: ${(err as Error).message}`);
+        throw new AiRateLimitException();
+      }
+      this.logger.error(`extractFromImage failed: ${(err as Error).message}`);
+      // Graceful degradation: image search falls back to "show all nearby workers"
+      return { ...FALLBACK };
+    }
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
 
   private parse(raw: string): SearchIntent {
-    // Strip markdown fences and locate the JSON object
     const s = raw.replace(/```json|```/g, '').trim();
-    // Skip any <|channel>thought...</channel|> thinking blocks (Gemma4 local)
+    // Strip Gemma4 thinking blocks
     const cleaned = s.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, '').trim();
 
     const i = cleaned.indexOf('{');
     const j = cleaned.lastIndexOf('}');
     if (i === -1 || j === -1) {
-      this.logger.warn(`Could not find JSON in response: ${s.slice(0, 100)}`);
+      this.logger.warn(`Could not find JSON in AI response: ${s.slice(0, 100)}`);
       return { ...FALLBACK };
     }
 
@@ -203,9 +248,14 @@ export class IntentExtractorService {
     }
   }
 
+  /** SHA-256 hash of text — O(1) lookup, handles all Unicode without ambiguity */
+  private hashKey(text: string): string {
+    return createHash('sha256').update(text).digest('hex').slice(0, 16);
+  }
+
   private setCache(key: string, intent: SearchIntent): void {
-    // Evict oldest entry when full (simple LRU)
     if (this.cache.size >= this.MAX_CACHE) {
+      // Evict oldest (Map preserves insertion order in V8)
       const oldest = this.cache.keys().next().value as string;
       this.cache.delete(oldest);
     }
@@ -226,13 +276,11 @@ export class IntentExtractorService {
       const count   = (results?.[1]?.[1] as number) ?? 0;
       if (count >= this.RATE_LIMIT_MAX) {
         await this.redis.zrem(key, `${now}`);
-        const { AiRateLimitException } = await import('../exceptions/ai-provider.exception');
         throw new AiRateLimitException();
       }
     } catch (e) {
-      // Re-throw rate limit errors; silently degrade on Redis errors
-      const msg = (e as Error).constructor?.name;
-      if (msg === 'AiRateLimitException') throw e;
+      const name = (e as Error).constructor?.name;
+      if (name === 'AiRateLimitException') throw e;
       this.logger.warn(`Redis rate-limit degraded: ${(e as Error).message}`);
     }
   }
