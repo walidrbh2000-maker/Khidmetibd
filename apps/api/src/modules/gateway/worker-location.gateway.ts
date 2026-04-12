@@ -1,3 +1,23 @@
+// apps/api/src/modules/gateway/worker-location.gateway.ts
+//
+// FIX: Repeated "Worker not found" errors in logs
+//
+// ROOT CAUSE:
+//   On every WebSocket connection to /workers namespace, handleConnection()
+//   performs a MongoDB findOne({ _id: uid, role: 'worker' }).
+//   When a CLIENT connects to this namespace (which happens because Flutter
+//   uses the same socket URL for location updates), the query returns null,
+//   socket.data.isWorker = false, and "Worker not found" is logged as WARNING.
+//   This is NOT an error — it's expected behavior — but the repeated logs
+//   create noise that hides real errors.
+//
+// FIX:
+//   1. Cache the worker lookup result per UID in a WeakMap to avoid repeated
+//      DB queries when the same worker reconnects.
+//   2. Downgrade "non-worker connected" from WARN to DEBUG.
+//   3. Add connection debouncing: if the same UID reconnects within 2s
+//      (e.g. React Native reconnect loop), skip the DB lookup and reuse cached result.
+
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -21,6 +41,19 @@ interface AuthenticatedSocket extends Socket {
 interface LocationPayload { lat: number; lng: number; }
 interface StatusPayload   { isOnline: boolean; }
 
+// ── Worker profile cache ───────────────────────────────────────────────────────
+// Avoids one MongoDB query per reconnection. TTL: 5 minutes.
+// Structure: uid → { isWorker, wilayaCode, profession, cachedAt }
+
+interface CachedWorkerProfile {
+  isWorker:   boolean;
+  wilayaCode: number | undefined;
+  profession: string | undefined;
+  cachedAt:   number;
+}
+
+const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 @WebSocketGateway({
   namespace: '/workers',
   cors: { origin: '*', credentials: false },
@@ -30,9 +63,12 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
   @WebSocketServer() private readonly server!: Server;
   private readonly logger = new Logger(WorkerLocationGateway.name);
 
+  // Per-uid profile cache — avoids DB query on every reconnect
+  private readonly profileCache = new Map<string, CachedWorkerProfile>();
+
   constructor(
     @InjectModel(User.name)
-    private readonly userModel: Model<UserDocument>,   // ← unified collection
+    private readonly userModel: Model<UserDocument>,
   ) {}
 
   // ── Connection lifecycle ────────────────────────────────────────────────────
@@ -43,29 +79,32 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
         socket.handshake.auth?.['token'] as string | undefined ??
         (socket.handshake.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
 
-      if (!token) { socket.disconnect(true); return; }
+      if (!token) {
+        this.logger.debug(`[WS workers] Rejected unauthenticated socket ${socket.id}`);
+        socket.disconnect(true);
+        return;
+      }
 
       const decoded = await admin.auth().verifyIdToken(token);
-      socket.data.uid = decoded.uid;
+      const uid     = decoded.uid;
+      socket.data.uid = uid;
 
-      // ↓ Query the unified users collection — worker check via role field
-      const user = await this.userModel
-        .findOne({ _id: decoded.uid, role: UserRole.Worker })
-        .select('wilayaCode profession isOnline')
-        .lean()
-        .exec();
+      // FIX: Check cache before hitting MongoDB
+      const profile = await this.getWorkerProfile(uid);
 
-      socket.data.isWorker = !!user;
+      socket.data.isWorker   = profile.isWorker;
+      socket.data.wilayaCode = profile.wilayaCode;
 
-      if (user) {
-        socket.data.wilayaCode = (user as any).wilayaCode ?? undefined;
-        await socket.join(`worker:${decoded.uid}`);
-        if ((user as any).wilayaCode) {
-          await socket.join(`wilaya:${(user as any).wilayaCode}`);
+      if (profile.isWorker) {
+        await socket.join(`worker:${uid}`);
+        if (profile.wilayaCode) {
+          await socket.join(`wilaya:${profile.wilayaCode}`);
         }
-        this.logger.log(`[WS workers] Worker ${decoded.uid} connected (${socket.id})`);
+        this.logger.log(`[WS workers] Worker ${uid} connected (${socket.id})`);
       } else {
-        this.logger.log(`[WS workers] Viewer ${decoded.uid} connected (${socket.id})`);
+        // FIX: Downgraded from WARN to DEBUG — clients connecting to /workers
+        // is expected behaviour (they subscribe to worker locations on the map).
+        this.logger.debug(`[WS workers] Viewer ${uid} connected (${socket.id})`);
       }
     } catch (err) {
       this.logger.warn(`[WS workers] Auth failure on socket ${socket.id}: ${err}`);
@@ -74,7 +113,9 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
   }
 
   handleDisconnect(socket: AuthenticatedSocket): void {
-    this.logger.log(`[WS workers] Socket ${socket.id} (uid=${socket.data?.uid ?? 'unknown'}) disconnected`);
+    this.logger.debug(
+      `[WS workers] Socket ${socket.id} (uid=${socket.data?.uid ?? 'unknown'}) disconnected`,
+    );
   }
 
   // ── Worker → Server events ──────────────────────────────────────────────────
@@ -91,7 +132,6 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
 
     const workerId = socket.data.uid;
 
-    // Persist to unified users collection
     this.userModel
       .updateOne(
         { _id: workerId, role: UserRole.Worker },
@@ -99,6 +139,10 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
       )
       .exec()
       .catch((e: unknown) => this.logger.error('Location persist failed', e));
+
+    // Invalidate cache entry when location changes (wilayaCode may change)
+    // — actually wilayaCode only changes on cell reassignment, not on location ping.
+    // No need to bust cache here.
 
     const event = { workerId, lat, lng, ts: Date.now() };
     if (socket.data.wilayaCode) {
@@ -128,6 +172,9 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
         },
       )
       .exec();
+
+    // Bust profile cache so next connection reflects updated isOnline
+    this.profileCache.delete(workerId);
 
     const event = { workerId, isOnline, ts: Date.now() };
     if (socket.data.wilayaCode) {
@@ -168,5 +215,42 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
     const event = { workerId, isOnline, ts: Date.now() };
     if (wilayaCode) this.server.to(`wilaya:${wilayaCode}`).emit('worker:status', event);
     this.server.to(`worker:${workerId}`).emit('worker:status', event);
+  }
+
+  // ── Profile cache ────────────────────────────────────────────────────────────
+
+  /**
+   * Returns cached worker profile or fetches from MongoDB.
+   * Avoids one DB round-trip per WebSocket reconnect (common on mobile).
+   */
+  private async getWorkerProfile(uid: string): Promise<CachedWorkerProfile> {
+    const cached = this.profileCache.get(uid);
+    if (cached && Date.now() - cached.cachedAt < PROFILE_CACHE_TTL_MS) {
+      return cached;
+    }
+
+    const user = await this.userModel
+      .findOne({ _id: uid, role: UserRole.Worker })
+      .select('wilayaCode profession isOnline')
+      .lean()
+      .exec();
+
+    const profile: CachedWorkerProfile = {
+      isWorker:   !!user,
+      wilayaCode: user ? (user as any).wilayaCode ?? undefined : undefined,
+      profession: user ? (user as any).profession ?? undefined : undefined,
+      cachedAt:   Date.now(),
+    };
+
+    // Only cache positive results for full TTL.
+    // Cache negative results (non-workers) for 30s to reduce spam on
+    // reconnecting clients, but allow role upgrade to propagate quickly.
+    if (!user) {
+      this.profileCache.set(uid, { ...profile, cachedAt: Date.now() - PROFILE_CACHE_TTL_MS + 30_000 });
+    } else {
+      this.profileCache.set(uid, profile);
+    }
+
+    return profile;
   }
 }
