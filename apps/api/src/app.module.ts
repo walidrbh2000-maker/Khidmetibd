@@ -1,3 +1,7 @@
+// apps/api/src/app.module.ts
+// FIX: HealthController now receives AI_PROVIDER_TOKEN via DI
+// to expose circuit breaker health at GET /health/detail
+
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
@@ -29,6 +33,13 @@ import { HealthController }         from './health.controller';
         maxPoolSize:              10,
         serverSelectionTimeoutMS: 5000,
         socketTimeoutMS:          45000,
+        // FIX: Suppress Mongoose 8.x autoIndex warnings on _id fields.
+        // The 'users', 'worker_bids', etc. collections use string _id (Firebase UID).
+        // Mongoose tries to add a sparse index on top of MongoDB's default _id index,
+        // which logs "Warning: Can not overwrite the default `_id` index".
+        // autoIndex: false in production means Mongoose won't attempt to sync indexes
+        // on startup — run `db.collection.createIndexes()` in your migration instead.
+        autoIndex: process.env['NODE_ENV'] !== 'production',
       }),
     }),
 
@@ -40,10 +51,10 @@ import { HealthController }         from './health.controller';
 
     DatabaseModule,
     QdrantModule,
-    AiModule,
+    AiModule,       // exports AI_PROVIDER_TOKEN — HealthController can inject it
     MediaModule,
     UsersModule,
-    WorkersModule,            // facade — delegates to UsersModule internally
+    WorkersModule,
     ServiceRequestsModule,
     BidsModule,
     LocationModule,
