@@ -2,29 +2,16 @@
 //
 // STEP 5 MIGRATION: Replaces AiIntentExtractorService.
 //
-// IDENTICAL external API to AiIntentExtractorService — method signatures,
-// exception types, and error codes are preserved so HomeSearchController
-// and all other callers need ZERO changes.
+// PATCH — Bug 2 fix (photo search):
+//   - _extractWithImage: ContentType explicite via http_parser MediaType
+//   - _detectImageMime: détection depuis magic bytes (pur Dart)
 //
-// Instead of calling Google Gemini directly from the Flutter client,
-// all AI inference is routed through the NestJS backend which applies
-// the Strategy Pattern (Gemini/Ollama/vLLM) based on AI_PROVIDER env var.
-//
-// Endpoints:
-//   extract(text)            → POST /ai/extract-intent            { text }
-//   extract(text+image)      → POST /ai/extract-intent/image      multipart
-//   extractFromAudio(bytes)  → POST /ai/extract-intent/audio      multipart
-//
-// KEPT from original:
-//   • LRU cache 20 entries (client-side dedup — server has its own)
-//   • Rate limit 20/hour client-side guard
-//   • AiIntentExtractorException + AiExtractorErrorCode values
-//   • _isBusy guard (no concurrent calls)
-//
-// REMOVED:
-//   • package:google_generative_ai
-//   • GenerativeModel, Content, Part, _systemPrompt, _modelName
+// PATCH — Bug 3 fix (audio intermittent):
+//   - _isBusy scindé en _isBusyText + _isBusyAudio (isolation)
+//   - extractFromAudio: retry x2 sur 5xx/timeout
+//   - ContentType explicite sur le multipart audio
 
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -32,6 +19,7 @@ import 'dart:typed_data';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import '../models/search_intent.dart';
 
@@ -63,15 +51,19 @@ class AiIntentExtractorException implements Exception {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class LocalAiService {
-  final String     _baseUrl;
+  final String      _baseUrl;
   final http.Client _http;
 
-  static const Duration _callTimeout    = Duration(seconds: 15);
-  static const int      _cacheCapacity  = 20;
+  static const Duration _callTimeout     = Duration(seconds: 15);
+  static const int      _cacheCapacity   = 20;
   static const int      _maxCallsPerHour = 20;
 
-  bool _isBusy = false;
-  bool get isBusy => _isBusy;
+  // BUG 3 FIX: scinder en deux pour ne pas bloquer l'audio quand une
+  // requête image/texte est en cours (et vice-versa).
+  bool _isBusyText  = false; // garde pour extract() text + image
+  bool _isBusyAudio = false; // garde pour extractFromAudio()
+
+  bool get isBusy => _isBusyText || _isBusyAudio;
 
   // LRU cache (text-only queries)
   final _cache = LinkedHashMap<String, SearchIntent>(
@@ -137,7 +129,8 @@ class LocalAiService {
       );
     }
 
-    if (_isBusy) {
+    // BUG 3 FIX: utiliser _isBusyText uniquement (pas _isBusyAudio)
+    if (_isBusyText) {
       throw const AiIntentExtractorException(
         'Already processing a request',
         code: AiExtractorErrorCode.alreadyProcessing,
@@ -157,7 +150,7 @@ class LocalAiService {
       if (cachedResult != null) return cachedResult;
     }
 
-    _isBusy = true;
+    _isBusyText = true;
     try {
       SearchIntent result;
       if (hasImage) {
@@ -169,14 +162,16 @@ class LocalAiService {
       _recordCall();
       return result;
     } finally {
-      _isBusy = false;
+      _isBusyText = false;
     }
   }
 
   /// Extracts a [SearchIntent] from raw audio bytes.
+  /// BUG 3 FIX: retry x2 sur 5xx/timeout + _isBusyAudio séparé.
   Future<SearchIntent> extractFromAudio(
     Uint8List audioBytes, {
-    String mime = 'audio/m4a',
+    String mime       = 'audio/m4a',
+    int    maxRetries = 2,
   }) async {
     if (audioBytes.isEmpty) {
       throw const AiIntentExtractorException(
@@ -185,9 +180,10 @@ class LocalAiService {
       );
     }
 
-    if (_isBusy) {
+    // BUG 3 FIX: garde audio indépendante de la garde texte/image
+    if (_isBusyAudio) {
       throw const AiIntentExtractorException(
-        'Already processing a request',
+        'Already processing an audio request',
         code: AiExtractorErrorCode.alreadyProcessing,
       );
     }
@@ -199,30 +195,68 @@ class LocalAiService {
       );
     }
 
-    _isBusy = true;
-    try {
-      final token   = await _getToken();
-      final request = http.MultipartRequest(
-        'POST',
-        Uri.parse('$_baseUrl/ai/extract-intent/audio'),
-      );
-      if (token != null) request.headers['Authorization'] = 'Bearer $token';
-      request.files.add(http.MultipartFile.fromBytes(
-        'file',
-        audioBytes,
-        filename:    'audio.m4a',
-      ));
+    _isBusyAudio = true;
+    Exception? lastError;
 
-      final streamed  = await request.send().timeout(_callTimeout);
-      final response  = await http.Response.fromStream(streamed);
-      _recordCall();
-      return _parseResponse(response);
-    } on AiIntentExtractorException {
-      rethrow;
-    } catch (e) {
-      throw _classifyError(e);
+    try {
+      for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          final token   = await _getToken();
+          final request = http.MultipartRequest(
+            'POST',
+            Uri.parse('$_baseUrl/ai/extract-intent/audio'),
+          );
+          if (token != null) request.headers['Authorization'] = 'Bearer $token';
+
+          // BUG 3 FIX: MediaType explicite pour éviter application/octet-stream
+          request.files.add(http.MultipartFile.fromBytes(
+            'file',
+            audioBytes,
+            filename:    'audio.m4a',
+            contentType: MediaType.parse(mime),
+          ));
+
+          final streamed = await request.send().timeout(_callTimeout);
+          final response = await http.Response.fromStream(streamed);
+
+          // Retry sur erreur 5xx transitoire (503 overload, 502 gateway)
+          if (response.statusCode >= 500 && attempt < maxRetries) {
+            if (kDebugMode) {
+              debugPrint('[LocalAiService] Audio attempt $attempt failed '
+                  '(${response.statusCode}), retrying...');
+            }
+            await Future.delayed(Duration(seconds: attempt));
+            continue;
+          }
+
+          _recordCall();
+          return _parseResponse(response);
+
+        } on AiIntentExtractorException {
+          rethrow; // quota/overload → pas de retry
+        } on TimeoutException {
+          lastError = const AiIntentExtractorException(
+            'Audio request timed out',
+            code: AiExtractorErrorCode.timeout,
+          );
+          if (attempt < maxRetries) {
+            await Future.delayed(const Duration(seconds: 2));
+          }
+        } catch (e) {
+          lastError = _classifyError(e);
+          if (attempt < maxRetries) {
+            await Future.delayed(const Duration(seconds: 1));
+          }
+        }
+      }
+
+      throw lastError ??
+          const AiIntentExtractorException(
+            'Audio extraction failed after retries',
+            code: AiExtractorErrorCode.network,
+          );
     } finally {
-      _isBusy = false;
+      _isBusyAudio = false;
     }
   }
 
@@ -241,24 +275,59 @@ class LocalAiService {
     return _parseResponse(response);
   }
 
+  /// BUG 2 FIX: ContentType explicite depuis magic bytes.
   Future<SearchIntent> _extractWithImage(
       String text, Uint8List imageBytes, String? mime) async {
+    // Détecter le vrai MIME depuis les magic bytes (plus fiable que le param)
+    final detectedMime = _detectImageMime(imageBytes) ?? mime ?? 'image/jpeg';
+    final extension    = detectedMime == 'image/png' ? 'png' : 'jpg';
+
     final token   = await _getToken();
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$_baseUrl/ai/extract-intent/image'),
     );
     if (token != null) request.headers['Authorization'] = 'Bearer $token';
+
+    // BUG 2 FIX: MediaType explicite — évite application/octet-stream
     request.files.add(http.MultipartFile.fromBytes(
       'file',
       imageBytes,
-      filename: 'image.jpg',
+      filename:    'image.$extension',
+      contentType: MediaType.parse(detectedMime),
     ));
-    if (text.trim().isNotEmpty) request.fields['text'] = text.trim();
+
+    // Contexte textuel optionnel (aide Gemini à identifier le problème)
+    if (text.trim().isNotEmpty) {
+      request.fields['text'] = text.trim();
+    }
 
     final streamed = await request.send().timeout(_callTimeout);
     final response = await http.Response.fromStream(streamed);
     return _parseResponse(response);
+  }
+
+  /// BUG 2 FIX: Détection MIME depuis magic bytes — évite application/octet-stream.
+  String? _detectImageMime(Uint8List bytes) {
+    if (bytes.length < 4) return null;
+    // JPEG: FF D8 FF
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+      return 'image/jpeg';
+    }
+    // PNG: 89 50 4E 47
+    if (bytes[0] == 0x89 && bytes[1] == 0x50 &&
+        bytes[2] == 0x4E && bytes[3] == 0x47) {
+      return 'image/png';
+    }
+    // WebP: RIFF....WEBP
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 && bytes[1] == 0x49 &&
+        bytes[2] == 0x46 && bytes[3] == 0x46 &&
+        bytes[8] == 0x57 && bytes[9] == 0x45 &&
+        bytes[10] == 0x42 && bytes[11] == 0x50) {
+      return 'image/webp';
+    }
+    return null;
   }
 
   SearchIntent _parseResponse(http.Response response) {

@@ -1,24 +1,13 @@
 // lib/services/api_service.dart
 //
 // MIGRATION — COLLECTION UNIFIÉE
-// ────────────────────────────────────────────────────────────────────────────
-// Changements post-migration par rapport à la version précédente :
+// PATCH — Hybrid HTTP+WS streams (Bug 1 fix)
 //
-//   createOrUpdateWorker() :
-//     • Ajout de `'role': 'worker'` dans le payload HTTP.
-//       Le serveur NestJS l'enforce de toute façon via CreateWorkerDto, mais
-//       l'envoyer explicitement rend l'intention lisible et évite toute
-//       ambiguïté si le DTO évolue.
-//     • `worker.profession` est maintenant `String?` (UserModel) au lieu de
-//       `String` (ancienne WorkerModel). Guard ajouté pour éviter d'envoyer
-//       null à un champ @IsNotEmpty() côté serveur.
+// Tous les streams délèguent désormais à _hybridRequestStream / _hybridBidStream :
+//   1. GET HTTP immédiat → émet les données au listener
+//   2. Signal WebSocket arrive → re-fetch HTTP → émet la nouvelle liste
 //
-//   Types : WorkerModel = UserModel via typedef — aucun changement de code
-//   requis ailleurs. Les caches restent ApiCache<WorkerModel> = ApiCache<UserModel>.
-//
-// FIX (Registration P0) : createOrUpdateUser / createOrUpdateWorker envoient
-// des payloads champ-par-champ plutôt que user.toMap() pour éviter les 400
-// causés par forbidNonWhitelisted=true dans ValidationPipe NestJS.
+// Aucun changement requis dans les controllers ou providers.
 
 import 'dart:async';
 import 'dart:convert';
@@ -39,10 +28,6 @@ import 'realtime_service.dart';
 
 export 'api_cache.dart' show ApiServiceException;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Exception
-// ─────────────────────────────────────────────────────────────────────────────
-
 class ApiServiceException implements Exception {
   final String  message;
   final String? code;
@@ -55,17 +40,11 @@ class ApiServiceException implements Exception {
       'ApiServiceException: $message${code != null ? ' ($code)' : ''}';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ApiService
-// ─────────────────────────────────────────────────────────────────────────────
-
 class ApiService {
   final String          _baseUrl;
   final RealtimeService _realtime;
   final http.Client     _http;
 
-  // WorkerModel = UserModel via typedef — les caches sont typiquement distincts
-  // pour isoler les TTL et les évictions, même si le type sous-jacent est identique.
   final ApiCache<UserModel>                   _userCache;
   final ApiCache<WorkerModel>                 _workerCache;
   final ApiCache<ServiceRequestEnhancedModel> _requestCache;
@@ -182,6 +161,97 @@ class ApiService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // HYBRID STREAM UTILITIES — BUG 1 FIX
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Principe :
+  //   1. À l'abonnement → GET HTTP immédiat → émet les données
+  //   2. Signal WebSocket → re-fetch HTTP → émet la liste à jour
+  //
+  // Les streams WS purs de RealtimeService n'émettent que sur événements
+  // futurs → liste vide au chargement de l'écran.
+  // Ce pattern hybride garantit des données dès le premier frame.
+
+  Stream<List<ServiceRequestEnhancedModel>> _hybridRequestStream({
+    required String httpQuery,
+    required Stream<List<ServiceRequestEnhancedModel>> wsSignal,
+  }) {
+    late StreamController<List<ServiceRequestEnhancedModel>> ctrl;
+    StreamSubscription<List<ServiceRequestEnhancedModel>>? wsSub;
+
+    Future<void> fetch() async {
+      if (ctrl.isClosed) return;
+      try {
+        final data = await _get(httpQuery);
+        if (data == null || ctrl.isClosed) return;
+        final list = (data as List)
+            .map((e) => ServiceRequestEnhancedModel.fromJson(
+                (e as Map).cast<String, dynamic>()))
+            .toList();
+        ctrl.add(list);
+      } catch (e) {
+        if (!ctrl.isClosed) ctrl.addError(e);
+      }
+    }
+
+    ctrl = StreamController<List<ServiceRequestEnhancedModel>>.broadcast(
+      onListen: () {
+        fetch(); // HTTP initial, non-bloquant
+        wsSub = wsSignal.listen(
+          (_) => fetch(), // signal d'invalidation → re-fetch
+          onError: (Object e) { if (!ctrl.isClosed) ctrl.addError(e); },
+          cancelOnError: false,
+        );
+      },
+      onCancel: () {
+        wsSub?.cancel();
+        wsSub = null;
+      },
+    );
+
+    return ctrl.stream;
+  }
+
+  Stream<List<WorkerBidModel>> _hybridBidStream({
+    required String httpQuery,
+    required Stream<List<WorkerBidModel>> wsSignal,
+  }) {
+    late StreamController<List<WorkerBidModel>> ctrl;
+    StreamSubscription<List<WorkerBidModel>>? wsSub;
+
+    Future<void> fetch() async {
+      if (ctrl.isClosed) return;
+      try {
+        final data = await _get(httpQuery);
+        if (data == null || ctrl.isClosed) return;
+        ctrl.add((data as List)
+            .map((e) => WorkerBidModel.fromJson(
+                (e as Map).cast<String, dynamic>()))
+            .toList());
+      } catch (e) {
+        if (!ctrl.isClosed) ctrl.addError(e);
+      }
+    }
+
+    ctrl = StreamController<List<WorkerBidModel>>.broadcast(
+      onListen: () {
+        fetch();
+        wsSub = wsSignal.listen(
+          (_) => fetch(),
+          onError: (Object e) { if (!ctrl.isClosed) ctrl.addError(e); },
+          cancelOnError: false,
+        );
+      },
+      onCancel: () {
+        wsSub?.cancel();
+        wsSub = null;
+      },
+    );
+
+    return ctrl.stream;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // MÉTHODES USER
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -204,8 +274,6 @@ class ApiService {
 
   Future<void> setUser(UserModel user) => createOrUpdateUser(user);
 
-  /// Payload explicitement limité aux champs déclarés dans CreateUserDto NestJS.
-  /// forbidNonWhitelisted=true rejette tout champ supplémentaire avec 400.
   Future<void> createOrUpdateUser(UserModel user) async {
     _ensureNotDisposed();
 
@@ -252,7 +320,6 @@ class ApiService {
   // ═══════════════════════════════════════════════════════════════════════════
   // MÉTHODES WORKER
   // ═══════════════════════════════════════════════════════════════════════════
-  // WorkerModel = UserModel via typedef — le serveur filtre avec role='worker'.
 
   Future<WorkerModel?> getWorker(String workerId) async {
     _ensureNotDisposed();
@@ -262,7 +329,6 @@ class ApiService {
     try {
       final data = await _get('/workers/$workerId');
       if (data == null) return null;
-      // WorkerModel.fromJson = UserModel.fromJson via typedef
       final worker = WorkerModel.fromJson(data as Map<String, dynamic>);
       _workerCache.set(workerId, worker);
       return worker;
@@ -274,13 +340,6 @@ class ApiService {
 
   Future<void> setWorker(WorkerModel worker) => createOrUpdateWorker(worker);
 
-  /// Payload explicitement limité aux champs déclarés dans CreateWorkerDto NestJS.
-  ///
-  /// MIGRATION :
-  ///   • `role: 'worker'` ajouté — le serveur l'enforce, mais l'envoyer
-  ///     explicitement garantit la cohérence si le DTO évolue.
-  ///   • `profession` est maintenant String? (UserModel). Guard isNotEmpty
-  ///     ajouté pour ne pas envoyer null à un champ @IsNotEmpty() serveur.
   Future<void> createOrUpdateWorker(WorkerModel worker) async {
     _ensureNotDisposed();
 
@@ -288,8 +347,7 @@ class ApiService {
       'id':    worker.id,
       'name':  worker.name,
       'email': worker.email,
-      'role':  'worker',            // ← MIGRATION : explicite
-      // profession peut être null pour UserModel ; guard obligatoire
+      'role':  'worker',
       if (worker.profession?.isNotEmpty == true)
         'profession': worker.profession,
       'isOnline': worker.isOnline,
@@ -459,34 +517,79 @@ class ApiService {
     });
   }
 
+  // ── Stream methods — HYBRID HTTP+WS (Bug 1 fix) ──────────────────────────
+
+  /// Single request stream: WS already pushes full payload, no hybrid needed.
   Stream<ServiceRequestEnhancedModel?> streamServiceRequest(String requestId) =>
       _realtime.streamServiceRequest(requestId);
 
-  Stream<List<ServiceRequestEnhancedModel>> streamUserServiceRequests(String userId) =>
-      _realtime.streamUserServiceRequests(userId);
+  /// Client's request list — HTTP initial + WS invalidation.
+  Stream<List<ServiceRequestEnhancedModel>> streamUserServiceRequests(
+      String userId) =>
+      _hybridRequestStream(
+        httpQuery: '/service-requests?userId=$userId&limit=50',
+        wsSignal: _realtime.streamUserServiceRequests(userId),
+      );
 
+  /// Worker's assigned requests — HTTP initial + WS invalidation.
   Stream<List<ServiceRequestEnhancedModel>> streamWorkerServiceRequests(
-          String workerId, {int? wilayaCode}) =>
-      _realtime.streamWorkerServiceRequests(workerId, wilayaCode: wilayaCode);
+      String workerId, {int? wilayaCode}) {
+    final query = StringBuffer(
+        '/service-requests?workerId=$workerId&limit=50'
+        '&status=open,awaitingSelection,bidSelected,inProgress,completed');
+    if (wilayaCode != null) query.write('&wilayaCode=$wilayaCode');
+    return _hybridRequestStream(
+      httpQuery: query.toString(),
+      wsSignal:
+          _realtime.streamWorkerServiceRequests(workerId, wilayaCode: wilayaCode),
+    );
+  }
 
+  /// Available requests for Browse tab — HTTP initial + WS invalidation.
   Stream<List<ServiceRequestEnhancedModel>> streamAvailableRequests({
-    required int wilayaCode, required String serviceType,
-  }) => _realtime.streamAvailableRequests(wilayaCode: wilayaCode, serviceType: serviceType);
+    required int wilayaCode,
+    required String serviceType,
+  }) =>
+      _hybridRequestStream(
+        httpQuery: '/service-requests'
+            '?wilayaCode=$wilayaCode'
+            '&serviceType=$serviceType'
+            '&status=open,awaitingSelection'
+            '&limit=50',
+        wsSignal: _realtime.streamAvailableRequests(
+            wilayaCode: wilayaCode, serviceType: serviceType),
+      );
 
-  Stream<List<ServiceRequestEnhancedModel>> streamWorkerActiveJobs(String workerId) =>
-      _realtime.streamWorkerActiveJobs(workerId);
+  /// Worker active jobs — HTTP initial + WS invalidation.
+  Stream<List<ServiceRequestEnhancedModel>> streamWorkerActiveJobs(
+      String workerId) =>
+      _hybridRequestStream(
+        httpQuery: '/service-requests?workerId=$workerId'
+            '&status=bidSelected,inProgress&limit=20',
+        wsSignal: _realtime.streamWorkerActiveJobs(workerId),
+      );
 
+  /// Worker assigned requests (worker home screen) — HTTP initial + WS invalidation.
   Stream<List<ServiceRequestEnhancedModel>> streamWorkerAssignedRequests(
-          String workerId, {int limit = 30}) =>
-      _realtime.streamWorkerAssignedRequests(workerId, limit: limit);
+      String workerId, {int limit = 30}) =>
+      _hybridRequestStream(
+        httpQuery: '/service-requests?workerId=$workerId&limit=$limit',
+        wsSignal: _realtime.streamWorkerAssignedRequests(workerId, limit: limit),
+      );
 
-  // ── Bids ───────────────────────────────────────────────────────────────────
+  // ── Bids — HYBRID ─────────────────────────────────────────────────────────
 
   Stream<List<WorkerBidModel>> streamBidsForRequest(String requestId) =>
-      _realtime.streamBidsForRequest(requestId);
+      _hybridBidStream(
+        httpQuery: '/bids?serviceRequestId=$requestId',
+        wsSignal: _realtime.streamBidsForRequest(requestId),
+      );
 
   Stream<List<WorkerBidModel>> streamWorkerBids(String workerId) =>
-      _realtime.streamWorkerBids(workerId);
+      _hybridBidStream(
+        httpQuery: '/bids?workerId=$workerId&limit=50',
+        wsSignal: _realtime.streamWorkerBids(workerId),
+      );
 
   Future<WorkerBidModel> createBid(WorkerBidModel bid) async {
     _ensureNotDisposed();
