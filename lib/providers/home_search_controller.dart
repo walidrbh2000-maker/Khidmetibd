@@ -1,11 +1,12 @@
 // lib/providers/home_search_controller.dart
 //
-// STEP 6 MIGRATION:
-//   • Removed: import '../services/ai_intent_extractor.dart'
-//   • Added:   import '../services/local_ai_service.dart'
-//   • Replaced: ref.read(aiIntentExtractorProvider) → ref.read(localAiServiceProvider)
-//   • AiIntentExtractorException / AiExtractorErrorCode unchanged — LocalAiService
-//     exports the same exception types so all catch blocks compile as-is.
+// STEP 6 MIGRATION: LocalAiService replaces AiIntentExtractorService.
+//
+// PATCH — Bug 2 fix (photo search "Erreur de recherche"):
+//   Quand Gemini retourne FALLBACK total (confidence < 0.1, profession=null),
+//   aller directement en HomeSearchStatus.results avec liste vide.
+//   Auparavant, _search() était appelé avec profession=null → résultats vides
+//   mais le widget photo interprétait l'absence de résultat comme une erreur.
 
 import 'dart:io';
 import 'dart:typed_data';
@@ -67,8 +68,12 @@ class HomeSearchState {
       status == HomeSearchStatus.searching;
 
   bool get hasResults => status == HomeSearchStatus.results;
-  bool get isEmpty    => hasResults && results.isEmpty;
-  bool get hasError   => status == HomeSearchStatus.error;
+
+  /// Vrai quand la recherche a abouti mais sans résultat (image non reconnue
+  /// ou aucun artisan à proximité) — distinct d'une vraie erreur réseau.
+  bool get isEmpty => hasResults && results.isEmpty;
+
+  bool get hasError => status == HomeSearchStatus.error;
 
   HomeSearchState copyWith({
     HomeSearchStatus?                   status,
@@ -105,6 +110,10 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
 
   static const double _lowConfidenceThreshold  = 0.35;
   static const double _highConfidenceThreshold = 0.70;
+
+  // BUG 2 FIX: seuil en dessous duquel on considère que l'image n'a rien
+  // identifié de valide — on va en "résultats vides" plutôt qu'en erreur.
+  static const double _fallbackConfidenceThreshold = 0.10;
 
   HomeSearchController(this._ref) : super(const HomeSearchState());
 
@@ -157,7 +166,6 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
 
     SearchIntent intent;
     try {
-      // STEP 6: localAiServiceProvider replaces aiIntentExtractorProvider
       final extractor = _ref.read(localAiServiceProvider);
       intent = await extractor.extract(text,
           imageBytes: imageBytes, mime: mime);
@@ -177,6 +185,24 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
         status:    HomeSearchStatus.error,
         error:     e.toString(),
         errorType: HomeSearchErrorType.unknown,
+      );
+      return;
+    }
+
+    // BUG 2 FIX: FALLBACK total (image non identifiée, confidence très basse)
+    // → aller en "résultats vides" plutôt que propager l'erreur downstream.
+    // Le widget photo affichera "Aucun artisan identifié" au lieu de
+    // "Erreur de recherche".
+    if (hasImage &&
+        intent.profession == null &&
+        (intent.confidence) < _fallbackConfidenceThreshold) {
+      AppLogger.info(
+          'HomeSearchController: FALLBACK total — image non reconnue '
+          '(confidence=${intent.confidence.toStringAsFixed(2)})');
+      state = state.copyWith(
+        status:     HomeSearchStatus.results,
+        results:    const [],
+        lastIntent: intent,
       );
       return;
     }
@@ -292,7 +318,6 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
 
     SearchIntent intent;
     try {
-      // STEP 6: localAiServiceProvider replaces aiIntentExtractorProvider
       final extractor = _ref.read(localAiServiceProvider);
       intent = await extractor.extractFromAudio(audioBytes);
       _recordCall();
