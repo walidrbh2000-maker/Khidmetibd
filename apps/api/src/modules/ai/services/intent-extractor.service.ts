@@ -1,26 +1,11 @@
 // apps/api/src/modules/ai/services/intent-extractor.service.ts
-//
-// FIXES:
-//  1. Proper error propagation — AI quota errors (429) are now returned as
-//     AiRateLimitException (HTTP 429) to the client, NOT as 500.
-//     Before: GeminiStrategy threw raw Error → NestJS caught it → 500 to Flutter.
-//     After:  ChainedAiStrategy throws typed Error → caught here → 429 to Flutter.
-//
-//  2. Cache key normalization — Arabic/Darija text was case-folded incorrectly.
-//     Now uses SHA-256 hash of normalized input as cache key to avoid
-//     collisions from Unicode normalization edge cases.
-//
-//  3. Audio result now includes transcribedText even on cache hits for audio
-//     flow. Previously extractFromText() overrode the transcription on cache hit.
-//
-//  4. Image extraction: quota error is now handled gracefully (returns FALLBACK
-//     with confidence=0 instead of 500).
 
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { createHash }                           from 'crypto';
 import type { IAiProvider, AudioResult }        from '../interfaces/ai-provider.interface';
 import { AI_PROVIDER_TOKEN }                    from '../interfaces/ai-provider.interface';
-import { AiRateLimitException }                 from '../exceptions/ai-provider.exception';
+import { AiRateLimitException, AiProviderException } from '../exceptions/ai-provider.exception';
+import { HttpStatus }                           from '@nestjs/common';
 import type { Redis }                           from 'ioredis';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -49,8 +34,25 @@ const FALLBACK: SearchIntent = {
   confidence:          0,
 };
 
-/** Error message patterns that indicate quota/overload — should become 429 */
-const QUOTA_PATTERNS = [
+// ── Error classification ───────────────────────────────────────────────────────
+//
+// Two distinct failure modes require two distinct HTTP responses:
+//
+//   QUOTA    (HTTP 429) — hard rate-limit; the caller must wait or upgrade quota.
+//   OVERLOAD (HTTP 503) — transient model demand spike; the caller should retry
+//                         automatically after a short back-off.
+//
+// Conflating them into a single 429 caused the Flutter client to display a
+// permanent "quota exceeded" message for temporary overloads that would have
+// resolved in seconds.
+//
+// Root cause of the original bug: Gemini 503 errors arrive as:
+//   { "error": { "code": 503, "status": "UNAVAILABLE", "message": "This model
+//     is currently experiencing high demand..." } }
+// None of the original QUOTA_PATTERNS matched "503" or "UNAVAILABLE".
+
+/** Patterns indicating a hard quota / rate-limit exhaustion → HTTP 429 */
+const QUOTA_PATTERNS: RegExp[] = [
   /quota/i,
   /resource.?exhausted/i,
   /rate.?limit/i,
@@ -58,12 +60,58 @@ const QUOTA_PATTERNS = [
   /429/,
 ];
 
+/**
+ * Patterns indicating a transient model overload / service unavailability
+ * → HTTP 503.  Gemini wraps these as { "status": "UNAVAILABLE", "code": 503 }.
+ */
+const OVERLOAD_PATTERNS: RegExp[] = [
+  /503/,
+  /unavailable/i,
+  /high demand/i,
+  /model.*overload/i,
+  /temporarily.*unavailable/i,
+  /please try again later/i,
+];
+
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return QUOTA_PATTERNS.some((p) => p.test(msg));
 }
 
-// ── System prompt (unchanged from original — already well-tuned) ───────────────
+function isOverloadError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Never double-classify: a quota error takes precedence.
+  return !isQuotaError(err) && OVERLOAD_PATTERNS.some((p) => p.test(msg));
+}
+
+// ── Garbage transcript detection ───────────────────────────────────────────────
+//
+// When Gemini receives silent or near-silent audio it produces a sequence of
+// SRT-style timestamps instead of transcribed speech:
+//   "00:00 00:01 00:02 00:03 00:00 00:01 00:02 00:03 00:01 00"
+//
+// Passing this through intent extraction yields a 0-confidence FALLBACK, but
+// only after a full LLM round-trip (~1–2 s + cost).  Detecting it here is an
+// O(n) string check that saves a wasted API call and latency.
+
+const TIMESTAMP_ONLY_RE = /^(?:\d{1,2}:\d{2}\s*)+$/;
+
+/**
+ * Returns true when the transcription text carries no semantic content.
+ * Covers:
+ *   • Gemini timestamp artifacts from silent audio  ("00:00 00:01 ...")
+ *   • Strings that are exclusively digits, colons, and whitespace
+ *   • Strings shorter than 3 characters (cannot express any profession)
+ */
+function isGarbageTranscript(text: string): boolean {
+  const t = text.trim();
+  if (t.length < 3)              return true;
+  if (TIMESTAMP_ONLY_RE.test(t)) return true;
+  if (/^[\d\s:.,\-]+$/.test(t)) return true;
+  return false;
+}
+
+// ── System prompt (unchanged — already well-tuned) ────────────────────────────
 
 const SYSTEM_PROMPT = `\
 Tu es l'extracteur d'intention de Khidmeti, application algérienne de services à domicile.
@@ -123,7 +171,7 @@ export class IntentExtractorService {
 
   // LRU cache: cacheKey → SearchIntent
   private readonly cache       = new Map<string, SearchIntent>();
-  private readonly MAX_CACHE   = 100; // increased from 50
+  private readonly MAX_CACHE   = 100;
   private readonly RATE_LIMIT_MAX    = 20;
   private readonly RATE_LIMIT_WINDOW = 3_600_000; // 1 hour
 
@@ -142,7 +190,6 @@ export class IntentExtractorService {
 
     if (uid) await this.checkRateLimit(uid);
 
-    // Cache key: SHA-256 of lowercased text — handles Unicode correctly
     const cacheKey = this.hashKey(trimmed.toLowerCase());
     const cached   = this.cache.get(cacheKey);
     if (cached) {
@@ -156,14 +203,18 @@ export class IntentExtractorService {
       this.setCache(cacheKey, intent);
       return intent;
     } catch (err) {
-      // FIX: Map quota/overload errors to 429 instead of letting them become 500
       if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/overload on text extraction: ${(err as Error).message}`);
+        this.logger.warn(`AI quota/rate-limit on text extraction: ${(err as Error).message}`);
         throw new AiRateLimitException();
       }
+      if (isOverloadError(err)) {
+        this.logger.warn(`AI model overloaded on text extraction: ${(err as Error).message}`);
+        throw new AiProviderException(
+          'AI model temporarily overloaded. Please try again later.',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
       this.logger.error(`extractFromText failed: ${(err as Error).message}`);
-      // For all other errors: return FALLBACK (don't crash the client)
-      // The app degrades gracefully — search still works with no profession filter
       return { ...FALLBACK };
     }
   }
@@ -175,19 +226,37 @@ export class IntentExtractorService {
       transcription = await this.ai.processAudio(buffer, mime);
     } catch (err) {
       if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/overload on audio: ${(err as Error).message}`);
+        this.logger.warn(`AI quota/rate-limit on audio: ${(err as Error).message}`);
         throw new AiRateLimitException();
+      }
+      if (isOverloadError(err)) {
+        this.logger.warn(`AI model overloaded on audio: ${(err as Error).message}`);
+        throw new AiProviderException(
+          'AI model temporarily overloaded. Please try again later.',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
       }
       this.logger.error(`Audio processing failed: ${(err as Error).message}`);
       return { ...FALLBACK };
     }
 
     const { text, language } = transcription;
-    if (!text.trim()) return { ...FALLBACK };
+
+    // ── Garbage transcript guard ─────────────────────────────────────────────
+    // Gemini produces SRT-style timestamps ("00:00 00:01 00:02 ...") when the
+    // audio buffer is silent or too short.  Propagating garbage to the intent
+    // extractor wastes a second LLM call and yields a 0-confidence FALLBACK
+    // anyway — skip the round-trip entirely.
+    if (!text.trim() || isGarbageTranscript(text)) {
+      this.logger.debug(
+        `Audio produced unusable transcript (language=${language}): ` +
+        `"${text.trim().slice(0, 60)}" — returning FALLBACK`,
+      );
+      return { ...FALLBACK };
+    }
 
     this.logger.debug(`Audio transcribed [${language}]: ${text.slice(0, 80)}`);
 
-    // Don't pass uid to extractFromText — rate limit already charged for the audio call
     const intent = await this.extractFromText(text);
     return { ...intent, transcribedText: text };
   }
@@ -204,11 +273,17 @@ export class IntentExtractorService {
       return this.parse(raw);
     } catch (err) {
       if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/overload on image: ${(err as Error).message}`);
+        this.logger.warn(`AI quota/rate-limit on image: ${(err as Error).message}`);
         throw new AiRateLimitException();
       }
+      if (isOverloadError(err)) {
+        this.logger.warn(`AI model overloaded on image: ${(err as Error).message}`);
+        throw new AiProviderException(
+          'AI model temporarily overloaded. Please try again later.',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
       this.logger.error(`extractFromImage failed: ${(err as Error).message}`);
-      // Graceful degradation: image search falls back to "show all nearby workers"
       return { ...FALLBACK };
     }
   }
@@ -217,7 +292,6 @@ export class IntentExtractorService {
 
   private parse(raw: string): SearchIntent {
     const s = raw.replace(/```json|```/g, '').trim();
-    // Strip Gemma4 thinking blocks
     const cleaned = s.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, '').trim();
 
     const i = cleaned.indexOf('{');
@@ -248,14 +322,12 @@ export class IntentExtractorService {
     }
   }
 
-  /** SHA-256 hash of text — O(1) lookup, handles all Unicode without ambiguity */
   private hashKey(text: string): string {
     return createHash('sha256').update(text).digest('hex').slice(0, 16);
   }
 
   private setCache(key: string, intent: SearchIntent): void {
     if (this.cache.size >= this.MAX_CACHE) {
-      // Evict oldest (Map preserves insertion order in V8)
       const oldest = this.cache.keys().next().value as string;
       this.cache.delete(oldest);
     }
