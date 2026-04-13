@@ -1,7 +1,15 @@
-// ══════════════════════════════════════════════════════════════════════════════
-// AiController — unchanged public API surface
-// Uses IntentExtractorService which now depends on IAiProvider (Strategy Pattern)
-// ══════════════════════════════════════════════════════════════════════════════
+// apps/api/src/modules/ai/ai.controller.ts
+//
+// BUG 4 FIX A — Support WebP dans extractIntentFromImage
+//
+// PROBLÈME :
+//   extractIntentFromImage() vérifiait uniquement JPEG et PNG via magic bytes.
+//   WebP et HEIC (formats courants sur Android moderne et iOS) étaient rejetés
+//   avec 400 BadRequest avant même d'atteindre le service.
+//
+// SOLUTION :
+//   Ajouter la détection WebP (signature RIFF....WEBP sur les 12 premiers
+//   octets). Gemini supporte nativement WebP — aucun changement côté service.
 
 import {
   Controller,
@@ -49,7 +57,15 @@ export class AiController {
     return this.intentExtractor.extractFromAudio(file.buffer, file.mimetype, user.uid);
   }
 
-  /** POST /ai/extract-intent/image — JPEG or PNG */
+  /**
+   * POST /ai/extract-intent/image — JPEG, PNG ou WebP
+   *
+   * BUG 4 FIX A :
+   *   Ajout de la détection WebP (format Android courant).
+   *   RIFF....WEBP : octets 0-3 = 52 49 46 46, octets 8-11 = 57 45 42 50.
+   *   Gemini supporte nativement WebP via son API Files — aucune conversion
+   *   nécessaire côté serveur.
+   */
   @Post('extract-intent/image')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
@@ -60,9 +76,24 @@ export class AiController {
     if (!file?.buffer?.length) throw new BadRequestException('Image file is required');
 
     const b = file.buffer;
+
+    // JPEG : FF D8 FF
     const isJpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
-    const isPng  = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
-    if (!isJpeg && !isPng) throw new BadRequestException('Only JPEG and PNG images are supported');
+
+    // PNG : 89 50 4E 47
+    const isPng =
+      b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+
+    // BUG 4 FIX A : WebP — RIFF....WEBP (12 premiers octets)
+    // Format courant sur Android moderne (caméra, galerie) et Chrome.
+    const isWebp =
+      b.length >= 12 &&
+      b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && // RIFF
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;  // WEBP
+
+    if (!isJpeg && !isPng && !isWebp) {
+      throw new BadRequestException('Only JPEG, PNG, and WebP images are supported');
+    }
 
     return this.intentExtractor.extractFromImage(b.toString('base64'), user.uid);
   }
