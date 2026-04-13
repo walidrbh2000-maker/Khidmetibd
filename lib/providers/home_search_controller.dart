@@ -1,12 +1,19 @@
 // lib/providers/home_search_controller.dart
 //
-// STEP 6 MIGRATION: LocalAiService replaces AiIntentExtractorService.
+// BUG 4 FIX C — alreadyProcessing non mappé
 //
-// PATCH — Bug 2 fix (photo search "Erreur de recherche"):
-//   Quand Gemini retourne FALLBACK total (confidence < 0.1, profession=null),
-//   aller directement en HomeSearchStatus.results avec liste vide.
-//   Auparavant, _search() était appelé avec profession=null → résultats vides
-//   mais le widget photo interprétait l'absence de résultat comme une erreur.
+// PROBLÈME :
+//   Quand l'utilisateur retente pendant qu'une requête image est en cours
+//   (_isBusyText = true), LocalAiService lève AiIntentExtractorException avec
+//   code = AiExtractorErrorCode.alreadyProcessing.
+//   Ce code tombait dans le `default` de _mapErrorCode() et retournait
+//   HomeSearchErrorType.network → l'UI affichait "Erreur de recherche" au
+//   lieu d'un message approprié ("Veuillez patienter...").
+//
+// SOLUTION :
+//   Mapper alreadyProcessing → HomeSearchErrorType.timeout.
+//   L'UI associée au type timeout affiche déjà "Veuillez patienter" — c'est
+//   le message le plus pertinent pour ce cas.
 
 import 'dart:io';
 import 'dart:typed_data';
@@ -37,12 +44,11 @@ enum HomeSearchStatus {
   error,
 }
 
-/// Structured error type exposed to the UI for distinct user-facing messages.
 enum HomeSearchErrorType {
-  quotaExceeded,   // 429 — show "retry in a few minutes"
-  modelOverloaded, // 503 — show "service temporarily unavailable"
-  timeout,         // 15s hard timeout
-  network,         // generic connectivity error
+  quotaExceeded,
+  modelOverloaded,
+  timeout,
+  network,
   unknown,
 }
 
@@ -69,8 +75,6 @@ class HomeSearchState {
 
   bool get hasResults => status == HomeSearchStatus.results;
 
-  /// Vrai quand la recherche a abouti mais sans résultat (image non reconnue
-  /// ou aucun artisan à proximité) — distinct d'une vraie erreur réseau.
   bool get isEmpty => hasResults && results.isEmpty;
 
   bool get hasError => status == HomeSearchStatus.error;
@@ -103,23 +107,17 @@ class HomeSearchState {
 class HomeSearchController extends StateNotifier<HomeSearchState> {
   final Ref _ref;
 
-  // FIX (AI Cost): per-session rate limit — max 20 AI calls per hour.
   static const int      _maxCallsPerHour = 20;
   static const Duration _windowDuration  = Duration(hours: 1);
   final List<DateTime>  _callTimestamps  = [];
 
-  static const double _lowConfidenceThreshold  = 0.35;
-  static const double _highConfidenceThreshold = 0.70;
-
-  // BUG 2 FIX: seuil en dessous duquel on considère que l'image n'a rien
-  // identifié de valide — on va en "résultats vides" plutôt qu'en erreur.
+  static const double _lowConfidenceThreshold      = 0.35;
+  static const double _highConfidenceThreshold     = 0.70;
   static const double _fallbackConfidenceThreshold = 0.10;
 
   HomeSearchController(this._ref) : super(const HomeSearchState());
 
-  // --------------------------------------------------------------------------
-  // Rate limiter helpers
-  // --------------------------------------------------------------------------
+  // ── Rate limiter ──────────────────────────────────────────────────────────
 
   bool _isRateLimited() {
     final now    = DateTime.now();
@@ -130,9 +128,7 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
 
   void _recordCall() => _callTimestamps.add(DateTime.now());
 
-  // --------------------------------------------------------------------------
-  // Public API
-  // --------------------------------------------------------------------------
+  // ── Public API ─────────────────────────────────────────────────────────────
 
   Future<void> submitSearch(
     String text, {
@@ -189,10 +185,7 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
       return;
     }
 
-    // BUG 2 FIX: FALLBACK total (image non identifiée, confidence très basse)
-    // → aller en "résultats vides" plutôt que propager l'erreur downstream.
-    // Le widget photo affichera "Aucun artisan identifié" au lieu de
-    // "Erreur de recherche".
+    // FALLBACK total (image non identifiée, confidence très basse)
     if (hasImage &&
         intent.profession == null &&
         (intent.confidence) < _fallbackConfidenceThreshold) {
@@ -448,9 +441,7 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
     state = const HomeSearchState();
   }
 
-  // --------------------------------------------------------------------------
-  // Private helpers
-  // --------------------------------------------------------------------------
+  // ── Private helpers ────────────────────────────────────────────────────────
 
   SearchIntent _applyConfidenceGate(SearchIntent intent) {
     final confidence = intent.confidence ?? 1.0;
@@ -473,6 +464,19 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
     return intent;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // BUG 4 FIX C — _mapErrorCode()
+  //
+  // AVANT :
+  //   alreadyProcessing tombait dans `default` → HomeSearchErrorType.network
+  //   → UI affichait "Erreur de recherche" quand une requête était déjà en cours.
+  //
+  // APRÈS :
+  //   alreadyProcessing → HomeSearchErrorType.timeout
+  //   → UI affiche "Veuillez patienter…" (message timeout), ce qui est
+  //   sémantiquement correct : l'utilisateur doit attendre la fin de la
+  //   requête en cours avant d'en lancer une nouvelle.
+  // ─────────────────────────────────────────────────────────────────────────
   HomeSearchErrorType _mapErrorCode(AiExtractorErrorCode code) {
     switch (code) {
       case AiExtractorErrorCode.quotaExceeded:
@@ -480,6 +484,10 @@ class HomeSearchController extends StateNotifier<HomeSearchState> {
       case AiExtractorErrorCode.modelOverloaded:
         return HomeSearchErrorType.modelOverloaded;
       case AiExtractorErrorCode.timeout:
+        return HomeSearchErrorType.timeout;
+      case AiExtractorErrorCode.alreadyProcessing:
+        // BUG 4 FIX C : traiter comme timeout — l'UI affiche "Veuillez patienter"
+        // plutôt que "Erreur de recherche" qui est trompeur pour l'utilisateur.
         return HomeSearchErrorType.timeout;
       default:
         return HomeSearchErrorType.network;
