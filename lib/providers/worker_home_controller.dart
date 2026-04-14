@@ -28,6 +28,19 @@
 //   AVANT : null → state = AsyncError('Worker profile not found')
 //   APRÈS : null → re-fetch via getWorker(uid) et mettre à jour silencieusement.
 //           Si le re-fetch échoue réellement → alors et seulement alors, error.
+//
+// FIX (Bug 1a — _subscribeToRequests manquant après re-fetch null):
+//   Quand le premier événement du stream est null (cas courant au démarrage
+//   avec RealtimeService), le re-fetch réussi mettait bien à jour workerAsync
+//   mais n'appelait jamais _subscribeToRequests(). La souscription aux
+//   requêtes n'était donc jamais initialisée → section vide.
+//
+// FIX (Bug 1b — catch silencieux → AsyncLoading permanent):
+//   Si le re-fetch échouait lors du premier chargement (state = AsyncLoading),
+//   le catch ne faisait rien → le state restait AsyncLoading indéfiniment →
+//   HomeWorkerSection retournait SizedBox.shrink() pour toujours.
+//   Correction : escalade vers AsyncError UNIQUEMENT si encore en AsyncLoading
+//   (ne pas écraser les données existantes en cas de blip réseau).
 
 import 'dart:async';
 
@@ -280,8 +293,20 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
     if (state.isRefreshing) return;
     state = state.copyWith(isRefreshing: true);
     try {
-      final worker = state.worker;
-      if (worker != null) await _loadRequests(worker.id);
+      final uid = _trackedUid;
+      if (uid != null) {
+        // Re-fetch le profil worker directement pour forcer un refresh propre.
+        final refreshed = await _ref
+            .read(firestoreServiceProvider)
+            .getWorker(uid);
+        if (!mounted) return;
+        if (refreshed != null) {
+          state = state.copyWith(workerAsync: AsyncValue.data(refreshed));
+          await _loadRequests(uid);
+        }
+      }
+    } catch (e) {
+      AppLogger.error('WorkerHomeController.refresh', e);
     } finally {
       if (mounted) state = state.copyWith(isRefreshing: false);
     }
@@ -294,7 +319,7 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
       state = state.copyWith(clearGoOnlineBlockReason: true);
 
   // --------------------------------------------------------------------------
-  // Private — GPS / permission gate (unchanged)
+  // Private — GPS / permission gate
   // --------------------------------------------------------------------------
 
   Future<GoOnlineBlockReason?> _resolveGoOnlineBlockReason() async {
@@ -352,19 +377,10 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
   // --------------------------------------------------------------------------
   // TASK 2 FIX — stream via firestoreServiceProvider
   // FIX (MIGRATION P2) — null = signal de changement, pas une erreur fatale
+  // FIX (Bug 1a) — appel _subscribeToRequests() après re-fetch réussi
+  // FIX (Bug 1b) — escalade AsyncError si encore en AsyncLoading
   // --------------------------------------------------------------------------
 
-  /// TASK 2 FIX: replaced FirebaseFirestore.instance.collection('workers')
-  /// .doc(uid).snapshots() with firestoreServiceProvider.streamWorker(uid).
-  ///
-  /// FIX (MIGRATION P2):
-  ///   RealtimeService.streamWorker() émet `null` chaque fois qu'un event
-  ///   worker:location ou worker:status arrive — c'est un signal de changement,
-  ///   pas une indication que le profil est introuvable.
-  ///
-  ///   AVANT : null → state = AsyncError → flash d'erreur à chaque mouvement GPS.
-  ///   APRÈS : null → re-fetch silencieux getWorker(uid) → mise à jour douce.
-  ///           Erreur réelle uniquement si le re-fetch lui-même échoue.
   void _subscribeToWorker(String uid) {
     _workerSub?.cancel();
     _workerSub = _ref
@@ -375,7 +391,8 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
         if (!mounted) return;
 
         if (worker == null) {
-          // FIX: null = signal de changement émis par RealtimeService.
+          // RealtimeService émet null comme signal de changement
+          // (location update, status change) — pas comme "profil introuvable".
           // On re-fetch silencieusement pour obtenir les données à jour.
           AppLogger.debug(
             'WorkerHomeController: streamWorker emitted null '
@@ -386,8 +403,14 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
                 .read(firestoreServiceProvider)
                 .getWorker(uid);
             if (!mounted) return;
+
             if (refreshed != null) {
               state = state.copyWith(workerAsync: AsyncValue.data(refreshed));
+              // FIX (Bug 1a): appeler _subscribeToRequests après re-fetch
+              // réussi. Sans cet appel, si le PREMIER événement du stream est
+              // null (fréquent au démarrage), la souscription aux requêtes
+              // n'est jamais initialisée et la section reste vide.
+              _subscribeToRequests(uid);
             } else {
               // Le profil n'existe vraiment pas — erreur légitime.
               state = state.copyWith(
@@ -397,12 +420,23 @@ class WorkerHomeController extends StateNotifier<WorkerHomeState> {
                 ),
               );
             }
-          } catch (e) {
-            // Re-fetch échoué (réseau) : garder l'état actuel sans crasher.
+          } catch (e, st) {
             AppLogger.warning(
-              'WorkerHomeController: re-fetch after null signal failed '
-              '(keeping current state): $e',
+              'WorkerHomeController: re-fetch after null signal failed: $e',
             );
+            if (!mounted) return;
+            // FIX (Bug 1b): le catch silencieux laissait le state bloqué en
+            // AsyncLoading si le re-fetch échouait lors du premier chargement.
+            // HomeWorkerSection ne sortait jamais de `isWorkerLoading → shrink`.
+            //
+            // Règle : escalader vers AsyncError UNIQUEMENT si on est encore en
+            // AsyncLoading. Si on avait déjà des données (AsyncData), un blip
+            // réseau ne doit pas effacer l'UI existante.
+            if (state.workerAsync is AsyncLoading) {
+              state = state.copyWith(
+                workerAsync: AsyncValue.error(e, st),
+              );
+            }
           }
           return;
         }
