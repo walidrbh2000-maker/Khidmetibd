@@ -28,6 +28,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+export 'local_media_service.dart' show CloudinaryServiceException;
 
 // ── UploadResult ──────────────────────────────────────────────────────────────
 
@@ -72,8 +73,6 @@ class UploadResult {
 // ── Exception (rétrocompatibilité) ────────────────────────────────────────────
 // Le nom CloudinaryServiceException est conservé pour ne pas casser les imports
 // existants dans MediaService et autres call sites.
-
-export 'local_media_service.dart' show CloudinaryServiceException;
 
 class CloudinaryServiceException implements Exception {
   final String  message;
