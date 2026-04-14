@@ -22,6 +22,8 @@ import '../../providers/auth_providers.dart';
 import '../../providers/core_providers.dart';
 import '../../utils/constants.dart';
 import '../../utils/logger.dart';
+import '../../../utils/app_config.dart';
+import '../../../utils/media_path_helper.dart';
 
 // ============================================================================
 // EDIT PROFILE STATE
@@ -206,12 +208,12 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
       // Upload image if user picked one.
       String? uploadedImageUrl = state.profileImageUrl;
       if (newImagePath != null) {
-        uploadedImageUrl = await _ref
+        uploadedImageUrl = (await _ref
             .read(mediaServiceProvider)
             .uploadImage(
               File(newImagePath),
               folder: 'profiles',
-            );
+            )).storedPath;
       }
 
       if (state.isWorkerAccount) {
