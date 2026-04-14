@@ -1,13 +1,32 @@
 // lib/services/media_service.dart
 //
-// STEP 5 MIGRATION: Constructor now accepts LocalMediaService instead of
-// CloudinaryService. All cloudinaryService.* calls replaced with
-// localMediaService.* — signatures are identical so no logic changes.
+// MIGRATION — NestJS comme proxy MinIO
 //
-// CHANGES:
-//   • _formatBytes() private method removed — replaced with FileSizeFormatter.format()
-//   • _logInfo / _logWarning / _logError replaced with AppLogger calls
-//   • CloudinaryService → LocalMediaService (constructor + field)
+// CHANGEMENTS vs version précédente :
+//   • uploadImage()         : Future<String>         → Future<UploadResult>
+//   • uploadVideo()         : Future<String>         → Future<UploadResult>
+//   • uploadMultipleImages(): Future<List<String>>   → Future<List<UploadResult>>
+//
+//   Tous les appels internes à localMediaService.upload*() sont mis à jour.
+//
+// MIGRATION DES CALL SITES :
+//   AVANT :
+//     final url = await mediaService.uploadImage(file);
+//     mediaUrls.add(url);                             // ← URL presigned (cassée)
+//
+//   APRÈS :
+//     final result = await mediaService.uploadImage(file);
+//     mediaUrls.add(result.storedPath);               // ← durable ✅
+//
+//   AFFICHAGE :
+//     Image.network(
+//       MediaPathHelper.toUrl(storedPath, apiBaseUrl: AppConfig.apiBaseUrl),
+//     )
+//
+// NOTES INCHANGÉES :
+//   • _formatBytes() supprimé → FileSizeFormatter.format()
+//   • AppLogger remplace les _logInfo/_logWarning/_logError locaux
+//   • LocalMediaService remplace CloudinaryService (constructeur + champ)
 
 import 'dart:io';
 import 'package:flutter/foundation.dart';
@@ -19,6 +38,8 @@ import 'local_media_service.dart';
 import '../utils/constants.dart';
 import '../utils/file_size_formatter.dart';
 import '../utils/logger.dart';
+
+// ── Exception ─────────────────────────────────────────────────────────────────
 
 class MediaServiceException implements Exception {
   final String  message;
@@ -32,9 +53,9 @@ class MediaServiceException implements Exception {
       'MediaServiceException: $message${code != null ? ' (Code: $code)' : ''}';
 }
 
-// ============================================================================
-// ISOLATE HELPERS
-// ============================================================================
+// ══════════════════════════════════════════════════════════════════════════════
+// ISOLATE HELPERS — compression image (inchangé)
+// ══════════════════════════════════════════════════════════════════════════════
 
 class _CompressImageParams {
   final String inputPath;
@@ -53,7 +74,9 @@ class _CompressImageParams {
 Future<String> _compressImageIsolate(_CompressImageParams params) async {
   final bytes = await File(params.inputPath).readAsBytes();
   final image = img.decodeImage(bytes);
-  if (image == null) throw Exception('Could not decode image: ${params.inputPath}');
+  if (image == null) {
+    throw Exception('Could not decode image: ${params.inputPath}');
+  }
 
   img.Image processed = image;
   if (image.width > params.maxDimension || image.height > params.maxDimension) {
@@ -69,6 +92,10 @@ Future<String> _compressImageIsolate(_CompressImageParams params) async {
   return params.outputPath;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MediaService
+// ══════════════════════════════════════════════════════════════════════════════
+
 class MediaService {
   static const int      maxImageSizeMB        = AppConstants.maxImageSizeMB;
   static const int      maxVideoSizeMB        = AppConstants.maxVideoSizeMB;
@@ -83,16 +110,21 @@ class MediaService {
   static const Duration maxVideoDuration      = Duration(minutes: 5);
   static const Duration compressionTimeout    = Duration(minutes: 3);
 
-  static const List<String> supportedImageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
-  static const List<String> supportedVideoExtensions = ['.mp4', '.mov', '.avi', '.mkv'];
+  static const List<String> supportedImageExtensions = [
+    '.jpg', '.jpeg', '.png', '.gif', '.webp',
+  ];
+  static const List<String> supportedVideoExtensions = [
+    '.mp4', '.mov', '.avi', '.mkv',
+  ];
 
-  // STEP 5: LocalMediaService replaces CloudinaryService
   final LocalMediaService localMediaService;
   final ImagePicker       _picker = ImagePicker();
 
   bool _isDisposed = false;
 
   MediaService(this.localMediaService);
+
+  // ── Picker methods (inchangés) ────────────────────────────────────────────
 
   Future<File?> pickImage({required bool fromCamera}) async {
     _ensureNotDisposed();
@@ -111,7 +143,11 @@ class MediaService {
     } catch (e) {
       AppLogger.error('MediaService.pickImage', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to pick image', code: 'PICK_IMAGE_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to pick image',
+        code: 'PICK_IMAGE_ERROR',
+        originalError: e,
+      );
     }
   }
 
@@ -125,6 +161,7 @@ class MediaService {
         imageQuality: defaultImageQuality,
       );
       if (pickedFiles.isEmpty) return [];
+
       final limitedFiles = pickedFiles.take(maxImages).toList();
       final files = <File>[];
       for (final xFile in limitedFiles) {
@@ -140,7 +177,11 @@ class MediaService {
     } catch (e) {
       AppLogger.error('MediaService.pickMultipleImages', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to pick multiple images', code: 'PICK_MULTIPLE_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to pick multiple images',
+        code: 'PICK_MULTIPLE_ERROR',
+        originalError: e,
+      );
     }
   }
 
@@ -158,9 +199,15 @@ class MediaService {
     } catch (e) {
       AppLogger.error('MediaService.pickVideo', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to pick video', code: 'PICK_VIDEO_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to pick video',
+        code: 'PICK_VIDEO_ERROR',
+        originalError: e,
+      );
     }
   }
+
+  // ── Compression (inchangé) ────────────────────────────────────────────────
 
   Future<File> compressImage(File file, {int quality = defaultImageQuality}) async {
     _ensureNotDisposed();
@@ -182,8 +229,8 @@ class MediaService {
         ),
       );
 
-      final compressedFile  = File(resultPath);
-      final compressedSize  = await compressedFile.length();
+      final compressedFile   = File(resultPath);
+      final compressedSize   = await compressedFile.length();
       final compressionRatio =
           ((1 - compressedSize / originalSize) * 100).toStringAsFixed(1);
 
@@ -195,7 +242,11 @@ class MediaService {
     } catch (e) {
       AppLogger.error('MediaService.compressImage', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to compress image', code: 'COMPRESS_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to compress image',
+        code: 'COMPRESS_ERROR',
+        originalError: e,
+      );
     }
   }
 
@@ -211,10 +262,21 @@ class MediaService {
         includeAudio: true,
       ).timeout(
         compressionTimeout,
-        onTimeout: () => throw MediaServiceException('Video compression timed out', code: 'COMPRESSION_TIMEOUT'),
+        onTimeout: () => throw MediaServiceException(
+          'Video compression timed out',
+          code: 'COMPRESSION_TIMEOUT',
+        ),
       );
-      if (info == null) { AppLogger.warning('Video compression returned null'); return null; }
-      if (info.file == null) throw MediaServiceException('Video compression failed', code: 'COMPRESS_FAILED');
+      if (info == null) {
+        AppLogger.warning('Video compression returned null');
+        return null;
+      }
+      if (info.file == null) {
+        throw MediaServiceException(
+          'Video compression failed',
+          code: 'COMPRESS_FAILED',
+        );
+      }
       final compressedSize   = info.filesize ?? 0;
       final compressionRatio = compressedSize > 0
           ? ((1 - compressedSize / originalSize) * 100).toStringAsFixed(1)
@@ -227,79 +289,147 @@ class MediaService {
     } catch (e) {
       AppLogger.error('MediaService.compressVideo', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to compress video', code: 'COMPRESS_VIDEO_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to compress video',
+        code: 'COMPRESS_VIDEO_ERROR',
+        originalError: e,
+      );
     }
   }
 
-  Future<String> uploadImage(File file, {String? folder}) async {
+  // ── Upload methods ────────────────────────────────────────────────────────
+
+  /// Upload une image après compression.
+  ///
+  /// Retourne un [UploadResult] :
+  ///   • result.storedPath → persister en base (durable, domain-agnostic)
+  ///   • result.url        → affichage immédiat
+  ///
+  /// Migration call sites :
+  ///   AVANT : final url = await mediaService.uploadImage(file);
+  ///   APRÈS : final result = await mediaService.uploadImage(file);
+  ///           mediaUrls.add(result.storedPath);
+  Future<UploadResult> uploadImage(File file, {String? folder}) async {
     _ensureNotDisposed();
     await _validateImageFile(file);
+
     File? compressedFile;
     try {
       compressedFile = await compressImage(file);
-      final url = await localMediaService.uploadImage(compressedFile, folder: folder);
-      AppLogger.info('Image uploaded: $url');
-      return url;
+      final result   = await localMediaService.uploadImage(compressedFile, folder: folder);
+
+      AppLogger.info('Image uploaded: storedPath=${result.storedPath}');
+      return result;
     } catch (e) {
       AppLogger.error('MediaService.uploadImage', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to upload image', code: 'UPLOAD_IMAGE_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to upload image',
+        code: 'UPLOAD_IMAGE_ERROR',
+        originalError: e,
+      );
     } finally {
       await _cleanupTempFile(compressedFile, file);
     }
   }
 
-  Future<String> uploadVideo(File file, {String? folder}) async {
+  /// Upload une vidéo après compression.
+  ///
+  /// Retourne un [UploadResult].
+  /// Persister [UploadResult.storedPath] en base.
+  Future<UploadResult> uploadVideo(File file, {String? folder}) async {
     _ensureNotDisposed();
     await _validateVideoFile(file);
+
     File? compressedFile;
     try {
       compressedFile = await compressVideo(file);
       final fileToUpload = compressedFile ?? file;
-      final url = await localMediaService.uploadVideo(fileToUpload, folder: folder);
-      AppLogger.info('Video uploaded: $url');
-      return url;
+      final result       = await localMediaService.uploadVideo(fileToUpload, folder: folder);
+
+      AppLogger.info('Video uploaded: storedPath=${result.storedPath}');
+      return result;
     } catch (e) {
       AppLogger.error('MediaService.uploadVideo', e);
       if (e is MediaServiceException) rethrow;
-      throw MediaServiceException('Failed to upload video', code: 'UPLOAD_VIDEO_ERROR', originalError: e);
+      throw MediaServiceException(
+        'Failed to upload video',
+        code: 'UPLOAD_VIDEO_ERROR',
+        originalError: e,
+      );
     } finally {
       await _cleanupTempFile(compressedFile, file);
     }
   }
 
-  Future<List<String>> uploadMultipleImages(List<File> files, {String? folder}) async {
+  /// Upload plusieurs images en parallèle séquentiel (une par une).
+  ///
+  /// Retourne une liste de [UploadResult].
+  /// Les échecs individuels sont loggués mais n'interrompent pas les autres.
+  /// Lance une exception si TOUS les uploads échouent.
+  ///
+  /// Migration call sites :
+  ///   AVANT : final urls = await mediaService.uploadMultipleImages(files);
+  ///   APRÈS : final results = await mediaService.uploadMultipleImages(files);
+  ///           final storedPaths = results.map((r) => r.storedPath).toList();
+  Future<List<UploadResult>> uploadMultipleImages(
+    List<File> files, {
+    String? folder,
+  }) async {
     _ensureNotDisposed();
     if (files.isEmpty) return [];
     if (files.length > maxMultipleImages) {
       throw MediaServiceException(
-          'Too many images: ${files.length} (max: $maxMultipleImages)',
-          code: 'TOO_MANY_IMAGES');
+        'Too many images: ${files.length} (max: $maxMultipleImages)',
+        code: 'TOO_MANY_IMAGES',
+      );
     }
-    final List<String> urls   = [];
-    final List<String> errors = [];
+
+    final results = <UploadResult>[];
+    final errors  = <String>[];
+
     for (int i = 0; i < files.length; i++) {
       try {
-        final url = await uploadImage(files[i], folder: folder);
-        urls.add(url);
+        final result = await uploadImage(files[i], folder: folder);
+        results.add(result);
       } catch (e) {
         AppLogger.warning('Failed to upload image ${i + 1}/${files.length}: $e');
         errors.add('Image ${i + 1}: $e');
       }
     }
-    if (urls.isEmpty && errors.isNotEmpty) {
-      throw MediaServiceException('All image uploads failed: ${errors.join(', ')}', code: 'ALL_UPLOADS_FAILED');
+
+    if (results.isEmpty && errors.isNotEmpty) {
+      throw MediaServiceException(
+        'All image uploads failed: ${errors.join(', ')}',
+        code: 'ALL_UPLOADS_FAILED',
+      );
     }
-    return urls;
+
+    return results;
   }
+
+  // ── Video thumbnail (inchangé) ────────────────────────────────────────────
 
   Future<File?> getVideoThumbnail(String videoPath) async {
     _ensureNotDisposed();
-    if (videoPath.trim().isEmpty) throw MediaServiceException('Video path cannot be empty', code: 'INVALID_VIDEO_PATH');
+    if (videoPath.trim().isEmpty) {
+      throw MediaServiceException(
+        'Video path cannot be empty',
+        code: 'INVALID_VIDEO_PATH',
+      );
+    }
     final videoFile = File(videoPath);
-    if (!await videoFile.exists()) throw MediaServiceException('Video file does not exist: $videoPath', code: 'FILE_NOT_FOUND');
+    if (!await videoFile.exists()) {
+      throw MediaServiceException(
+        'Video file does not exist: $videoPath',
+        code: 'FILE_NOT_FOUND',
+      );
+    }
     try {
-      return await VideoCompress.getFileThumbnail(videoPath, quality: thumbnailQuality);
+      return await VideoCompress.getFileThumbnail(
+        videoPath,
+        quality: thumbnailQuality,
+      );
     } catch (e) {
       AppLogger.error('MediaService.getVideoThumbnail', e);
       return null;
@@ -308,36 +438,82 @@ class MediaService {
 
   void cancelVideoCompression() {
     _ensureNotDisposed();
-    try { VideoCompress.cancelCompression(); } catch (e) { AppLogger.error('MediaService.cancelVideoCompression', e); }
+    try {
+      VideoCompress.cancelCompression();
+    } catch (e) {
+      AppLogger.error('MediaService.cancelVideoCompression', e);
+    }
   }
 
+  // ── Validation (inchangé) ─────────────────────────────────────────────────
+
   Future<void> _validateImageFile(File file) async {
-    if (!await file.exists()) throw MediaServiceException('Image file does not exist: ${file.path}', code: 'FILE_NOT_FOUND');
+    if (!await file.exists()) {
+      throw MediaServiceException(
+        'Image file does not exist: ${file.path}',
+        code: 'FILE_NOT_FOUND',
+      );
+    }
     final fileSize = await file.length();
-    if (fileSize == 0) throw MediaServiceException('Image file is empty', code: 'EMPTY_FILE');
-    if (fileSize > maxImageSizeBytes) throw MediaServiceException('Image size exceeds ${maxImageSizeMB}MB: ${FileSizeFormatter.format(fileSize)}', code: 'FILE_TOO_LARGE');
+    if (fileSize == 0) {
+      throw MediaServiceException('Image file is empty', code: 'EMPTY_FILE');
+    }
+    if (fileSize > maxImageSizeBytes) {
+      throw MediaServiceException(
+        'Image size exceeds ${maxImageSizeMB}MB: ${FileSizeFormatter.format(fileSize)}',
+        code: 'FILE_TOO_LARGE',
+      );
+    }
     final extension = _getFileExtension(file.path);
-    if (!supportedImageExtensions.contains(extension)) throw MediaServiceException('Unsupported image format: $extension', code: 'UNSUPPORTED_FORMAT');
+    if (!supportedImageExtensions.contains(extension)) {
+      throw MediaServiceException(
+        'Unsupported image format: $extension',
+        code: 'UNSUPPORTED_FORMAT',
+      );
+    }
   }
 
   Future<void> _validateVideoFile(File file) async {
-    if (!await file.exists()) throw MediaServiceException('Video file does not exist: ${file.path}', code: 'FILE_NOT_FOUND');
+    if (!await file.exists()) {
+      throw MediaServiceException(
+        'Video file does not exist: ${file.path}',
+        code: 'FILE_NOT_FOUND',
+      );
+    }
     final fileSize = await file.length();
-    if (fileSize == 0) throw MediaServiceException('Video file is empty', code: 'EMPTY_FILE');
-    if (fileSize > maxVideoSizeBytes) throw MediaServiceException('Video size exceeds ${maxVideoSizeMB}MB: ${FileSizeFormatter.format(fileSize)}', code: 'FILE_TOO_LARGE');
+    if (fileSize == 0) {
+      throw MediaServiceException('Video file is empty', code: 'EMPTY_FILE');
+    }
+    if (fileSize > maxVideoSizeBytes) {
+      throw MediaServiceException(
+        'Video size exceeds ${maxVideoSizeMB}MB: ${FileSizeFormatter.format(fileSize)}',
+        code: 'FILE_TOO_LARGE',
+      );
+    }
     final extension = _getFileExtension(file.path);
-    if (!supportedVideoExtensions.contains(extension)) throw MediaServiceException('Unsupported video format: $extension', code: 'UNSUPPORTED_FORMAT');
+    if (!supportedVideoExtensions.contains(extension)) {
+      throw MediaServiceException(
+        'Unsupported video format: $extension',
+        code: 'UNSUPPORTED_FORMAT',
+      );
+    }
   }
 
   void _validateImageQuality(int quality) {
     if (quality < minImageQuality || quality > maxImageQuality) {
-      throw MediaServiceException('Invalid image quality: $quality (must be $minImageQuality–$maxImageQuality)', code: 'INVALID_QUALITY');
+      throw MediaServiceException(
+        'Invalid image quality: $quality (must be $minImageQuality–$maxImageQuality)',
+        code: 'INVALID_QUALITY',
+      );
     }
   }
 
   void _validateMaxImages(int maxImages) {
     if (maxImages < 1 || maxImages > maxMultipleImages) {
-      throw MediaServiceException('Invalid maxImages: $maxImages (must be 1–$maxMultipleImages)', code: 'INVALID_MAX_IMAGES');
+      throw MediaServiceException(
+        'Invalid maxImages: $maxImages (must be 1–$maxMultipleImages)',
+        code: 'INVALID_MAX_IMAGES',
+      );
     }
   }
 
@@ -361,13 +537,22 @@ class MediaService {
   }
 
   void _ensureNotDisposed() {
-    if (_isDisposed) throw MediaServiceException('MediaService has been disposed', code: 'SERVICE_DISPOSED');
+    if (_isDisposed) {
+      throw MediaServiceException(
+        'MediaService has been disposed',
+        code: 'SERVICE_DISPOSED',
+      );
+    }
   }
 
   Future<void> dispose() async {
     if (_isDisposed) return;
     _isDisposed = true;
-    try { await VideoCompress.deleteAllCache(); } catch (e) { AppLogger.error('MediaService.dispose', e); }
+    try {
+      await VideoCompress.deleteAllCache();
+    } catch (e) {
+      AppLogger.error('MediaService.dispose', e);
+    }
     localMediaService.dispose();
   }
 }
