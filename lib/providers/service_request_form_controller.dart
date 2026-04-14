@@ -12,6 +12,8 @@ import '../providers/core_providers.dart';
 import '../providers/location_controller.dart';
 import '../utils/constants.dart';
 import '../utils/logger.dart';
+import '../../../utils/app_config.dart';
+import '../../../utils/media_path_helper.dart';
 
 // ============================================================================
 // STATE
@@ -513,7 +515,7 @@ class ServiceRequestFormController
           final url = isVideo
               ? await mediaService.uploadVideo(file)
               : await mediaService.uploadImage(file);
-          mediaUrls.add(url);
+          mediaUrls.add(url.storedPath);
         }
       }
 
