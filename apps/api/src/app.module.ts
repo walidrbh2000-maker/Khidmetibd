@@ -2,7 +2,7 @@
 
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { MongooseModule } from '@nestjs/mongoose';
+import { MongooseModule }  from '@nestjs/mongoose';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { DatabaseModule }           from './database/database.module';
 import { QdrantModule }             from './qdrant/qdrant.module';
@@ -16,6 +16,7 @@ import { BidsModule }               from './modules/bids/bids.module';
 import { LocationModule }           from './modules/location/location.module';
 import { NotificationsModule }      from './modules/notifications/notifications.module';
 import { GatewayModule }            from './modules/gateway/gateway.module';
+import { ProfessionsModule }        from './modules/professions/professions.module';
 import { HealthController }         from './health.controller';
 
 @Module({
@@ -58,6 +59,7 @@ import { HealthController }         from './health.controller';
     LocationModule,
     NotificationsModule,
     GatewayModule,
+    ProfessionsModule,
   ],
   controllers: [HealthController],
 })
