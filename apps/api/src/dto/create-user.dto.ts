@@ -1,6 +1,6 @@
 import {
   IsString, IsEmail, IsOptional, IsNumber, IsNotEmpty,
-  IsEnum, MinLength, MaxLength, Min, Max,
+  IsEnum, Matches, MinLength, MaxLength, Min, Max,
 } from 'class-validator';
 import { UserRole } from '../schemas/user.schema';
 
@@ -15,16 +15,29 @@ export class CreateUserDto {
   @MaxLength(50)
   name: string;
 
+  /**
+   * Email optionnel — les utilisateurs Phone Auth peuvent ne pas en avoir.
+   * Laisser vide ('') ou omettre pour un profil téléphone uniquement.
+   */
   @IsEmail()
-  email: string;
+  @IsOptional()
+  email?: string;
 
   /** Defaults to 'client'. Pass 'worker' when registering a worker account. */
   @IsEnum(UserRole)
   @IsOptional()
   role?: UserRole;
 
+  /**
+   * Numéro de téléphone algérien — format E.164 (+213XXXXXXXXX)
+   * ou format local (0[5-7]XXXXXXXX).
+   * Sera stocké en E.164 après normalisation côté service.
+   */
   @IsString()
   @IsOptional()
+  @Matches(/^(\+213[5-7]\d{8}|0[5-7]\d{8})$/, {
+    message: 'phoneNumber must be a valid Algerian number (+213XXXXXXXXX or 0XXXXXXXXX)',
+  })
   phoneNumber?: string;
 
   @IsNumber()
