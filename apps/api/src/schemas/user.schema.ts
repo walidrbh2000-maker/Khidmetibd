@@ -17,7 +17,29 @@
 //     • Partial indexes restrict heavy worker indexes to role='worker' documents,
 //       keeping the index footprint proportional to the actual worker count.
 //
+// PHONE AUTH — index email :
+//   Les utilisateurs authentifiés par téléphone peuvent n'avoir aucun email.
+//   L'index email est désormais partiel (partialFilterExpression: email ≠ '')
+//   pour ne contraindre l'unicité que sur les emails non vides.
+//   Cela évite les collisions entre N utilisateurs avec email = ''.
+//
 // MIGRATION (run once against production):
+//   -- Supprimer l'ancien index unique non-partiel :
+//   db.users.dropIndex("email_1");
+//
+//   -- Créer le nouvel index email partiel :
+//   db.users.createIndex(
+//     { email: 1 },
+//     { unique: true, sparse: true, partialFilterExpression: { email: { $ne: '' } } }
+//   );
+//
+//   -- Créer l'index phoneNumber partiel :
+//   db.users.createIndex(
+//     { phoneNumber: 1 },
+//     { unique: true, sparse: true, partialFilterExpression: { phoneNumber: { $ne: '' } } }
+//   );
+//
+//   -- Migrer les workers :
 //   db.workers.find().forEach(w => {
 //     w.role = 'worker';
 //     db.users.updateOne({ _id: w._id }, { $set: w }, { upsert: true });
@@ -50,9 +72,18 @@ export class User {
   @Prop({ required: true })
   name: string;
 
-  @Prop({ required: true, lowercase: true, trim: true })
+  /**
+   * Email — optionnel pour les utilisateurs Phone Auth (peut être '').
+   * L'index MongoDB est partiel : unicité appliquée uniquement si email ≠ ''.
+   */
+  @Prop({ default: '', lowercase: true, trim: true })
   email: string;
 
+  /**
+   * Numéro de téléphone au format E.164 (+213XXXXXXXXX pour l'Algérie).
+   * Champ principal d'identification pour les utilisateurs Phone Auth.
+   * Index partiel : uniquement si phoneNumber ≠ ''.
+   */
   @Prop({ default: '' })
   phoneNumber: string;
 
@@ -131,7 +162,36 @@ export class User {
 export const UserSchema = SchemaFactory.createForClass(User);
 
 // ── Shared indexes ────────────────────────────────────────────────────────────
-UserSchema.index({ email: 1 }, { unique: true });
+
+/**
+ * Email unique — partiel : uniquement si email ≠ ''.
+ * Compatible avec les utilisateurs Phone Auth qui n'ont pas d'email.
+ *
+ * ⚠️ MIGRATION : supprimer "email_1" (unique non-partiel) en production
+ *    avant de déployer cette version.
+ */
+UserSchema.index(
+  { email: 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: { email: { $ne: '' } },
+  },
+);
+
+/**
+ * PhoneNumber unique — partiel : uniquement si phoneNumber ≠ ''.
+ * Garantit qu'un numéro de téléphone E.164 ne peut être lié qu'à un seul compte.
+ */
+UserSchema.index(
+  { phoneNumber: 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: { phoneNumber: { $ne: '' } },
+  },
+);
+
 UserSchema.index({ wilayaCode: 1 });
 UserSchema.index({ geoHash: 1 });
 
