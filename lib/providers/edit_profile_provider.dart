@@ -10,20 +10,19 @@
 //   APRÈS : getUser(uid) → brancher sur userDoc.isWorker
 //           (même pattern que settings_provider.dart et splash_controller.dart)
 //
-//   save() conserve le pattern existant (getWorker/getUser + copyWith merge)
-//   qui est correct architecturalement — aucun changement nécessaire là.
+//   FIX (import paths) :
+//   Imports corrigés — le fichier est en lib/providers/, pas dans un sous-dossier.
+//   Suppression des imports inutilisés (app_config, media_path_helper).
 
 import 'dart:io';
 
 import 'package:firebase_analytics/firebase_analytics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../providers/auth_providers.dart';
-import '../../providers/core_providers.dart';
-import '../../utils/constants.dart';
-import '../../utils/logger.dart';
-import '../../../utils/app_config.dart';
-import '../../../utils/media_path_helper.dart';
+import '../utils/constants.dart';
+import '../utils/logger.dart';
+import 'auth_providers.dart';
+import 'core_providers.dart';
 
 // ============================================================================
 // EDIT PROFILE STATE
@@ -31,9 +30,7 @@ import '../../../utils/media_path_helper.dart';
 
 enum EditProfileStatus { loading, idle, saving, success, error }
 
-// Sentinel used so copyWith can distinguish "clear errorMessage" from
-// "leave errorMessage unchanged". Without this, every copyWith call that
-// omits the parameter silently resets a live error to null.
+// Sentinel: lets copyWith distinguish "clear errorMessage" from "keep current".
 const _kKeepError = Object();
 
 class EditProfileState {
@@ -41,10 +38,10 @@ class EditProfileState {
   final String  name;
   final String  email;           // read-only — sourced from Firebase Auth
   final String  phone;
-  final String? professionLabel; // workers only — read-only (business-critical)
+  final String? professionLabel; // workers only — read-only display
   final String? profileImageUrl;
   final bool    isWorkerAccount;
-  final String? errorMessage;
+  final String? errorMessage;    // localization key
 
   const EditProfileState({
     this.status           = EditProfileStatus.loading,
@@ -57,6 +54,11 @@ class EditProfileState {
     this.errorMessage,
   });
 
+  bool get isLoading => status == EditProfileStatus.loading ||
+                        status == EditProfileStatus.saving;
+  bool get hasError  => status == EditProfileStatus.error;
+  bool get isSuccess => status == EditProfileStatus.success;
+
   EditProfileState copyWith({
     EditProfileStatus? status,
     String?  name,
@@ -65,7 +67,9 @@ class EditProfileState {
     String?  professionLabel,
     String?  profileImageUrl,
     bool?    isWorkerAccount,
-    // Pass a String to set, pass null to CLEAR, omit (default sentinel) to KEEP.
+    // Omit (sentinel)  → keep current value.
+    // Pass null         → clear the error.
+    // Pass a String     → set the new error key.
     Object?  errorMessage = _kKeepError,
   }) {
     return EditProfileState(
@@ -94,23 +98,17 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
     _load();
   }
 
-  /// FIX (MIGRATION — collection unifiée) :
+  // ── Load ───────────────────────────────────────────────────────────────────
+
+  /// Loads the authenticated user's profile using the unified /users/:uid endpoint.
   ///
-  /// AVANT — fragile, branché sur les prefs :
-  ///   1. prefs.getString(PrefKeys.accountRole) == UserType.worker
-  ///      → getWorker(uid)  (appel à l'ancienne collection via facade)
-  ///   2. sinon → getUser(uid)
-  ///   Problème : prefs absentes (réinstall, nouvel appareil) → branche client
-  ///   → professionLabel jamais chargé pour un worker.
-  ///
-  /// APRÈS — source unique, identique à settings_provider.dart :
-  ///   getUser(uid) → brancher sur userDoc.isWorker
-  ///   Le champ `role` du document unifié est la seule source de vérité.
+  /// DESIGN: single GET /users/:uid → branch on userDoc.isWorker.
+  /// No need to check SharedPrefs for role — the document IS the source of truth.
   Future<void> _load() async {
     try {
-      final authService      = _ref.read(authServiceProvider);
-      final firestoreService = _ref.read(firestoreServiceProvider);
-      final uid              = authService.user?.uid;
+      final authService = _ref.read(authServiceProvider);
+      final apiService  = _ref.read(firestoreServiceProvider);
+      final uid         = authService.user?.uid;
 
       if (uid == null) {
         state = state.copyWith(
@@ -120,13 +118,13 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
         return;
       }
 
-      // Une seule requête — le document unifié porte le rôle et tous les champs.
-      final userDoc = await firestoreService.getUser(uid);
+      // Single request — unified collection, `role` field discriminates.
+      final userDoc = await apiService.getUser(uid);
 
       if (!mounted) return;
 
       if (userDoc == null) {
-        // Profil pas encore créé — fallback sur Firebase Auth.
+        // Profile not yet created — fallback to Firebase Auth claims.
         state = state.copyWith(
           status:          EditProfileStatus.idle,
           name:            authService.user?.displayName ?? '',
@@ -134,7 +132,9 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
           isWorkerAccount: false,
           errorMessage:    null,
         );
-        AppLogger.warning('EditProfileNotifier: userDoc null pour uid=$uid — fallback Firebase');
+        AppLogger.warning(
+          'EditProfileNotifier: userDoc null for uid=$uid — fallback to Firebase',
+        );
         return;
       }
 
@@ -144,7 +144,7 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
           name:            userDoc.name,
           email:           authService.user?.email ?? userDoc.email,
           phone:           userDoc.phoneNumber,
-          professionLabel: userDoc.profession,       // String? — champ unifié
+          professionLabel: userDoc.profession,
           profileImageUrl: userDoc.profileImageUrl,
           isWorkerAccount: true,
           errorMessage:    null,
@@ -171,16 +171,17 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
     }
   }
 
-  /// Saves name + phone to Firestore and syncs Firebase Auth displayName.
-  /// If [newImagePath] is provided, uploads the picked file via MediaService
-  /// then stores the returned URL.
+  // ── Save ───────────────────────────────────────────────────────────────────
+
+  /// Persists name + phone changes and optionally a new profile image.
   ///
-  /// Pattern:
-  ///   1. Load current document → apply changes via copyWith → write back.
-  ///      FirestoreService has no partial-update method — uses
-  ///      createOrUpdateWorker / createOrUpdateUser which call set(merge:true).
-  ///   2. MediaService.uploadImage(File) returns the MinIO URL.
-  ///   3. FirebaseAnalytics.instance.logEvent for profile_updated.
+  /// Steps:
+  ///   1. Upload image via MediaService (if provided) → get storedPath.
+  ///   2. Load current document → apply changes via copyWith → write back.
+  ///   3. Sync Firebase Auth displayName.
+  ///   4. Log analytics event (fire-and-forget).
+  ///
+  /// Returns true on success, false if an error occurred (state.errorMessage set).
   Future<bool> save({
     required String name,
     required String phone,
@@ -190,9 +191,9 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
     state = state.copyWith(status: EditProfileStatus.saving);
 
     try {
-      final authService      = _ref.read(authServiceProvider);
-      final firestoreService = _ref.read(firestoreServiceProvider);
-      final uid              = authService.user?.uid;
+      final authService = _ref.read(authServiceProvider);
+      final apiService  = _ref.read(firestoreServiceProvider);
+      final uid         = authService.user?.uid;
 
       if (uid == null) {
         state = state.copyWith(
@@ -205,22 +206,20 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
       final trimmedName  = name.trim();
       final trimmedPhone = phone.trim();
 
-      // Upload image if user picked one.
+      // Step 1 — upload image if the user picked a new one.
       String? uploadedImageUrl = state.profileImageUrl;
       if (newImagePath != null) {
         uploadedImageUrl = (await _ref
-            .read(mediaServiceProvider)
-            .uploadImage(
-              File(newImagePath),
-              folder: 'profiles',
-            )).storedPath;
+                .read(mediaServiceProvider)
+                .uploadImage(File(newImagePath)))
+            .storedPath;
       }
 
+      // Step 2 — load current document, apply delta, write back.
       if (state.isWorkerAccount) {
-        // Load current worker, apply changes via copyWith, write back.
-        final current = await firestoreService.getWorker(uid);
+        final current = await apiService.getWorker(uid);
         if (current != null) {
-          await firestoreService.createOrUpdateWorker(
+          await apiService.createOrUpdateWorker(
             current.copyWith(
               name:            trimmedName,
               phoneNumber:     trimmedPhone,
@@ -229,10 +228,9 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
           );
         }
       } else {
-        // Load current user, apply changes via copyWith, write back.
-        final current = await firestoreService.getUser(uid);
+        final current = await apiService.getUser(uid);
         if (current != null) {
-          await firestoreService.createOrUpdateUser(
+          await apiService.createOrUpdateUser(
             current.copyWith(
               name:            trimmedName,
               phoneNumber:     trimmedPhone,
@@ -242,10 +240,10 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
         }
       }
 
-      // Sync Firebase Auth displayName so ProfileCard reflects the change.
+      // Step 3 — keep Firebase Auth displayName in sync.
       await authService.user?.updateDisplayName(trimmedName);
 
-      // fire-and-forget — never block save on analytics
+      // Step 4 — analytics (fire-and-forget — never block save).
       FirebaseAnalytics.instance.logEvent(
         name: 'profile_updated',
         parameters: {
@@ -264,7 +262,6 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
         );
       }
       return true;
-
     } catch (e, st) {
       AppLogger.error('EditProfileNotifier.save', e, st);
       if (mounted) {
@@ -276,6 +273,8 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
       return false;
     }
   }
+
+  // ── Retry ──────────────────────────────────────────────────────────────────
 
   Future<void> retry() async {
     if (mounted) state = const EditProfileState();
@@ -289,4 +288,5 @@ class EditProfileNotifier extends StateNotifier<EditProfileState> {
 
 final editProfileProvider =
     StateNotifierProvider.autoDispose<EditProfileNotifier, EditProfileState>(
-        (ref) => EditProfileNotifier(ref));
+  (ref) => EditProfileNotifier(ref),
+);
