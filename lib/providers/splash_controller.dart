@@ -1,32 +1,36 @@
 // lib/providers/splash_controller.dart
+//
+// MIGRATION NOTE:
+//   - waitForInitialization() now relies on FirebaseAuth.authStateChanges()
+//     directly — no dependency on the email auth flow.
+//   - Onboarding check added: if the user has never seen the onboarding slides,
+//     the router goes to /onboarding regardless of auth state.
+//   - Email verification check removed — phone auth users are always verified.
+//   - _resolveAndCacheRole logic unchanged (getUser → isWorker).
 
 import 'dart:async';
 
-import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../providers/auth_providers.dart';
+import '../providers/onboarding_controller.dart';
 import '../providers/user_role_provider.dart';
 import '../utils/constants.dart';
 import '../utils/logger.dart';
 import 'core_providers.dart';
 
-// ============================================================================
-// ENUMS
-// ============================================================================
+// ── Enums ──────────────────────────────────────────────────────────────────
 
 enum SplashPhase { initializing, animating, ready, error }
-
 enum SplashErrorType { none, noInternet, serverError, timeout, unknown }
 
-// ============================================================================
-// STATE
-// ============================================================================
+// ── State ──────────────────────────────────────────────────────────────────
 
 class SplashState {
-  final SplashPhase phase;
+  final SplashPhase     phase;
   final SplashErrorType errorType;
 
   const SplashState({
@@ -36,10 +40,7 @@ class SplashState {
 
   bool get canRetry => phase == SplashPhase.error;
 
-  SplashState copyWith({
-    SplashPhase?     phase,
-    SplashErrorType? errorType,
-  }) {
+  SplashState copyWith({SplashPhase? phase, SplashErrorType? errorType}) {
     return SplashState(
       phase:     phase     ?? this.phase,
       errorType: errorType ?? this.errorType,
@@ -47,77 +48,64 @@ class SplashState {
   }
 }
 
-// ============================================================================
-// CONTROLLER
-// ============================================================================
+// ── Controller ─────────────────────────────────────────────────────────────
 
 class SplashController extends StateNotifier<SplashState> {
   final Ref _ref;
 
-  bool  _isAnimationComplete  = false;
-  bool  _isAuthChecked        = false;
-  bool  _isMinDurationElapsed = false;
-
-  bool _isInitializing = false;
+  bool _isAnimationComplete  = false;
+  bool _isAuthChecked        = false;
+  bool _isMinDurationElapsed = false;
+  bool _isInitializing       = false;
 
   Timer? _minDurationTimer;
 
   static const Duration _kMinSplashDuration  = Duration(seconds: 3);
   static const Duration _globalInitTimeout   = Duration(seconds: 15);
   static const Duration _kRoleResolveTimeout = Duration(seconds: 5);
+  static const Duration _kAuthStateTimeout   = Duration(seconds: 10);
 
   SplashController(this._ref) : super(const SplashState());
 
-  // --------------------------------------------------------------------------
-  // Initialization
-  // --------------------------------------------------------------------------
+  // ── Initialization ─────────────────────────────────────────────────────
 
   Future<void> initialize() async {
     if (_isInitializing) return;
     _isInitializing = true;
 
     try {
-      if (!_isAnimationComplete) {
-        _isAnimationComplete = false;
-      }
       _isAuthChecked        = false;
       _isMinDurationElapsed = false;
-
       _minDurationTimer?.cancel();
-      _minDurationTimer = null;
 
       if (!mounted) return;
       state = const SplashState(phase: SplashPhase.initializing);
 
       _armMinDurationTimer();
 
-      final authService = _ref.read(authServiceProvider);
-
+      // Wait for Firebase auth state to resolve + onboarding state to load.
       await Future.wait([
-        authService.waitForInitialization(),
+        _waitForAuthState(),
+        _waitForOnboarding(),
         Future.delayed(const Duration(seconds: 2)),
       ]).timeout(
         _globalInitTimeout,
         onTimeout: () {
-          AppLogger.warning(
-            'SplashController.initialize: ${_globalInitTimeout.inSeconds}s '
-            'global timeout reached',
-          );
-          throw TimeoutException(
-            'Initialization global timeout',
-            _globalInitTimeout,
-          );
+          AppLogger.warning('SplashController: global timeout');
+          throw TimeoutException('Splash init timeout', _globalInitTimeout);
         },
       );
 
-      if (authService.isLoggedIn && authService.user != null) {
-        await _resolveAndCacheRole(authService.user!.uid);
+      // If user is logged in, resolve their role.
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser != null) {
+        await _resolveAndCacheRole(currentUser.uid);
       }
 
       _isAuthChecked = true;
       _updateState();
     } on TimeoutException {
-      AppLogger.warning('SplashController.initialize: timeout');
+      AppLogger.warning('SplashController: timeout');
       if (!mounted) return;
       _isAuthChecked = true;
       state = state.copyWith(
@@ -125,7 +113,7 @@ class SplashController extends StateNotifier<SplashState> {
         errorType: SplashErrorType.timeout,
       );
     } on FirebaseException catch (e) {
-      AppLogger.error('SplashController.initialize (Firebase)', e);
+      AppLogger.error('SplashController (Firebase)', e);
       if (!mounted) return;
       _isAuthChecked = true;
       state = state.copyWith(
@@ -133,7 +121,7 @@ class SplashController extends StateNotifier<SplashState> {
         errorType: _mapFirebaseError(e),
       );
     } catch (e, stack) {
-      AppLogger.error('SplashController.initialize', '$e\n$stack');
+      AppLogger.error('SplashController', '$e\n$stack');
       if (!mounted) return;
       _isAuthChecked = true;
       state = state.copyWith(
@@ -145,7 +133,6 @@ class SplashController extends StateNotifier<SplashState> {
     }
   }
 
-  /// Called by SplashScreen when the branding animation finishes.
   void onAnimationComplete() {
     _isAnimationComplete = true;
     _updateState();
@@ -153,9 +140,33 @@ class SplashController extends StateNotifier<SplashState> {
 
   Future<void> retry() => initialize();
 
-  // --------------------------------------------------------------------------
-  // Private helpers
-  // --------------------------------------------------------------------------
+  // ── Private helpers ─────────────────────────────────────────────────────
+
+  Future<void> _waitForAuthState() async {
+    try {
+      await FirebaseAuth.instance
+          .authStateChanges()
+          .first
+          .timeout(_kAuthStateTimeout, onTimeout: () => null);
+    } catch (e) {
+      AppLogger.warning('SplashController: auth state timeout — continuing');
+    }
+  }
+
+  Future<void> _waitForOnboarding() async {
+    // OnboardingController loads SharedPrefs asynchronously.
+    // We poll until isLoaded to prevent a flash of the onboarding screen
+    // for returning users.
+    const maxWait  = Duration(seconds: 2);
+    const interval = Duration(milliseconds: 50);
+    final start    = DateTime.now();
+
+    final ctrl = _ref.read(onboardingControllerProvider.notifier);
+    while (!ctrl.isLoaded) {
+      if (DateTime.now().difference(start) > maxWait) break;
+      await Future.delayed(interval);
+    }
+  }
 
   void _armMinDurationTimer() {
     _minDurationTimer = Timer(_kMinSplashDuration, () {
@@ -178,36 +189,15 @@ class SplashController extends StateNotifier<SplashState> {
     }
   }
 
-  /// FIX (MIGRATION — collection unifiée) :
-  /// Remplace le pattern getWorker(uid) → role=worker|client par une seule
-  /// requête getUser(uid) + check userDoc.isWorker.
-  ///
-  /// AVANT : GET /workers/:uid — retournait null pour les clients, non-null
-  ///         pour les workers. Requête inutile : la collection workers n'existe
-  ///         plus, les workers sont dans users avec role='worker'.
-  ///
-  /// APRÈS : GET /users/:uid — retourne le document unifié avec le champ role.
-  ///         userDoc.isWorker == true  →  UserRole.worker
-  ///         userDoc.isWorker == false →  UserRole.client
-  ///         null (pas encore inscrit) →  UserRole.client (défaut sûr)
+  /// Resolves whether the user is a worker or client and caches the result.
+  /// Uses GET /users/:uid — the unified collection with `role` field.
   Future<void> _resolveAndCacheRole(String uid) async {
     try {
       final firestoreService = _ref.read(firestoreServiceProvider);
 
-      // Une seule requête — le champ `role` est dans le document unifié.
       final userDoc = await firestoreService
           .getUser(uid)
-          .timeout(
-            _kRoleResolveTimeout,
-            onTimeout: () {
-              AppLogger.warning(
-                'SplashController._resolveAndCacheRole: '
-                '${_kRoleResolveTimeout.inSeconds}s timeout — '
-                'falling back to client role for uid=$uid',
-              );
-              return null;
-            },
-          );
+          .timeout(_kRoleResolveTimeout, onTimeout: () => null);
 
       final role = userDoc?.isWorker == true ? UserRole.worker : UserRole.client;
 
@@ -222,14 +212,10 @@ class SplashController extends StateNotifier<SplashState> {
       AppLogger.info('SplashController: cached role=$role uid=$uid');
     } on FirebaseException catch (e) {
       if (e.code == 'permission-denied') {
-        AppLogger.error(
-          'SplashController._resolveAndCacheRole: PERMISSION_DENIED uid=$uid',
-          e,
-        );
+        AppLogger.error('SplashController: PERMISSION_DENIED uid=$uid', e);
         rethrow;
       }
       setCachedUserRole(_ref, UserRole.client);
-      AppLogger.error('SplashController._resolveAndCacheRole', e);
     } catch (e) {
       setCachedUserRole(_ref, UserRole.client);
       AppLogger.error('SplashController._resolveAndCacheRole', e);
@@ -238,23 +224,23 @@ class SplashController extends StateNotifier<SplashState> {
 
   SplashErrorType _mapFirebaseError(FirebaseException e) {
     switch (e.code) {
-      case 'network-request-failed':
-        return SplashErrorType.noInternet;
+      case 'network-request-failed': return SplashErrorType.noInternet;
       case 'internal-error':
       case 'unavailable':
-      case 'permission-denied':
-        return SplashErrorType.serverError;
-      case 'deadline-exceeded':
-        return SplashErrorType.timeout;
-      default:
-        return SplashErrorType.unknown;
+      case 'permission-denied':      return SplashErrorType.serverError;
+      case 'deadline-exceeded':      return SplashErrorType.timeout;
+      default:                       return SplashErrorType.unknown;
     }
+  }
+
+  @override
+  void dispose() {
+    _minDurationTimer?.cancel();
+    super.dispose();
   }
 }
 
-// ============================================================================
-// PROVIDER
-// ============================================================================
+// ── Provider ───────────────────────────────────────────────────────────────
 
 final splashControllerProvider =
     StateNotifierProvider.autoDispose<SplashController, SplashState>(
