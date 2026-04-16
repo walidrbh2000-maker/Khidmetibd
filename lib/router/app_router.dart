@@ -16,6 +16,18 @@
 //   4. Logged in + role unknown → wait (null redirect)
 //   5. Role guard: /worker/* paths blocked for clients
 //   6. /worker-home → /home
+//
+// NAMING NOTE:
+//   Two files share a similar purpose but are distinct widgets:
+//
+//   lib/screens/auth/worker_profile_screen.dart
+//     → WorkerProfileSetupScreen  (new-user setup flow, no params)
+//
+//   lib/screens/worker_profile/worker_profile_screen.dart
+//     → WorkerProfileScreen  (public profile viewer, requires workerId)
+//
+//   The auth setup screen was renamed WorkerProfileSetupScreen to eliminate
+//   the compile-time ambiguity when both are imported in this file.
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -27,6 +39,7 @@ import '../screens/onboarding/onboarding_screen.dart';
 import '../screens/auth/phone_auth_screen.dart';
 import '../screens/auth/role_selection_screen.dart';
 import '../screens/auth/user_profile_screen.dart';
+// WorkerProfileSetupScreen — new-user worker setup (renamed to avoid collision)
 import '../screens/auth/worker_profile_screen.dart';
 import '../screens/settings/settings_screen.dart';
 import '../screens/main_navigation_screen.dart';
@@ -39,6 +52,7 @@ import '../screens/worker_jobs/worker_jobs_screen.dart';
 import '../screens/worker_jobs/job_detail_screen.dart';
 import '../screens/worker_jobs/submit_bid_screen.dart';
 import '../screens/edit_profile/edit_profile_screen.dart';
+// WorkerProfileScreen — public profile viewer (requires workerId param)
 import '../screens/worker_profile/worker_profile_screen.dart';
 import '../screens/notifications/notifications_screen.dart';
 import '../screens/about/about_screen.dart';
@@ -212,7 +226,8 @@ final goRouterProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path:        AppRoutes.workerProfileSetup,
         name:        'worker-profile-setup',
-        pageBuilder: (_, s) => _fade(s.pageKey, const WorkerProfileScreen()),
+        // WorkerProfileSetupScreen — the new-user setup widget (auth folder)
+        pageBuilder: (_, s) => _fade(s.pageKey, const WorkerProfileSetupScreen()),
       ),
 
       // ── Main navigation shell ────────────────────────────────────────────
@@ -259,6 +274,7 @@ final goRouterProvider = Provider<GoRouter>((ref) {
         name:        'worker-profile',
         pageBuilder: (_, s) {
           final workerId = s.pathParameters['id'] ?? '';
+          // WorkerProfileScreen — the public viewer (worker_profile folder)
           return _fade(s.pageKey, WorkerProfileScreen(workerId: workerId));
         },
       ),
