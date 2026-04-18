@@ -12,7 +12,7 @@ ifeq ($(OS),Darwin)
 else ifeq ($(OS),Windows_NT)
   OPEN_CMD := start
 else
-  OPEN_CMD := $(shell command -v xdg-open 2>/dev/null || echo "echo 🔗 Open manually: ")
+  OPEN_CMD := $(shell command -v xdg-open 2>/dev/null || echo "echo 🔗 Ouvrez manuellement : ")
 endif
 
 SED_I := $(shell \
@@ -33,8 +33,9 @@ DATETIME := $(shell date +%Y%m%d-%H%M%S)
 
 .DEFAULT_GOAL := help
 .PHONY: help start start-local start-gpu stop restart build rebuild logs logs-api \
-        logs-mongo logs-redis logs-qdrant logs-minio logs-nginx health status \
-        ai-status dns ai-switch-gemini ai-switch-ollama ai-switch-vllm ollama-pull \
+        logs-mongo logs-redis logs-qdrant logs-minio logs-nginx logs-mongo-ui \
+        health status ai-status dns ai-switch-openrouter ai-switch-gemini \
+        ai-switch-ollama ai-switch-vllm ollama-pull \
         minio-buckets minio-console minio-list test-api test-ai test-upload \
         firewall backup backup-mongo restore list-backups shell-api shell-mongo \
         shell-redis shell-minio shell-qdrant mongo-stats redis-info redis-flush \
@@ -49,48 +50,50 @@ help: ## Afficher l'aide
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  KHIDMETI — Commandes disponibles"
-	@echo "  OS: $(OS) | Arch: $(ARCH)"
+	@echo "  OS : $(OS) | Architecture : $(ARCH)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo "  [SERVICES]"
-	@echo "  start              Demarrer (AI=gemini par defaut)"
-	@echo "  start-local        Demarrer avec Ollama (16GB RAM requis)"
-	@echo "  start-gpu          Demarrer avec vLLM  (GPU NVIDIA requis)"
-	@echo "  stop               Arreter tous les services"
-	@echo "  restart            Redemarrer tous les services"
+	@echo "  start              Démarrer (AI_PROVIDER=openrouter par défaut)"
+	@echo "  start-local        Démarrer avec Ollama (16 Go RAM requis)"
+	@echo "  start-gpu          Démarrer avec vLLM (GPU NVIDIA requis)"
+	@echo "  stop               Arrêter tous les services"
+	@echo "  restart            Redémarrer tous les services"
 	@echo "  build              Builder l'image NestJS"
-	@echo "  rebuild            Rebuild + redemarrer"
+	@echo "  rebuild            Rebuild + redémarrage"
 	@echo ""
 	@echo "  [LOGS]"
 	@echo "  logs               Tous les logs"
-	@echo "  logs-api           Logs NestJS uniquement"
+	@echo "  logs-api           Logs NestJS"
 	@echo "  logs-mongo         Logs MongoDB"
+	@echo "  logs-mongo-ui      Logs Mongo Express (interface web)"
 	@echo "  logs-redis         Logs Redis"
 	@echo "  logs-qdrant        Logs Qdrant"
 	@echo "  logs-minio         Logs MinIO"
 	@echo "  logs-nginx         Logs nginx"
 	@echo ""
 	@echo "  [DIAGNOSTIC]"
-	@echo "  health             Verifier la sante des services"
+	@echo "  health             Vérifier la santé des services"
 	@echo "  status             Statut des conteneurs Docker"
-	@echo "  ai-status          Provider AI actif"
+	@echo "  ai-status          Fournisseur IA actif"
 	@echo "  dns                URLs + config Flutter"
 	@echo ""
 	@echo "  [TUNNEL — Codespaces / WiFi distant]"
-	@echo "  tunnel-quick       Quick Tunnel (URL aleatoire trycloudflare.com)"
+	@echo "  tunnel-quick       Quick Tunnel (URL aléatoire trycloudflare.com)"
 	@echo "  tunnel-install     Installer cloudflared"
-	@echo "  tunnel-stop        Arreter le tunnel"
+	@echo "  tunnel-stop        Arrêter le tunnel"
 	@echo "  flutter-run        Lancer Flutter avec l'IP locale"
 	@echo ""
 	@echo "  [IA]"
-	@echo "  ai-switch-gemini   Basculer sur Gemini API (defaut)"
-	@echo "  ai-switch-ollama   Basculer sur Ollama (local)"
-	@echo "  ai-switch-vllm     Basculer sur vLLM (GPU)"
-	@echo "  ollama-pull        Telecharger les modeles Ollama"
+	@echo "  ai-switch-openrouter  Basculer sur OpenRouter (Gemma 4 gratuit)"
+	@echo "  ai-switch-gemini      Basculer sur Google Gemini API"
+	@echo "  ai-switch-ollama      Basculer sur Ollama (local)"
+	@echo "  ai-switch-vllm        Basculer sur vLLM (GPU)"
+	@echo "  ollama-pull           Télécharger les modèles Ollama"
 	@echo ""
 	@echo "  [MINIO]"
-	@echo "  minio-buckets      Creer les buckets MinIO"
-	@echo "  minio-console      Ouvrir la console MinIO"
+	@echo "  minio-buckets      Recréer les buckets MinIO"
+	@echo "  minio-console      Ouvrir la console MinIO (port 9002)"
 	@echo ""
 	@echo "  [TESTS]"
 	@echo "  test-api           Tester les endpoints principaux"
@@ -104,52 +107,52 @@ help: ## Afficher l'aide
 	@echo "  shell-api          Shell dans le conteneur NestJS"
 	@echo "  shell-mongo        mongosh dans MongoDB"
 	@echo "  shell-redis        redis-cli dans Redis"
-	@echo "  shell-minio        mc (MinIO client)"
+	@echo "  shell-minio        mc (client MinIO)"
 	@echo ""
 	@echo "  [NETTOYAGE]"
-	@echo "  clean              Supprimer volumes + donnees (destructif!)"
+	@echo "  clean              Supprimer volumes + données (destructif !)"
 	@echo "  clean-logs         Vider les logs"
 	@echo ""
-	@echo "  Windows CMD/PS:  scripts\\khidmeti.bat  or  scripts\\khidmeti.ps1"
+	@echo "  Windows : scripts\\khidmeti.bat  ou  scripts\\khidmeti.ps1"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## GESTION DES SERVICES
 ## ══════════════════════════════════════════════════════════════════════════════
 
-start: ## Demarrer (AI_PROVIDER=gemini par defaut)
+start: ## Démarrer (AI_PROVIDER défini dans .env)
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Demarrage de Khidmeti Backend..."
+	@echo "  Démarrage de Khidmeti Backend..."
 	@echo "══════════════════════════════════════════════"
 	@mkdir -p logs backups/mongodb backups/minio data/mongodb data/redis data/qdrant data/minio
 	@if [ ! -f .env ]; then \
 		cp .env.example .env 2>/dev/null || true; \
-		echo "⚠️  ATTENTION: .env cree — configurez FIREBASE_* et GEMINI_API_KEY"; \
+		echo "⚠️  ATTENTION : .env créé — configurez FIREBASE_* et vos clés IA"; \
 	fi
 	@docker compose up -d
 	@echo ""
-	@echo "  Attente du demarrage des services (15s)..."
-	@sleep 15
+	@echo "  Attente du démarrage des services (20s)..."
+	@sleep 20
 	@$(MAKE) health
 	@echo ""
 	@$(MAKE) dns
 
-start-local: ## Demarrer avec Ollama (16GB RAM requis)
-	@echo "Demarrage avec Ollama (AI local)..."
+start-local: ## Démarrer avec Ollama (16 Go RAM requis)
+	@echo "Démarrage avec Ollama (IA locale)..."
 	@docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 	@sleep 20
 	@$(MAKE) ollama-pull
 	@$(MAKE) health
 
-start-gpu: ## Demarrer avec vLLM (GPU NVIDIA requis)
-	@echo "Demarrage avec vLLM (GPU)..."
+start-gpu: ## Démarrer avec vLLM (GPU NVIDIA requis)
+	@echo "Démarrage avec vLLM (GPU)..."
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 	@$(MAKE) health
 
-stop: ## Arreter tous les services
+stop: ## Arrêter tous les services
 	@docker compose down
-	@echo "✅ Services arretes."
+	@echo "✅ Services arrêtés."
 
 stop-local:
 	@docker compose -f docker-compose.yml -f docker-compose.local.yml down
@@ -157,28 +160,31 @@ stop-local:
 stop-gpu:
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml down
 
-restart: stop ## Redemarrer
+restart: stop ## Redémarrer
 	@sleep 3
 	@$(MAKE) start
 
 build: ## Builder l'image NestJS
 	@docker compose build --no-cache api
-	@echo "✅ Build termine."
+	@echo "✅ Build terminé."
 
-rebuild: build start ## Rebuild complet + redemarrage
+rebuild: build start ## Rebuild complet + redémarrage
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## LOGS  (FIX: recette sur ligne séparée avec tabulation)
+## LOGS
 ## ══════════════════════════════════════════════════════════════════════════════
 
 logs: ## Tous les logs
 	@docker compose logs --tail=100 -f
 
-logs-api: ## Logs NestJS uniquement
+logs-api: ## Logs NestJS
 	@docker compose logs -f api
 
 logs-mongo: ## Logs MongoDB
 	@docker compose logs -f mongo
+
+logs-mongo-ui: ## Logs Mongo Express
+	@docker compose logs -f mongo-express
 
 logs-redis: ## Logs Redis
 	@docker compose logs -f redis
@@ -196,62 +202,67 @@ logs-nginx: ## Logs nginx
 ## DIAGNOSTIC
 ## ══════════════════════════════════════════════════════════════════════════════
 
-health: ## Verifier la sante des services
+health: ## Vérifier la santé des services
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Etat des services Khidmeti"
+	@echo "  État des services Khidmeti"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@echo -n "  NestJS API  (port 3000) : "; \
+	@echo -n "  NestJS API      (port 3000) : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE (HTTP $$code)"
-	@echo -n "  nginx       (port 80)   : "; \
+	@echo -n "  nginx           (port 80)   : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE (HTTP $$code)"
-	@echo -n "  MongoDB     (port 27017): "; \
+	@echo -n "  MongoDB         (port 27017): "; \
 	  docker exec khidmeti-mongo mongosh --quiet --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
 	  && echo "✅ OK" || echo "❌ HORS LIGNE"
-	@echo -n "  Redis       (port 6379) : "; \
+	@echo -n "  Mongo Express   (port 8081) : "; \
+	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081 2>/dev/null); \
+	  [ "$$code" = "200" ] && echo "✅ OK  →  http://localhost:8081" || echo "❌ HORS LIGNE (HTTP $$code)"
+	@echo -n "  Redis           (port 6379) : "; \
 	  REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	  docker exec khidmeti-redis redis-cli -a "$$REDIS_PASS" ping >/dev/null 2>&1 \
 	  && echo "✅ OK" || echo "❌ HORS LIGNE"
-	@echo -n "  Qdrant      (port 6333) : "; \
+	@echo -n "  Qdrant          (port 6333) : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:6333/healthz 2>/dev/null); \
-	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
-	@echo -n "  MinIO API   (port 9001) : "; \
+	  [ "$$code" = "200" ] && echo "✅ OK  →  http://localhost:6333/dashboard" || echo "❌ HORS LIGNE"
+	@echo -n "  MinIO API       (port 9001) : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9001/minio/health/live 2>/dev/null); \
-	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
+	  [ "$$code" = "200" ] && echo "✅ OK  →  http://localhost:9002 (console)" || echo "❌ HORS LIGNE"
 	@echo ""
 
 status: ## Statut des conteneurs
 	@docker ps -a --filter "name=khidmeti" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-ai-status: ## Provider IA actif
-	@docker exec khidmeti-api printenv AI_PROVIDER 2>/dev/null || echo "(conteneur non demarre)"
+ai-status: ## Fournisseur IA actif
+	@echo -n "  AI_PROVIDER actif : "
+	@docker exec khidmeti-api printenv AI_PROVIDER 2>/dev/null || echo "(conteneur non démarré)"
 
 dns: ## Afficher les URLs + config Flutter
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  URLs des services  [host: $(HOST)]"
+	@echo "  URLs des services  [hôte : $(HOST)]"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@echo "  API REST:          http://$(HOST):3000"
-	@echo "  API via nginx:     http://$(HOST):80"
-	@echo "  Swagger docs:      http://$(HOST):3000/api/docs"
-	@echo "  Qdrant dashboard:  http://$(HOST):6333/dashboard"
-	@echo "  MinIO console:     http://$(HOST):9002"
-	@echo "  MinIO API (S3):    http://$(HOST):9001"
+	@echo "  API REST       :  http://$(HOST):3000"
+	@echo "  API via nginx  :  http://$(HOST):80"
+	@echo "  Swagger docs   :  http://$(HOST):3000/api/docs"
+	@echo "  Mongo Express  :  http://$(HOST):8081   ← Interface MongoDB"
+	@echo "  Qdrant UI      :  http://$(HOST):6333/dashboard"
+	@echo "  MinIO console  :  http://$(HOST):9002"
+	@echo "  MinIO API (S3) :  http://$(HOST):9001"
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Config Flutter (meme WiFi)"
+	@echo "  Config Flutter (même WiFi)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@echo "  IP locale detectee: $(LOCAL_IP)"
+	@echo "  IP locale détectée : $(LOCAL_IP)"
 	@echo ""
 	@echo "  flutter run --dart-define=API_BASE_URL=http://$(LOCAL_IP):80"
 	@echo ""
-	@echo "  OU: collez l'URL Quick Tunnel dans Firebase Remote Config"
-	@echo "      cle: api_base_url"
+	@echo "  OU : collez l'URL Quick Tunnel dans Firebase Remote Config"
+	@echo "       clé : api_base_url"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
@@ -261,7 +272,7 @@ dns: ## Afficher les URLs + config Flutter
 tunnel-install: ## Installer cloudflared
 	@echo "Installation de cloudflared..."
 	@if command -v cloudflared >/dev/null 2>&1; then \
-		echo "✅ cloudflared deja installe: $$(cloudflared --version)"; \
+		echo "✅ cloudflared déjà installé : $$(cloudflared --version)"; \
 	elif [ -f /etc/debian_version ] || grep -qi ubuntu /etc/os-release 2>/dev/null; then \
 		curl -L --output /tmp/cloudflared.deb \
 		  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb 2>/dev/null; \
@@ -276,48 +287,53 @@ tunnel-install: ## Installer cloudflared
 
 tunnel-quick: ## Lancer un Quick Tunnel
 	@echo ""
-	@echo "  CTRL+C pour arreter le tunnel."
+	@echo "  CTRL+C pour arrêter le tunnel."
 	@echo ""
 	@cloudflared tunnel --url http://localhost:80
 
-tunnel-stop: ## Arreter le tunnel
-	@pkill -f 'cloudflared tunnel' 2>/dev/null && echo "✅ Tunnel(s) arretes." || echo "Aucun tunnel actif."
+tunnel-stop: ## Arrêter le tunnel
+	@pkill -f 'cloudflared tunnel' 2>/dev/null && echo "✅ Tunnel(s) arrêté(s)." || echo "Aucun tunnel actif."
 
-tunnel-status: ## Etat du tunnel
+tunnel-status: ## État du tunnel
 	@ps aux | grep 'cloudflared tunnel' | grep -v grep || echo "Aucun tunnel actif."
 
-flutter-run: ## Lance Flutter avec l'IP locale
+flutter-run: ## Lancer Flutter avec l'IP locale
 	@flutter run --dart-define=API_BASE_URL=http://$(LOCAL_IP):80
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## GESTION DE L'IA
 ## ══════════════════════════════════════════════════════════════════════════════
 
-ai-switch-gemini: ## Basculer sur Gemini
+ai-switch-openrouter: ## Basculer sur OpenRouter (Gemma 4 gratuit)
+	@$(SED_I) 's/^AI_PROVIDER=.*/AI_PROVIDER=openrouter/' .env
+	@docker compose up -d --no-deps api
+	@echo "✅ Fournisseur IA : OPENROUTER (Gemma 4 gratuit)"
+
+ai-switch-gemini: ## Basculer sur Google Gemini
 	@$(SED_I) 's/^AI_PROVIDER=.*/AI_PROVIDER=gemini/' .env
 	@docker compose up -d --no-deps api
-	@echo "✅ Provider IA: GEMINI"
+	@echo "✅ Fournisseur IA : GEMINI"
 
-ai-switch-ollama: ## Basculer sur Ollama
+ai-switch-ollama: ## Basculer sur Ollama (local)
 	@$(SED_I) 's/^AI_PROVIDER=.*/AI_PROVIDER=ollama/' .env
 	@docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
-	@echo "✅ Provider IA: OLLAMA"
+	@echo "✅ Fournisseur IA : OLLAMA"
 
-ai-switch-vllm: ## Basculer sur vLLM
+ai-switch-vllm: ## Basculer sur vLLM (GPU)
 	@$(SED_I) 's/^AI_PROVIDER=.*/AI_PROVIDER=vllm/' .env
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-	@echo "✅ Provider IA: VLLM"
+	@echo "✅ Fournisseur IA : VLLM"
 
-ollama-pull: ## Telecharger les modeles Ollama
+ollama-pull: ## Télécharger les modèles Ollama
 	@docker exec khidmeti-ollama ollama pull gemma4:e2b
 	@docker exec khidmeti-ollama ollama pull nomic-embed-text
-	@echo "✅ Modeles telecharges."
+	@echo "✅ Modèles téléchargés."
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## MINIO
 ## ══════════════════════════════════════════════════════════════════════════════
 
-minio-buckets: ## Creer les buckets MinIO
+minio-buckets: ## Recréer les buckets MinIO
 	@MINIO_ACCESS_KEY=$$(grep MINIO_ACCESS_KEY .env | cut -d= -f2 | tr -d '[:space:]'); \
 	MINIO_SECRET_KEY=$$(grep MINIO_SECRET_KEY .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker exec khidmeti-minio-init /bin/sh -c "\
@@ -326,7 +342,14 @@ minio-buckets: ## Creer les buckets MinIO
 		mc mb --ignore-existing local/service-media && \
 		mc mb --ignore-existing local/audio-recordings && \
 		mc anonymous set download local/profile-images && \
-		echo '✅ Buckets crees.'"
+		echo '✅ Buckets Khidmeti créés.'" 2>/dev/null || \
+	docker run --rm --network khidmeti-network minio/mc:latest sh -c \
+		"mc alias set local http://minio:9001 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY && \
+		 mc mb --ignore-existing local/profile-images && \
+		 mc mb --ignore-existing local/service-media && \
+		 mc mb --ignore-existing local/audio-recordings && \
+		 mc anonymous set download local/profile-images && \
+		 echo '✅ Buckets créés.'"
 
 minio-console: ## Ouvrir la console MinIO
 	@$(OPEN_CMD) http://localhost:9002 2>/dev/null || echo "  → http://localhost:9002"
@@ -344,14 +367,14 @@ minio-list: ## Lister les fichiers MinIO
 
 test-api: ## Tester les endpoints principaux
 	@echo ""
-	@echo "  [1] Health:"; curl -s http://localhost:3000/health
+	@echo "  [1] Health :"; curl -s http://localhost:3000/health
 	@echo ""
-	@echo "  [2] Swagger (HTTP code):"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
+	@echo "  [2] Swagger (code HTTP) :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
 	@echo ""
 
 test-ai: ## Tester l'extraction d'intention IA (make test-ai TOKEN=xxx)
 	@if [ -z "$(TOKEN)" ]; then \
-		echo "Usage: make test-ai TOKEN=<firebase_id_token>"; \
+		echo "Usage : make test-ai TOKEN=<firebase_id_token>"; \
 	else \
 		curl -s -X POST http://localhost:3000/ai/extract-intent \
 		  -H "Authorization: Bearer $(TOKEN)" \
@@ -377,7 +400,7 @@ backup: ## Sauvegarder MongoDB + MinIO
 
 restore: ## Restaurer (BACKUP_DATE=YYYYMMDD-HHMMSS)
 	@if [ -z "$(BACKUP_DATE)" ]; then \
-		echo "Usage: make restore BACKUP_DATE=20250101-120000"; exit 1; \
+		echo "Usage : make restore BACKUP_DATE=20250101-120000"; exit 1; \
 	fi
 	@MONGO_USER=$$(grep MONGO_ROOT_USER .env | cut -d= -f2 | tr -d '[:space:]'); \
 	MONGO_PASS=$$(grep MONGO_ROOT_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
@@ -386,7 +409,7 @@ restore: ## Restaurer (BACKUP_DATE=YYYYMMDD-HHMMSS)
 	  --username "$$MONGO_USER" --password "$$MONGO_PASS" \
 	  --authenticationDatabase admin --db khidmeti --drop \
 	  /tmp/restore_$(BACKUP_DATE)/khidmeti
-	@echo "✅ Restauration terminee."
+	@echo "✅ Restauration terminée."
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## SHELL ET DEBUG
@@ -427,7 +450,7 @@ redis-info: ## Stats Redis
 redis-flush: ## Vider le cache Redis
 	@REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker exec khidmeti-redis redis-cli -a "$$REDIS_PASS" FLUSHALL
-	@echo "✅ Cache Redis vide."
+	@echo "✅ Cache Redis vidé."
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## NETTOYAGE
@@ -435,36 +458,36 @@ redis-flush: ## Vider le cache Redis
 
 clean-logs: ## Vider les logs
 	@find logs/ -name "*.log" -delete 2>/dev/null || true
-	@echo "✅ Logs nettoyes."
+	@echo "✅ Logs nettoyés."
 
-clean: ## Supprimer volumes + donnees (DESTRUCTIF)
+clean: ## Supprimer volumes + données (DESTRUCTIF)
 	@echo ""
-	@echo "  ⚠️  ATTENTION: suppression de TOUTES les donnees."
-	@read -p "  Confirmer? [y/N] " CONFIRM; \
+	@echo "  ⚠️  ATTENTION : suppression de TOUTES les données Khidmeti."
+	@read -p "  Confirmer ? [y/N] " CONFIRM; \
 	if [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ]; then \
 		docker compose down -v --remove-orphans; \
 		docker system prune -f; \
 		rm -rf data/mongodb data/redis data/qdrant data/minio; \
-		echo "✅ Nettoyage termine."; \
+		echo "✅ Nettoyage terminé."; \
 	else \
-		echo "Annule."; \
+		echo "Annulé."; \
 	fi
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## PRODUCTION
 ## ══════════════════════════════════════════════════════════════════════════════
 
-prod-start: ## Demarrer en mode production
+prod-start: ## Démarrer en mode production
 	@docker compose up -d
 	@echo "✅ Mode production actif."
 
-prod-update: ## Mettre a jour l'API sans downtime
+prod-update: ## Mettre à jour l'API sans downtime
 	@docker compose build --no-cache api
 	@docker compose up -d --no-deps --build api
-	@echo "✅ API mise a jour."
+	@echo "✅ API mise à jour."
 
 firewall: ## Afficher les commandes pare-feu
-	@echo "  OS detecte: $(OS)"
+	@echo "  OS détecté : $(OS)"
 ifeq ($(OS),Linux)
-	@echo "  sudo ufw allow 80/tcp 3000/tcp 6333/tcp 9001/tcp 9002/tcp"
+	@echo "  sudo ufw allow 80/tcp 3000/tcp 6333/tcp 8081/tcp 9001/tcp 9002/tcp"
 endif

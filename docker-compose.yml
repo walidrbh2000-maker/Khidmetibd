@@ -1,24 +1,29 @@
-version: '3.9'
+name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose
 #
-# AI: Gemma-4 via Google AI API (aucun conteneur AI local requis)
-#     Demo:  gemma-4-31b-it via GEMINI_API_KEY
-#     Prod:  remplacer par votre serveur Ollama/vLLM — aucun changement de code
+# IA : Gemma-4 via OpenRouter (gratuit) ou Google AI API
+#      Basculer via AI_PROVIDER dans .env : gemini | openrouter | ollama | vllm
 #
-# Stack: NestJS · MongoDB · Redis · Qdrant · MinIO · nginx
+# Stack : NestJS · MongoDB 7 · Redis 7 · Qdrant 1.9 · MinIO · nginx
+# Interface MongoDB : Mongo Express → http://localhost:8081  (démarrage auto)
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
   khidmeti-network:
     driver: bridge
+    name: khidmeti-network
 
 volumes:
   mongo-data:
+    name: khidmeti-mongo-data
   redis-data:
+    name: khidmeti-redis-data
   qdrant-data:
+    name: khidmeti-qdrant-data
   minio-data:
+    name: khidmeti-minio-data
 
 services:
 
@@ -48,6 +53,9 @@ services:
         condition: service_healthy
     networks:
       - khidmeti-network
+    labels:
+      com.khidmeti.service: "api"
+      com.khidmeti.description: "Khidmeti NestJS REST API"
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -68,6 +76,34 @@ services:
       timeout:      5s
       retries:      5
       start_period: 20s
+    labels:
+      com.khidmeti.service: "database"
+
+  # ── Mongo Express — Interface Web MongoDB (démarrage automatique) ────────────
+  #    Accès : http://localhost:8081
+  #    Pas de mot de passe requis en développement local
+  # ─────────────────────────────────────────────────────────────────────────────
+  mongo-express:
+    image:          mongo-express:1.0.2
+    container_name: khidmeti-mongo-ui
+    restart:        unless-stopped
+    ports:
+      - '8081:8081'
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USER}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD}
+      ME_CONFIG_MONGODB_URL:           mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/
+      ME_CONFIG_BASICAUTH:             "false"
+      ME_CONFIG_MONGODB_ENABLE_ADMIN:  "true"
+      ME_CONFIG_SITE_BASEURL:          "/"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - khidmeti-network
+    labels:
+      com.khidmeti.service: "mongo-ui"
+      com.khidmeti.description: "Interface Web MongoDB — http://localhost:8081"
 
   # ── Redis 7.2 ───────────────────────────────────────────────────────────────
   redis:
@@ -88,8 +124,10 @@ services:
       interval: 10s
       timeout:  3s
       retries:  5
+    labels:
+      com.khidmeti.service: "cache"
 
-  # ── Qdrant v1.9 ─────────────────────────────────────────────────────────────
+  # ── Qdrant v1.9 — Base vectorielle ──────────────────────────────────────────
   qdrant:
     image:          qdrant/qdrant:v1.9.0
     container_name: khidmeti-qdrant
@@ -109,8 +147,13 @@ services:
       timeout:      5s
       retries:      10
       start_period: 30s
+    labels:
+      com.khidmeti.service: "vector-db"
 
-  # ── MinIO ───────────────────────────────────────────────────────────────────
+  # ── MinIO — Stockage objet (remplace Cloudinary) ────────────────────────────
+  #    API S3  : http://localhost:9001
+  #    Console : http://localhost:9002
+  # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:latest
     container_name: khidmeti-minio
@@ -119,6 +162,7 @@ services:
     environment:
       MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_BROWSER_REDIRECT_URL: "http://localhost:9002"
     volumes:
       - minio-data:/data
     ports:
@@ -132,11 +176,14 @@ services:
       timeout:      5s
       retries:      5
       start_period: 10s
+    labels:
+      com.khidmeti.service: "object-storage"
 
-  # ── MinIO init ──────────────────────────────────────────────────────────────
+  # ── MinIO Init — Création automatique des buckets ───────────────────────────
   minio-init:
     image:          minio/mc:latest
     container_name: khidmeti-minio-init
+    restart:        "no"
     depends_on:
       minio:
         condition: service_healthy
@@ -147,16 +194,20 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
     entrypoint: >
       /bin/sh -c "
+        echo '→ Connexion MinIO...';
         mc alias set local http://minio:9001 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY;
+        echo '→ Création des buckets...';
         mc mb --ignore-existing local/profile-images;
         mc mb --ignore-existing local/service-media;
         mc mb --ignore-existing local/audio-recordings;
         mc anonymous set download local/profile-images;
-        echo 'MinIO buckets prêts.';
+        echo '✅ Buckets Khidmeti prêts : profile-images | service-media | audio-recordings';
         exit 0;
       "
+    labels:
+      com.khidmeti.service: "minio-init"
 
-  # ── nginx ───────────────────────────────────────────────────────────────────
+  # ── nginx — Reverse proxy ───────────────────────────────────────────────────
   nginx:
     image:          nginx:1.27-alpine
     container_name: khidmeti-nginx
@@ -169,22 +220,5 @@ services:
       - api
     networks:
       - khidmeti-network
-
-  # ── Mongo Express (dev uniquement) ──────────────────────────────────────────
-  mongo-express:
-    image:          mongo-express:latest
-    container_name: khidmeti-mongo-express
-    restart:        unless-stopped
-    profiles:       ['dev-tools']
-    ports:
-      - '8081:8081'
-    environment:
-      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USER}
-      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD}
-      ME_CONFIG_MONGODB_URL:           mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/
-      ME_CONFIG_BASICAUTH:             'false'
-    depends_on:
-      mongo:
-        condition: service_healthy
-    networks:
-      - khidmeti-network
+    labels:
+      com.khidmeti.service: "gateway"
