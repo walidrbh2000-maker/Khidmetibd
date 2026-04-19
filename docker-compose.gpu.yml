@@ -1,0 +1,125 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# KHIDMETI — docker-compose.gpu.yml
+#
+# Override pour machine GPU NVIDIA (futur upgrade).
+# À utiliser EN PLUS du docker-compose.yml principal :
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   make start-gpu
+#
+# ── Prérequis ────────────────────────────────────────────────────────────────
+#   NVIDIA drivers installés sur l'hôte
+#   NVIDIA Container Toolkit : https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#   sudo apt install nvidia-container-toolkit
+#   sudo systemctl restart docker
+#
+# ── Modèles recommandés selon le GPU ────────────────────────────────────────
+#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:12b  + whisper-medium
+#   12 GB VRAM (RTX 3060, 4070)    → gemma4:27b  + whisper-large-v3
+#   16 GB VRAM (RTX 4080, 3090)    → gemma4:31b  + whisper-large-v3
+#   24 GB VRAM (RTX 3090, 4090)    → gemma4:31b  + whisper-large-v3
+#
+# ── Variables .env à modifier pour GPU ──────────────────────────────────────
+#   OLLAMA_MODEL=gemma4:12b          ← ou 27b, 31b
+#   WHISPER_MODEL=Systran/faster-whisper-large-v3
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Ollama avec accélération GPU ────────────────────────────────────────────
+  #
+  #  Le GPU prend en charge l'intégralité de l'inférence.
+  #  Performances indicatives gemma4:12b (RTX 3070 8GB) :
+  #    texte/image : 0.3-0.8s  (vs 5-15s CPU)
+  #    chargement  : 1-2s      (vs 10-20s CPU)
+  #
+  #  OLLAMA_KEEP_ALIVE passé à 10 min : le modèle reste en VRAM
+  #  (pas de coût de reload contrairement au CPU qui pèse sur la RAM système)
+  # ─────────────────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      # GPU : pas de limite de parallélisme — laisser Ollama gérer
+      OLLAMA_NUM_PARALLEL:       "4"
+      OLLAMA_MAX_LOADED_MODELS:  "1"
+      # Garder le modèle en VRAM plus longtemps (GPU = pas d'impact RAM système)
+      OLLAMA_KEEP_ALIVE:         "10m"
+      # Laisser Ollama utiliser tous les cores CPU pour la pré-tokenisation
+      OLLAMA_NUM_THREAD:         "0"
+      NVIDIA_VISIBLE_DEVICES:    "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    # Supprime la limite mémoire CPU (le modèle vit en VRAM)
+    mem_limit: null
+    # Accès GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        all
+              capabilities: [gpu]
+
+  # ── Ollama Init GPU — pull le modèle GPU ────────────────────────────────────
+  #
+  #  Override du service cpu pour tirer un modèle plus grand.
+  #  OLLAMA_MODEL doit être mis à jour dans .env :
+  #    OLLAMA_MODEL=gemma4:12b  (8 GB VRAM)
+  #    OLLAMA_MODEL=gemma4:27b  (12 GB VRAM)
+  #    OLLAMA_MODEL=gemma4:31b  (16+ GB VRAM)
+  # ─────────────────────────────────────────────────────────────────────────────
+  ollama-init:
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+
+  # ── faster-whisper avec accélération CUDA ──────────────────────────────────
+  #
+  #  Image CUDA (vs latest-cpu en mode standard).
+  #  float16 (fp16) vs int8 : meilleure précision, même vitesse sur GPU.
+  #
+  #  Modèles GPU recommandés :
+  #    Systran/faster-whisper-medium       → bon équilibre
+  #    Systran/faster-whisper-large-v3    → meilleure qualité (Darija/Arabe)
+  #
+  #  Vitesse large-v3 sur RTX 3070 : ~0.5s pour 10s d'audio
+  #  (vs ~4s sur CPU avec small/int8)
+  # ─────────────────────────────────────────────────────────────────────────────
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    environment:
+      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-large-v3}"
+      WHISPER__INFERENCE_DEVICE: "cuda"
+      WHISPER__COMPUTE_TYPE:     "float16"
+      WHISPER__LANGUAGE:         "auto"
+      # beam_size=5 sur GPU : meilleure précision sans coût notable
+      WHISPER__BEAM_SIZE:        "5"
+    mem_limit: null
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+
+  # ── API — limites mémoire levées sur machine GPU (typiquement 16-32 GB RAM) ─
+  api:
+    mem_limit: null
+
+  # ── Services infrastructure — limites levées ─────────────────────────────────
+  mongo:
+    mem_limit: null
+  redis:
+    mem_limit: null
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+  qdrant:
+    mem_limit: null
+  minio:
+    mem_limit: null
+  mongo-express:
+    mem_limit: null
+  nginx:
+    mem_limit: null

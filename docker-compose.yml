@@ -1,13 +1,23 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose
+# KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
-# IA : Gemma-4 via OpenRouter (gratuit) ou Google AI API
-#      Basculer via AI_PROVIDER dans .env : gemini | openrouter | ollama | vllm
+# Premier démarrage : make start
+#   → Ollama démarre, puis ollama-init télécharge gemma4:e2b (~7.2 GB)
+#   → faster-whisper télécharge son modèle au premier appel (~466 MB)
+#   → L'API fonctionne immédiatement ; l'IA répond dès que le modèle est prêt
 #
-# Stack : NestJS · MongoDB 7 · Redis 7 · Qdrant 1.9 · MinIO · nginx
-# Interface MongoDB : Mongo Express → http://localhost:8081  (démarrage auto)
+# GPU (futur) : docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Budget mémoire 8 GB RAM :
+#   Ollama + gemma4:e2b chargé  ~3.0 GB  (libéré après KEEP_ALIVE=3m)
+#   faster-whisper small/int8   ~0.5 GB  (permanent)
+#   MongoDB + Redis + Qdrant    ~1.0 GB
+#   MinIO + nginx + API         ~0.5 GB
+#   OS + Docker                 ~1.5 GB
+#   ──────────────────────────────────
+#   Total                       ~6.5 GB  ✅ marge confortable
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -16,14 +26,12 @@ networks:
     name: khidmeti-network
 
 volumes:
-  mongo-data:
-    name: khidmeti-mongo-data
-  redis-data:
-    name: khidmeti-redis-data
-  qdrant-data:
-    name: khidmeti-qdrant-data
-  minio-data:
-    name: khidmeti-minio-data
+  mongo-data:   { name: khidmeti-mongo-data   }
+  redis-data:   { name: khidmeti-redis-data   }
+  qdrant-data:  { name: khidmeti-qdrant-data  }
+  minio-data:   { name: khidmeti-minio-data   }
+  ollama-data:  { name: khidmeti-ollama-data  }
+  whisper-data: { name: khidmeti-whisper-data }
 
 services:
 
@@ -43,19 +51,109 @@ services:
     volumes:
       - ./apps/api/src:/app/src:ro
     depends_on:
-      mongo:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      mongo:   { condition: service_healthy }
+      redis:   { condition: service_healthy }
+      qdrant:  { condition: service_healthy }
+      minio:   { condition: service_healthy }
+      ollama:  { condition: service_healthy }
+      whisper: { condition: service_healthy }
     networks:
       - khidmeti-network
-    labels:
-      com.khidmeti.service: "api"
-      com.khidmeti.description: "Khidmeti NestJS REST API"
+    mem_limit: 512m
+
+  # ── Ollama — LLM local ──────────────────────────────────────────────────────
+  #
+  #  Modèle CPU recommandé : gemma4:e2b
+  #    Multimodal natif (texte + images), 2.3B paramètres effectifs
+  #    Téléchargement unique ~7.2 GB via ollama-init (voir ci-dessous)
+  #
+  #  Paramètres critiques pour 8 GB RAM :
+  #    OLLAMA_NUM_PARALLEL=1     → 1 requête à la fois (évite OOM)
+  #    OLLAMA_MAX_LOADED_MODELS=1 → 1 modèle en RAM max
+  #    OLLAMA_KEEP_ALIVE=3m      → libère ~3 GB après 3 min d'inactivité
+  #    OLLAMA_NUM_THREAD=4       → adapter selon votre CPU (nproc --all)
+  # ─────────────────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: khidmeti-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_NUM_PARALLEL:       "1"
+      OLLAMA_MAX_LOADED_MODELS:  "1"
+      OLLAMA_KEEP_ALIVE:         "3m"
+      OLLAMA_NUM_THREAD:         "4"
+      OLLAMA_FLASH_ATTENTION:    "0"
+    ports:
+      - '11434:11434'
+    networks:
+      - khidmeti-network
+    mem_limit:       4g
+    mem_reservation: 200m
+    healthcheck:
+      test:         ['CMD', 'curl', '-sf', 'http://localhost:11434/']
+      interval:     10s
+      timeout:      5s
+      retries:      6
+      start_period: 20s
+
+  # ── Ollama Init — téléchargement automatique du modèle ─────────────────────
+  #
+  #  S'exécute UNE SEULE FOIS au premier `docker compose up`.
+  #  Si le modèle est déjà présent dans ollama-data, le pull est un no-op rapide.
+  #  N'est PAS dans les depends_on de `api` → ne bloque pas le démarrage.
+  #
+  #  OLLAMA_MODEL défini dans .env (defaut: gemma4:e2b)
+  #  En GPU (docker-compose.gpu.yml) : override à gemma4:12b
+  # ─────────────────────────────────────────────────────────────────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: khidmeti-ollama-init
+    restart: "no"
+    entrypoint: ollama pull ${OLLAMA_MODEL:-gemma4:e2b}
+    environment:
+      # Pointe le CLI ollama vers le serveur dans le conteneur ollama
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama: { condition: service_healthy }
+    networks:
+      - khidmeti-network
+
+  # ── faster-whisper — Transcription audio locale ─────────────────────────────
+  #
+  #  Modèle  : Systran/faster-whisper-small (multilingue ~466 MB)
+  #  Langues : Darija / Arabe / Français / Anglais — détection automatique
+  #  Device  : cpu avec int8 quantification → ~3-5s pour 10s d'audio
+  #  API     : compatible OpenAI — POST /v1/audio/transcriptions
+  #
+  #  Le modèle est téléchargé automatiquement au premier appel (~466 MB).
+  #  Storé dans whisper-data pour être conservé entre les redémarrages.
+  # ─────────────────────────────────────────────────────────────────────────────
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: khidmeti-whisper
+    restart: unless-stopped
+    volumes:
+      - whisper-data:/root/.cache/huggingface
+    environment:
+      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
+      WHISPER__INFERENCE_DEVICE: "cpu"
+      WHISPER__COMPUTE_TYPE:     "int8"
+      WHISPER__LANGUAGE:         "auto"
+      WHISPER__BEAM_SIZE:        "1"
+    ports:
+      - '8000:8000'
+    networks:
+      - khidmeti-network
+    mem_limit:       700m
+    mem_reservation: 100m
+    healthcheck:
+      test:         ['CMD', 'curl', '-sf', 'http://localhost:8000/health']
+      interval:     15s
+      timeout:      10s
+      retries:      5
+      start_period: 60s
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -70,19 +168,15 @@ services:
       - mongo-data:/data/db
     networks:
       - khidmeti-network
+    mem_limit: 512m
     healthcheck:
       test:         ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
       interval:     10s
       timeout:      5s
       retries:      5
       start_period: 20s
-    labels:
-      com.khidmeti.service: "database"
 
-  # ── Mongo Express — Interface Web MongoDB (démarrage automatique) ────────────
-  #    Accès : http://localhost:8081
-  #    Pas de mot de passe requis en développement local
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── Mongo Express ────────────────────────────────────────────────────────────
   mongo-express:
     image:          mongo-express:1.0.2
     container_name: khidmeti-mongo-ui
@@ -95,15 +189,11 @@ services:
       ME_CONFIG_MONGODB_URL:           mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/
       ME_CONFIG_BASICAUTH:             "false"
       ME_CONFIG_MONGODB_ENABLE_ADMIN:  "true"
-      ME_CONFIG_SITE_BASEURL:          "/"
     depends_on:
-      mongo:
-        condition: service_healthy
+      mongo: { condition: service_healthy }
     networks:
       - khidmeti-network
-    labels:
-      com.khidmeti.service: "mongo-ui"
-      com.khidmeti.description: "Interface Web MongoDB — http://localhost:8081"
+    mem_limit: 256m
 
   # ── Redis 7.2 ───────────────────────────────────────────────────────────────
   redis:
@@ -113,21 +203,20 @@ services:
     command: >
       redis-server
       --requirepass ${REDIS_PASSWORD}
-      --maxmemory 256mb
+      --maxmemory 128mb
       --maxmemory-policy allkeys-lru
     volumes:
       - redis-data:/data
     networks:
       - khidmeti-network
+    mem_limit: 192m
     healthcheck:
       test:     ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
       interval: 10s
       timeout:  3s
       retries:  5
-    labels:
-      com.khidmeti.service: "cache"
 
-  # ── Qdrant v1.9 — Base vectorielle ──────────────────────────────────────────
+  # ── Qdrant v1.9 ─────────────────────────────────────────────────────────────
   qdrant:
     image:          qdrant/qdrant:v1.9.0
     container_name: khidmeti-qdrant
@@ -139,6 +228,7 @@ services:
       - '6334:6334'
     networks:
       - khidmeti-network
+    mem_limit: 256m
     healthcheck:
       test:
         - CMD-SHELL
@@ -147,13 +237,8 @@ services:
       timeout:      5s
       retries:      10
       start_period: 30s
-    labels:
-      com.khidmeti.service: "vector-db"
 
-  # ── MinIO — Stockage objet (remplace Cloudinary) ────────────────────────────
-  #    API S3  : http://localhost:9001
-  #    Console : http://localhost:9002
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── MinIO ───────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:latest
     container_name: khidmeti-minio
@@ -162,7 +247,6 @@ services:
     environment:
       MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
-      MINIO_BROWSER_REDIRECT_URL: "http://localhost:9002"
     volumes:
       - minio-data:/data
     ports:
@@ -170,23 +254,21 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
+    mem_limit: 256m
     healthcheck:
       test:         ['CMD', 'curl', '-f', 'http://localhost:9001/minio/health/live']
       interval:     10s
       timeout:      5s
       retries:      5
       start_period: 10s
-    labels:
-      com.khidmeti.service: "object-storage"
 
-  # ── MinIO Init — Création automatique des buckets ───────────────────────────
+  # ── MinIO Init ──────────────────────────────────────────────────────────────
   minio-init:
     image:          minio/mc:latest
     container_name: khidmeti-minio-init
     restart:        "no"
     depends_on:
-      minio:
-        condition: service_healthy
+      minio: { condition: service_healthy }
     networks:
       - khidmeti-network
     environment:
@@ -194,20 +276,15 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
     entrypoint: >
       /bin/sh -c "
-        echo '→ Connexion MinIO...';
         mc alias set local http://minio:9001 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY;
-        echo '→ Création des buckets...';
         mc mb --ignore-existing local/profile-images;
         mc mb --ignore-existing local/service-media;
         mc mb --ignore-existing local/audio-recordings;
         mc anonymous set download local/profile-images;
-        echo '✅ Buckets Khidmeti prêts : profile-images | service-media | audio-recordings';
-        exit 0;
+        echo '✅ Buckets prêts.';
       "
-    labels:
-      com.khidmeti.service: "minio-init"
 
-  # ── nginx — Reverse proxy ───────────────────────────────────────────────────
+  # ── nginx ───────────────────────────────────────────────────────────────────
   nginx:
     image:          nginx:1.27-alpine
     container_name: khidmeti-nginx
@@ -220,5 +297,4 @@ services:
       - api
     networks:
       - khidmeti-network
-    labels:
-      com.khidmeti.service: "gateway"
+    mem_limit: 64m
