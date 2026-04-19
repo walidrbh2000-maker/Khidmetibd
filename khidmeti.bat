@@ -4,10 +4,9 @@
 :: Usage: khidmeti.bat [command] [args]
 ::
 :: WORKFLOW :
-::   khidmeti.bat start  → 1ère fois : build Ollama auto (~15 min) + démarrage
-::   khidmeti.bat start  → fois suivantes : démarrage en quelques secondes
-::
-:: Requirements: Docker Desktop
+::   khidmeti.bat start       → 1ère fois : pull modèle + démarrage
+::   khidmeti.bat start       → fois suivantes : démarrage instantané (volume)
+::   khidmeti.bat ollama-pull → forcer re-pull avec progression visible
 :: ══════════════════════════════════════════════════════════════════════════════
 setlocal enabledelayedexpansion
 
@@ -31,9 +30,6 @@ for /f "tokens=2 delims==" %%a in ('findstr "^OLLAMA_MODEL=" .env 2^>nul') do (
   set OLLAMA_MODEL_VAL=%%a
   set OLLAMA_MODEL_VAL=!OLLAMA_MODEL_VAL: =!
 )
-:: Convertir ":" en "-" pour le tag Docker (gemma4:e2b → gemma4-e2b)
-set OLLAMA_TAG=%OLLAMA_MODEL_VAL::=-%
-set OLLAMA_IMAGE=khidmeti-ollama:%OLLAMA_TAG%
 
 :: ── Router la commande ────────────────────────────────────────────────────────
 set CMD=%1
@@ -46,8 +42,7 @@ if /i "%CMD%"=="stop"           goto :stop
 if /i "%CMD%"=="restart"        goto :restart
 if /i "%CMD%"=="build"          goto :build
 if /i "%CMD%"=="rebuild"        goto :rebuild
-if /i "%CMD%"=="ollama-build"   goto :ollama_build
-if /i "%CMD%"=="ollama-rebuild" goto :ollama_rebuild
+if /i "%CMD%"=="ollama-pull"    goto :ollama_pull
 if /i "%CMD%"=="health"         goto :health
 if /i "%CMD%"=="ai-status"      goto :ai_status
 if /i "%CMD%"=="status"         goto :status
@@ -88,18 +83,17 @@ echo.
 echo ══════════════════════════════════════════════════════
 echo   KHIDMETI — Commandes Windows CMD
 echo   IP locale : %LOCAL_IP%
-echo   Image     : %OLLAMA_IMAGE%
+echo   Modele    : %OLLAMA_MODEL_VAL%
 echo ══════════════════════════════════════════════════════
 echo.
 echo   [DEMARRAGE]
-echo   khidmeti.bat start              Tout demarrer (build Ollama auto si besoin)
+echo   khidmeti.bat start              Demarrer + pull modele si absent
 echo   khidmeti.bat start-gpu          Demarrer avec GPU NVIDIA
-echo   khidmeti.bat stop               Arreter tous les services
+echo   khidmeti.bat stop               Arreter (volumes conserves)
 echo   khidmeti.bat restart            Redemarrer
 echo.
-echo   [IMAGE OLLAMA]
-echo   khidmeti.bat ollama-build       Builder l'image Ollama+modele (~15 min)
-echo   khidmeti.bat ollama-rebuild     Forcer rebuild sans cache
+echo   [OLLAMA]
+echo   khidmeti.bat ollama-pull        Pull modele avec progression (X GB / Y GB)
 echo.
 echo   [BUILD API]
 echo   khidmeti.bat build              Builder l'image NestJS
@@ -113,7 +107,7 @@ echo   khidmeti.bat logs-whisper       Logs faster-whisper
 echo.
 echo   [DIAGNOSTIC]
 echo   khidmeti.bat health             Sante de tous les services
-echo   khidmeti.bat ai-status          Statut IA + taille image Ollama
+echo   khidmeti.bat ai-status          Statut IA + modeles installes
 echo   khidmeti.bat status             Statut des conteneurs
 echo   khidmeti.bat dns                URLs + config Flutter
 echo.
@@ -133,43 +127,39 @@ echo   khidmeti.bat shell-mongo        mongosh
 echo   khidmeti.bat test-ai            Tester extraction Darija
 echo.
 echo   [NETTOYAGE]
-echo   khidmeti.bat clean              Supprimer donnees (image Ollama conservee)
+echo   khidmeti.bat clean              Supprimer volumes (modele inclus)
 echo.
 goto :eof
 
 :: ═══════════════════════════════════════════════════════════════════════════════
-:: OLLAMA BUILD
+:: OLLAMA PULL — progression visible
 :: ═══════════════════════════════════════════════════════════════════════════════
-:ollama_build
+:ollama_pull
 echo.
 echo ══════════════════════════════════════════════
-echo   Build image Ollama + modele integre
-echo   Modele  : %OLLAMA_MODEL_VAL%
-echo   Image   : %OLLAMA_IMAGE%
-echo   Duree   : ~15 min (une seule fois par machine)
-echo ══════════════════════════════════════════════
-echo.
-docker compose build ollama
-if !errorlevel! neq 0 (
-  echo.
-  echo   ERREUR : build Ollama echoue.
-  exit /b 1
-)
-echo.
-echo   OK Image %OLLAMA_IMAGE% prete.
-echo.
-goto :eof
-
-:ollama_rebuild
-echo.
-echo ══════════════════════════════════════════════
-echo   Rebuild Ollama sans cache
+echo   Pull modele Ollama
 echo   Modele : %OLLAMA_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
-docker compose build --no-cache ollama
+echo   Attente que Ollama soit pret...
+:ollama_pull_wait
+curl -sf http://localhost:11434/ >nul 2>&1
+if !errorlevel! neq 0 (
+  timeout /t 2 /nobreak >nul
+  goto :ollama_pull_wait
+)
+echo   OK Ollama pret.
 echo.
-echo   OK Image %OLLAMA_IMAGE% reconstruite.
+echo   Telechargement en cours (progression ci-dessous) :
+echo   ex: pulling abc123... 2.1 GB / 7.2 GB  32 MB/s
+echo.
+docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
+if !errorlevel! neq 0 (
+  echo   ERREUR : pull echoue.
+  exit /b 1
+)
+echo.
+echo   OK Modele %OLLAMA_MODEL_VAL% pret.
 echo.
 goto :eof
 
@@ -180,10 +170,10 @@ goto :eof
 echo.
 echo ══════════════════════════════════════════════
 echo   Demarrage de Khidmeti
+echo   Modele IA : %OLLAMA_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
 
-:: Creer les repertoires necessaires
 if not exist "logs"              mkdir logs
 if not exist "backups\mongodb"   mkdir backups\mongodb
 if not exist "data\mongodb"      mkdir data\mongodb
@@ -191,7 +181,6 @@ if not exist "data\redis"        mkdir data\redis
 if not exist "data\qdrant"       mkdir data\qdrant
 if not exist "data\minio"        mkdir data\minio
 
-:: Verifier .env
 if not exist ".env" (
   if exist ".env.example" (
     copy ".env.example" ".env" >nul
@@ -200,28 +189,42 @@ if not exist ".env" (
   )
 )
 
-:: Verifier si l'image Ollama existe
-docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
-if !errorlevel! neq 0 (
-  echo   Image Ollama absente ^(%OLLAMA_IMAGE%^)
-  echo   Build automatique ^(~15 min, une seule fois sur cette machine^)...
-  echo.
-  call :ollama_build
-  if !errorlevel! neq 0 (
-    echo   ERREUR : impossible de builder l'image Ollama.
-    exit /b 1
-  )
-) else (
-  echo   OK Image Ollama presente ^(%OLLAMA_IMAGE%^)
-  echo.
-)
-
-:: Demarrer tous les services
+echo   Demarrage des services...
 docker compose up -d
 echo.
 echo   OK Services demarres.
 echo.
-timeout /t 8 /nobreak >nul
+
+:: Attendre Ollama
+echo   Attente que Ollama soit pret...
+:start_ollama_wait
+curl -sf http://localhost:11434/ >nul 2>&1
+if !errorlevel! neq 0 (
+  timeout /t 2 /nobreak >nul
+  goto :start_ollama_wait
+)
+echo   OK Ollama pret.
+echo.
+
+:: Vérifier si le modèle est déjà présent
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "%OLLAMA_MODEL_VAL%" >nul 2>&1
+if !errorlevel! equ 0 (
+  echo   OK Modele %OLLAMA_MODEL_VAL% deja present — demarrage instantane.
+  echo.
+) else (
+  echo   Modele absent du volume — telechargement en cours...
+  echo   Progression (X GB / Y GB) :
+  echo.
+  docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
+  if !errorlevel! neq 0 (
+    echo   ERREUR : pull du modele echoue.
+    exit /b 1
+  )
+  echo.
+  echo   OK Modele %OLLAMA_MODEL_VAL% pret.
+  echo.
+)
+
 call :health
 call :dns
 goto :eof
@@ -233,14 +236,19 @@ echo   Demarrage Khidmeti — GPU NVIDIA
 echo   Modele : %OLLAMA_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
-docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
-if !errorlevel! neq 0 (
-  echo   Image absente — build automatique...
-  call :ollama_build
-)
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 echo.
-timeout /t 8 /nobreak >nul
+echo   Attente Ollama...
+:start_gpu_wait
+curl -sf http://localhost:11434/ >nul 2>&1
+if !errorlevel! neq 0 ( timeout /t 2 /nobreak >nul & goto :start_gpu_wait )
+echo   OK.
+echo.
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "%OLLAMA_MODEL_VAL%" >nul 2>&1
+if !errorlevel! neq 0 (
+  echo   Pull modele GPU...
+  docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
+)
 call :health
 goto :eof
 
@@ -249,7 +257,9 @@ goto :eof
 :: ═══════════════════════════════════════════════════════════════════════════════
 :stop
 docker compose down
-echo Services arretes.
+echo.
+echo   OK Services arretes. Volumes conserves (modele Ollama intact).
+echo.
 goto :eof
 
 :restart
@@ -280,7 +290,7 @@ echo.
 curl -s -o nul -w "  NestJS API  (3000) : HTTP %%{http_code}\n" http://localhost:3000/health     2>nul || echo   NestJS API  (3000) : HORS LIGNE
 curl -s -o nul -w "  nginx       (80)   : HTTP %%{http_code}\n" http://localhost/health           2>nul || echo   nginx       (80)   : HORS LIGNE
 curl -s -o nul -w "  Qdrant      (6333) : HTTP %%{http_code}\n" http://localhost:6333/healthz    2>nul || echo   Qdrant      (6333) : HORS LIGNE
-curl -s -o nul -w "  MinIO       (9001) : HTTP %%{http_code}\n" http://localhost:9001/minio/health/live 2>nul || echo   MinIO API   (9001) : HORS LIGNE
+curl -s -o nul -w "  MinIO       (9001) : HTTP %%{http_code}\n" http://localhost:9001/minio/health/live 2>nul || echo   MinIO       (9001) : HORS LIGNE
 curl -s -o nul -w "  Ollama      (11434): HTTP %%{http_code}\n" http://localhost:11434/           2>nul || echo   Ollama      (11434): HORS LIGNE
 curl -s -o nul -w "  Whisper     (8000) : HTTP %%{http_code}\n" http://localhost:8000/health     2>nul || echo   Whisper     (8000) : HORS LIGNE
 echo.
@@ -295,13 +305,8 @@ echo.
 curl -s -o nul -w "  Ollama  (11434) : HTTP %%{http_code}\n" http://localhost:11434/ 2>nul
 curl -s -o nul -w "  Whisper (8000)  : HTTP %%{http_code}\n" http://localhost:8000/health 2>nul
 echo.
-echo   Image Docker :
-docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
-if !errorlevel! equ 0 (
-  echo     OK %OLLAMA_IMAGE%
-) else (
-  echo     ABSENT %OLLAMA_IMAGE% — sera buildee au prochain : khidmeti.bat start
-)
+echo   Modeles installes :
+docker exec khidmeti-ollama ollama list 2>nul || echo   (Ollama non demarre)
 echo.
 goto :eof
 
@@ -401,7 +406,6 @@ if %errorlevel% neq 0 (
 powershell -Command "Expand-Archive -Path '%TEMP%\ngrok.zip' -DestinationPath 'C:\ngrok' -Force" >nul 2>&1
 echo.
 echo   ngrok extrait dans C:\ngrok\
-echo.
 echo   Ajoutez C:\ngrok\ a votre variable PATH puis :
 echo   1. Compte : https://dashboard.ngrok.com/signup
 echo   2. Token  : https://dashboard.ngrok.com/get-started/your-authtoken
@@ -465,9 +469,6 @@ echo Config ngrok supprimee.
 goto :eof
 
 :flutter_run
-echo.
-echo   Flutter avec API_BASE_URL=http://%LOCAL_IP%:80
-echo.
 flutter run --dart-define=API_BASE_URL=http://%LOCAL_IP%:80
 goto :eof
 
@@ -604,8 +605,8 @@ exit /b 1
 :: ═══════════════════════════════════════════════════════════════════════════════
 :clean
 echo.
-echo   ATTENTION : suppression de MongoDB, Redis, Qdrant, MinIO.
-echo   L'image Ollama+modele est CONSERVEE dans le cache Docker.
+echo   ATTENTION : suppression de tous les volumes (MongoDB, Redis, Qdrant, MinIO, Ollama).
+echo   Le modele Ollama sera re-telecharge au prochain : khidmeti.bat start
 set /p CONFIRM="  Taper YES pour confirmer : "
 if /i "%CONFIRM%"=="YES" (
   docker compose down -v --remove-orphans
@@ -613,7 +614,7 @@ if /i "%CONFIRM%"=="YES" (
   if exist "data\redis"   rmdir /s /q data\redis
   if exist "data\qdrant"  rmdir /s /q data\qdrant
   if exist "data\minio"   rmdir /s /q data\minio
-  echo Nettoyage termine. Image Ollama intacte.
+  echo Nettoyage termine.
 ) else (
   echo Annule.
 )

@@ -5,39 +5,41 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #   make start-gpu
+#   khidmeti.bat start-gpu
+#   .\khidmeti.ps1 start-gpu
 #
-# ── Prérequis ────────────────────────────────────────────────────────────────
+# ── Prérequis ─────────────────────────────────────────────────────────────────
 #   NVIDIA drivers installés sur l'hôte
 #   NVIDIA Container Toolkit :
 #     sudo apt install nvidia-container-toolkit
 #     sudo systemctl restart docker
 #
-# ── Modèles recommandés selon le GPU ────────────────────────────────────────
-#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  (défaut)
-#   8 GB VRAM                      → gemma4:e4b  (meilleure qualité)
-#   12 GB VRAM (RTX 3060, 4070)    → gemma4:26b
-#   16 GB VRAM (RTX 4080, 3090)    → gemma4:31b
+# ── Modèles recommandés selon le GPU ─────────────────────────────────────────
+#    8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  (défaut)
+#    8 GB VRAM                      → gemma4:e4b  (meilleure qualité)
+#   12 GB VRAM  (RTX 3060, 4070)    → gemma4:26b
+#   16 GB VRAM+ (RTX 4080, 3090)    → gemma4:31b
 #
-# ── Changer de modèle GPU ───────────────────────────────────────────────────
+# ── Changer de modèle GPU ────────────────────────────────────────────────────
 #   1. Modifier OLLAMA_MODEL dans .env
-#   2. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
-#   3. make ollama-rebuild
-#   4. make start-gpu
+#   2. make ollama-pull   (pull avec progression visible)
+#   3. make start-gpu
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
 
-  # ── Ollama GPU — même image baked, accélération NVIDIA ─────────────────────
+  # ── Ollama GPU ───────────────────────────────────────────────────────────────
   #
-  #  L'image contient déjà le modèle (baked at build time).
-  #  On ajoute uniquement les capacités GPU ici.
+  #  Remplace l'image CPU par la variante CUDA.
+  #  Le modèle reste dans le même volume ollama-data.
+  #  Aucun re-téléchargement si le modèle est déjà dans le volume.
   #
-  #  OLLAMA_NUM_PARALLEL=4 : GPU gère le parallélisme natif
-  #  OLLAMA_KEEP_ALIVE=-1  : modèle permanent en VRAM
+  #  OLLAMA_NUM_PARALLEL=4   → GPU gère le parallélisme natif
+  #  OLLAMA_KEEP_ALIVE=-1    → modèle permanent en VRAM
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
+    image: ollama/ollama:latest
     environment:
-      OLLAMA_MODELS:              /ollama/models
       OLLAMA_NUM_PARALLEL:        "4"
       OLLAMA_MAX_LOADED_MODELS:   "1"
       OLLAMA_KEEP_ALIVE:          "-1"
@@ -53,7 +55,7 @@ services:
               count:        all
               capabilities: [gpu]
 
-  # ── faster-whisper CUDA ────────────────────────────────────────────────────
+  # ── faster-whisper CUDA ───────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cuda
     environment:
@@ -71,7 +73,7 @@ services:
               count:        1
               capabilities: [gpu]
 
-  # ── Limites levées sur machine GPU ────────────────────────────────────────
+  # ── Limites mémoire levées sur machine GPU ────────────────────────────────
   api:
     mem_limit: null
 

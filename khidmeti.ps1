@@ -4,10 +4,9 @@
 # Alias:  Set-Alias kh .\khidmeti.ps1
 #
 # WORKFLOW :
-#   .\khidmeti.ps1 start  → 1ère fois : build Ollama auto (~15 min) + démarrage
-#   .\khidmeti.ps1 start  → fois suivantes : démarrage en quelques secondes
-#
-# Requirements: Docker Desktop, PowerShell 5+
+#   .\khidmeti.ps1 start        → 1ère fois : pull modèle + démarrage
+#   .\khidmeti.ps1 start        → fois suivantes : démarrage instantané (volume)
+#   .\khidmeti.ps1 ollama-pull  → forcer re-pull avec progression visible
 # ══════════════════════════════════════════════════════════════════════════════
 param(
   [Parameter(Position=0)]
@@ -67,11 +66,44 @@ function Remove-EnvValue([string]$key) {
   $content | Set-Content ".env" -Encoding UTF8
 }
 
-# ── Image Ollama ──────────────────────────────────────────────────────────────
+# ── Modèle Ollama ─────────────────────────────────────────────────────────────
 $OllamaModel = Get-EnvValue "OLLAMA_MODEL"
 if ($OllamaModel -eq "") { $OllamaModel = "gemma4:e2b" }
-$OllamaTag   = $OllamaModel -replace ":", "-"
-$OllamaImage = "khidmeti-ollama:$OllamaTag"
+
+# ── Attendre Ollama ───────────────────────────────────────────────────────────
+function Wait-Ollama {
+  Write-Host "  ⏳ Attente que Ollama soit prêt..." -ForegroundColor Gray
+  $ready = $false
+  while (-not $ready) {
+    try {
+      $r = Invoke-WebRequest -Uri "http://localhost:11434/" -UseBasicParsing -TimeoutSec 3 -ErrorAction SilentlyContinue
+      if ($r.StatusCode -eq 200) { $ready = $true }
+    } catch { Start-Sleep -Seconds 2 }
+  }
+  Write-Ok "Ollama prêt."
+}
+
+# ── Vérifier si modèle présent ────────────────────────────────────────────────
+function Test-ModelPresent([string]$model) {
+  $result = docker exec khidmeti-ollama ollama list 2>$null
+  return ($result -match [regex]::Escape($model.Split(":")[0]))
+}
+
+# ── Pull avec progression visible ─────────────────────────────────────────────
+function Invoke-OllamaPull([string]$model) {
+  Write-Host ""
+  Write-Host "  📥 Téléchargement en cours (progression ci-dessous) :" -ForegroundColor Yellow
+  Write-Host "  ex: pulling abc123... ████████░░ 4.1 GB / 7.2 GB  32 MB/s  1m58s" -ForegroundColor Gray
+  Write-Host ""
+  # docker exec -it pour avoir le TTY et voir la barre de progression native d'Ollama
+  docker exec -it khidmeti-ollama ollama pull $model
+  if ($LASTEXITCODE -ne 0) {
+    Write-Err "Pull échoué."
+    exit 1
+  }
+  Write-Host ""
+  Write-Ok "Modèle $model prêt."
+}
 
 # ── Health check ──────────────────────────────────────────────────────────────
 function Test-Endpoint([string]$label, [string]$url) {
@@ -85,35 +117,6 @@ function Test-Endpoint([string]$label, [string]$url) {
   } catch {
     Write-Err "$label → HORS LIGNE"
   }
-}
-
-# ── Vérifier si image Docker existe ──────────────────────────────────────────
-function Test-DockerImage([string]$imageName) {
-  $result = docker image inspect $imageName 2>$null
-  return $LASTEXITCODE -eq 0
-}
-
-# ── Build Ollama ──────────────────────────────────────────────────────────────
-function Invoke-OllamaBuild([bool]$noCache = $false) {
-  Write-Header "Build image Ollama + modèle intégré"
-  Write-Host "  Modèle : $OllamaModel" -ForegroundColor Yellow
-  Write-Host "  Image  : $OllamaImage" -ForegroundColor Yellow
-  Write-Host "  Durée  : ~15 min (une seule fois par machine)" -ForegroundColor Gray
-  Write-Host ""
-
-  if ($noCache) {
-    docker compose build --no-cache ollama
-  } else {
-    docker compose build ollama
-  }
-
-  if ($LASTEXITCODE -ne 0) {
-    Write-Err "Build Ollama échoué."
-    exit 1
-  }
-  Write-Host ""
-  Write-Ok "$OllamaImage prête."
-  Write-Host ""
 }
 
 # ── Scripts ───────────────────────────────────────────────────────────────────
@@ -138,7 +141,7 @@ function Invoke-Seed([string]$filePath, [string[]]$extraArgs = @()) {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DÉTECTION commande scripts-<nom>
+# Détection commande scripts-<nom>
 # ══════════════════════════════════════════════════════════════════════════════
 if ($Command -like "scripts-*" -and
     $Command -ne "scripts-migrations" -and
@@ -157,13 +160,10 @@ if ($Command -like "scripts-*" -and
     if ($ok) { Write-Ok "$scriptName.ts OK" } else { Write-Err "ECHEC"; exit 1 }
   } else {
     Write-Err "Script '$scriptName' introuvable."
-    Write-Host ""
-    Write-Info "Migrations disponibles :"
     Get-ChildItem "scripts\migrations\*.js" -ErrorAction SilentlyContinue |
-      ForEach-Object { Write-Info "  $($_.BaseName)" }
-    Write-Info "Seeds disponibles :"
+      ForEach-Object { Write-Info "  migration: $($_.BaseName)" }
     Get-ChildItem "apps\api\src\scripts\seeds\*.ts" -ErrorAction SilentlyContinue |
-      ForEach-Object { Write-Info "  $($_.BaseName)" }
+      ForEach-Object { Write-Info "  seed: $($_.BaseName)" }
     exit 1
   }
   Write-Host ""
@@ -179,53 +179,52 @@ switch ($Command.ToLower()) {
   "help" {
     Write-Header "KHIDMETI — Commandes PowerShell"
     Write-Host "  IP locale : $LOCAL_IP" -ForegroundColor Yellow
-    Write-Host "  Image     : $OllamaImage" -ForegroundColor Yellow
+    Write-Host "  Modèle    : $OllamaModel" -ForegroundColor Yellow
     Write-Host ""
     @(
-      @("[DÉMARRAGE]", ""),
-      @("start",                   "Tout démarrer (build Ollama auto si besoin)"),
-      @("start-gpu",               "Démarrer avec GPU NVIDIA"),
-      @("stop",                    "Arrêter tous les services"),
-      @("restart",                 "Redémarrer"),
-      @("", ""),
-      @("[IMAGE OLLAMA]", ""),
-      @("ollama-build",            "Builder l'image Ollama+modèle (~15 min)"),
-      @("ollama-rebuild",          "Forcer rebuild sans cache"),
-      @("", ""),
-      @("[BUILD API]", ""),
-      @("build",                   "Builder l'image NestJS"),
-      @("rebuild",                 "Rebuild NestJS + redémarrage"),
-      @("", ""),
-      @("[LOGS]", ""),
-      @("logs",                    "Tous les logs"),
-      @("logs-api",                "Logs NestJS"),
-      @("logs-ollama",             "Logs Ollama"),
-      @("logs-whisper",            "Logs faster-whisper"),
-      @("", ""),
-      @("[DIAGNOSTIC]", ""),
-      @("health",                  "Santé de tous les services"),
-      @("ai-status",               "Statut IA + taille image Ollama"),
-      @("status",                  "Statut des conteneurs"),
-      @("dns",                     "URLs + config Flutter"),
-      @("", ""),
-      @("[TUNNEL]", ""),
-      @("ngrok",                   "Tunnel ngrok PERMANENT — recommandé"),
-      @("tunnel",                  "Cloudflare Quick Tunnel"),
-      @("", ""),
-      @("[SCRIPTS]", ""),
-      @("scripts",                 "Tout exécuter (migrations + seeds)"),
-      @("scripts-migrations",      "Migrations seulement"),
-      @("scripts-seeds",           "Seeds seulement"),
-      @("scripts-<nom>",           "Un script précis (ex: scripts-seed-workers)"),
-      @("", ""),
-      @("[DEBUG]", ""),
-      @("shell-api",               "Shell NestJS"),
-      @("shell-mongo",             "mongosh"),
-      @("test-api",                "Tester les endpoints"),
-      @("test-ai",                 "Tester extraction Darija"),
-      @("", ""),
-      @("[NETTOYAGE]", ""),
-      @("clean",                   "Supprimer données (image Ollama conservée)")
+      @("[DÉMARRAGE]",            ""),
+      @("start",                  "Démarrer + pull modèle si absent (progression visible)"),
+      @("start-gpu",              "Démarrer avec GPU NVIDIA"),
+      @("stop",                   "Arrêter (volumes conservés — modèle intact)"),
+      @("restart",                "Redémarrer"),
+      @("",                       ""),
+      @("[OLLAMA]",               ""),
+      @("ollama-pull",            "Pull / mise à jour du modèle (X GB / Y GB visible)"),
+      @("",                       ""),
+      @("[BUILD API]",            ""),
+      @("build",                  "Builder l'image NestJS"),
+      @("rebuild",                "Rebuild NestJS + redémarrage"),
+      @("",                       ""),
+      @("[LOGS]",                 ""),
+      @("logs",                   "Tous les logs"),
+      @("logs-api",               "Logs NestJS"),
+      @("logs-ollama",            "Logs Ollama"),
+      @("logs-whisper",           "Logs faster-whisper"),
+      @("",                       ""),
+      @("[DIAGNOSTIC]",           ""),
+      @("health",                 "Santé de tous les services"),
+      @("ai-status",              "Statut IA + modèles installés"),
+      @("status",                 "Statut des conteneurs"),
+      @("dns",                    "URLs + config Flutter"),
+      @("",                       ""),
+      @("[TUNNEL]",               ""),
+      @("ngrok",                  "Tunnel ngrok PERMANENT — recommandé"),
+      @("tunnel",                 "Cloudflare Quick Tunnel"),
+      @("",                       ""),
+      @("[SCRIPTS]",              ""),
+      @("scripts",                "Tout exécuter (migrations + seeds)"),
+      @("scripts-migrations",     "Migrations seulement"),
+      @("scripts-seeds",          "Seeds seulement"),
+      @("scripts-<nom>",          "Un script précis"),
+      @("",                       ""),
+      @("[DEBUG]",                ""),
+      @("shell-api",              "Shell NestJS"),
+      @("shell-mongo",            "mongosh"),
+      @("test-api",               "Tester les endpoints"),
+      @("test-ai",                "Tester extraction Darija"),
+      @("",                       ""),
+      @("[NETTOYAGE]",            ""),
+      @("clean",                  "Supprimer tous les volumes (modèle inclus)")
     ) | ForEach-Object {
       if ($_[1] -eq "" -and $_[0] -ne "") {
         Write-Host "`n  $($_[0])" -ForegroundColor Cyan
@@ -236,26 +235,25 @@ switch ($Command.ToLower()) {
     Write-Host ""
   }
 
-  # ── ollama-build ────────────────────────────────────────────────────────────
-  "ollama-build" {
-    Invoke-OllamaBuild $false
+  # ── ollama-pull ──────────────────────────────────────────────────────────────
+  "ollama-pull" {
+    Write-Header "Pull modèle Ollama"
+    Write-Host "  Modèle : $OllamaModel" -ForegroundColor Yellow
+    Wait-Ollama
+    Invoke-OllamaPull $OllamaModel
   }
 
-  "ollama-rebuild" {
-    Invoke-OllamaBuild $true
-  }
-
-  # ── start ───────────────────────────────────────────────────────────────────
+  # ── start ────────────────────────────────────────────────────────────────────
   "start" {
     Write-Header "Démarrage de Khidmeti"
+    Write-Host "  Modèle IA : $OllamaModel" -ForegroundColor Yellow
+    Write-Host ""
 
-    # Créer les répertoires
     @("logs","backups\mongodb","data\mongodb","data\redis","data\qdrant","data\minio") |
       ForEach-Object {
         if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
       }
 
-    # Vérifier .env
     if (-not (Test-Path ".env")) {
       if (Test-Path ".env.example") {
         Copy-Item ".env.example" ".env"
@@ -263,50 +261,50 @@ switch ($Command.ToLower()) {
       }
     }
 
-    # Build Ollama automatique si l'image est absente
-    if (-not (Test-DockerImage $OllamaImage)) {
-      Write-Host ""
-      Write-Host "  ℹ️  Image Ollama absente ($OllamaImage)" -ForegroundColor Yellow
-      Write-Host "  → Build automatique (~15 min, une seule fois sur cette machine)..." -ForegroundColor Yellow
-      Write-Host ""
-      Invoke-OllamaBuild $false
-    } else {
-      Write-Host ""
-      Write-Ok "Image Ollama présente ($OllamaImage)"
-      Write-Host ""
-    }
-
-    # Démarrer tous les services
+    Write-Host "  🚀 Démarrage des services..." -ForegroundColor White
     docker compose up -d
     Write-Host ""
     Write-Ok "Services démarrés."
     Write-Host ""
-    Start-Sleep -Seconds 8
+
+    Wait-Ollama
+    Write-Host ""
+
+    if (Test-ModelPresent $OllamaModel) {
+      Write-Ok "Modèle $OllamaModel déjà présent — démarrage instantané."
+      Write-Host ""
+    } else {
+      Write-Warn "Modèle absent du volume — téléchargement en cours..."
+      Invoke-OllamaPull $OllamaModel
+    }
+
     & $PSCommandPath health
     & $PSCommandPath dns
   }
 
-  # ── start-gpu ───────────────────────────────────────────────────────────────
+  # ── start-gpu ────────────────────────────────────────────────────────────────
   "start-gpu" {
     Write-Header "Démarrage Khidmeti — GPU NVIDIA"
     Write-Host "  Modèle : $OllamaModel" -ForegroundColor Yellow
     Write-Host ""
-
-    if (-not (Test-DockerImage $OllamaImage)) {
-      Write-Host "  ℹ️  Image absente — build automatique..." -ForegroundColor Yellow
-      Invoke-OllamaBuild $false
-    }
-
     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
     Write-Host ""
-    Start-Sleep -Seconds 8
+    Wait-Ollama
+    if (-not (Test-ModelPresent $OllamaModel)) {
+      Invoke-OllamaPull $OllamaModel
+    } else {
+      Write-Ok "Modèle $OllamaModel déjà présent."
+    }
     & $PSCommandPath health
   }
 
-  # ── stop ────────────────────────────────────────────────────────────────────
+  # ── stop ─────────────────────────────────────────────────────────────────────
   "stop" {
     docker compose down
+    Write-Host ""
     Write-Ok "Services arrêtés."
+    Write-Info "Le modèle Ollama est conservé dans le volume khidmeti-ollama-data."
+    Write-Host ""
   }
 
   "restart" {
@@ -315,7 +313,7 @@ switch ($Command.ToLower()) {
     & $PSCommandPath start
   }
 
-  # ── build ───────────────────────────────────────────────────────────────────
+  # ── build ────────────────────────────────────────────────────────────────────
   "build" {
     docker compose build --no-cache api
     Write-Ok "Build NestJS terminé."
@@ -326,7 +324,7 @@ switch ($Command.ToLower()) {
     & $PSCommandPath start
   }
 
-  # ── logs ────────────────────────────────────────────────────────────────────
+  # ── logs ─────────────────────────────────────────────────────────────────────
   "logs"         { docker compose logs --tail=100 -f }
   "logs-api"     { docker compose logs -f api }
   "logs-mongo"   { docker compose logs -f mongo }
@@ -334,36 +332,32 @@ switch ($Command.ToLower()) {
   "logs-ollama"  { docker compose logs -f ollama }
   "logs-whisper" { docker compose logs -f whisper }
 
-  # ── health ──────────────────────────────────────────────────────────────────
+  # ── health ───────────────────────────────────────────────────────────────────
   "health" {
     Write-Header "État des services"
-    Test-Endpoint "NestJS API  (3000)" "http://localhost:3000/health"
-    Test-Endpoint "nginx       (80)  " "http://localhost/health"
-    Test-Endpoint "Qdrant      (6333)" "http://localhost:6333/healthz"
-    Test-Endpoint "MinIO       (9001)" "http://localhost:9001/minio/health/live"
+    Test-Endpoint "NestJS API  (3000) " "http://localhost:3000/health"
+    Test-Endpoint "nginx       (80)   " "http://localhost/health"
+    Test-Endpoint "Qdrant      (6333) " "http://localhost:6333/healthz"
+    Test-Endpoint "MinIO       (9001) " "http://localhost:9001/minio/health/live"
     Test-Endpoint "Ollama      (11434)" "http://localhost:11434/"
-    Test-Endpoint "Whisper     (8000)" "http://localhost:8000/health"
+    Test-Endpoint "Whisper     (8000) " "http://localhost:8000/health"
     Write-Host ""
   }
 
-  # ── ai-status ───────────────────────────────────────────────────────────────
+  # ── ai-status ────────────────────────────────────────────────────────────────
   "ai-status" {
     Write-Header "Statut IA locale"
     Test-Endpoint "Ollama  (11434)" "http://localhost:11434/"
     Test-Endpoint "Whisper (8000) " "http://localhost:8000/health"
     Write-Host ""
-    Write-Host "  Image Docker :" -ForegroundColor Gray
-    if (Test-DockerImage $OllamaImage) {
-      $size = docker image inspect $OllamaImage --format '{{.Size}}' 2>$null
-      if ($size) {
-        $sizeGB = [math]::Round([long]$size / 1073741824, 1)
-        Write-Ok "$OllamaImage ($sizeGB GB)"
-      } else {
-        Write-Ok $OllamaImage
-      }
-    } else {
-      Write-Err "$OllamaImage absente → sera buildée au prochain : .\khidmeti.ps1 start"
+    Write-Host "  Modèles installés :" -ForegroundColor Gray
+    docker exec khidmeti-ollama ollama list 2>$null | ForEach-Object {
+      Write-Host "   $_" -ForegroundColor Green
     }
+    Write-Host ""
+    Write-Host "  Volume :" -ForegroundColor Gray
+    docker volume inspect khidmeti-ollama-data `
+      --format "   Chemin : {{.Mountpoint}}" 2>$null
     Write-Host ""
   }
 
@@ -372,7 +366,7 @@ switch ($Command.ToLower()) {
       --format "table {{.Names}}`t{{.Status}}`t{{.Ports}}"
   }
 
-  # ── dns ─────────────────────────────────────────────────────────────────────
+  # ── dns ──────────────────────────────────────────────────────────────────────
   "dns" {
     Write-Header "URLs des services"
     Write-Host "  API REST       :  http://localhost:3000"           -ForegroundColor White
@@ -397,11 +391,10 @@ switch ($Command.ToLower()) {
     Write-Host ""
   }
 
-  # ── tunnel ──────────────────────────────────────────────────────────────────
+  # ── tunnel ───────────────────────────────────────────────────────────────────
   "tunnel" {
-    Write-Header "Cloudflare Quick Tunnel (URL aléatoire)"
+    Write-Header "Cloudflare Quick Tunnel"
     Write-Host "  Ctrl+C pour arrêter. URL permanente : .\khidmeti.ps1 ngrok" -ForegroundColor Gray
-    Write-Host ""
     if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
       Write-Err "cloudflared introuvable. https://github.com/cloudflare/cloudflared/releases/latest"
       exit 1
@@ -409,7 +402,7 @@ switch ($Command.ToLower()) {
     cloudflared tunnel --url http://localhost:80
   }
 
-  # ── ngrok-install ────────────────────────────────────────────────────────────
+  # ── ngrok-install ─────────────────────────────────────────────────────────────
   "ngrok-install" {
     Write-Header "Installation de ngrok (Windows)"
     if (Get-Command ngrok -ErrorAction SilentlyContinue) {
@@ -424,7 +417,6 @@ switch ($Command.ToLower()) {
         Expand-Archive -Path $zipPath -DestinationPath $destPath -Force
         Remove-Item $zipPath -ErrorAction SilentlyContinue
         Write-Ok "ngrok extrait dans $destPath"
-        Write-Host ""
         Write-Warn "Ajoutez $destPath à votre PATH :"
         Write-Host '  [System.Environment]::SetEnvironmentVariable("PATH", $env:PATH+";C:\ngrok", "Machine")' -ForegroundColor Cyan
       } catch {
@@ -433,48 +425,38 @@ switch ($Command.ToLower()) {
       }
     }
     Write-Host ""
-    Write-Info "Étapes suivantes :"
-    Write-Info "  1. Compte gratuit : https://dashboard.ngrok.com/signup"
-    Write-Info "  2. Token  : https://dashboard.ngrok.com/get-started/your-authtoken"
-    Write-Info "  3. Domaine : https://dashboard.ngrok.com/domains"
-    Write-Info "  4. .\khidmeti.ps1 ngrok"
+    Write-Info "Étapes : 1. https://dashboard.ngrok.com/signup"
+    Write-Info "         2. https://dashboard.ngrok.com/get-started/your-authtoken"
+    Write-Info "         3. https://dashboard.ngrok.com/domains"
+    Write-Info "         4. .\khidmeti.ps1 ngrok"
     Write-Host ""
   }
 
   # ── ngrok ────────────────────────────────────────────────────────────────────
   "ngrok" {
     Write-Header "Tunnel ngrok — Domaine statique permanent"
-    Write-Host ""
-
     if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
       Write-Err "ngrok introuvable. Lancez : .\khidmeti.ps1 ngrok-install"
       exit 1
     }
-
     $ngrokToken = Get-EnvValue "NGROK_AUTH_TOKEN"
     if ($ngrokToken -eq "") {
-      Write-Host "  Étape 1/2 — Auth Token" -ForegroundColor Cyan
       Write-Host "  https://dashboard.ngrok.com/get-started/your-authtoken" -ForegroundColor Gray
-      Write-Host ""
-      $ngrokToken = Read-Host "  Collez votre Auth Token"
+      $ngrokToken = Read-Host "  Auth Token"
       Set-EnvValue "NGROK_AUTH_TOKEN" $ngrokToken
       Write-Ok "Token sauvegardé dans .env"
-      Write-Host ""
     }
     ngrok config add-authtoken $ngrokToken 2>$null | Out-Null
 
     $ngrokDomain = Get-EnvValue "NGROK_DOMAIN"
     if ($ngrokDomain -eq "") {
-      Write-Host "  Étape 2/2 — Domaine statique" -ForegroundColor Cyan
       Write-Host "  https://dashboard.ngrok.com/domains" -ForegroundColor Gray
-      Write-Host ""
-      $ngrokDomain = Read-Host "  Entrez votre domaine statique"
+      $ngrokDomain = Read-Host "  Domaine statique"
       Set-EnvValue "NGROK_DOMAIN" $ngrokDomain
       Write-Ok "Domaine sauvegardé dans .env"
-      Write-Host ""
     }
-
-    Write-Host "  URL permanente : https://$ngrokDomain" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  URL : https://$ngrokDomain" -ForegroundColor Green
     Write-Host "  flutter run --dart-define=API_BASE_URL=https://$ngrokDomain" -ForegroundColor Cyan
     Write-Host "  → Ctrl+C pour arrêter" -ForegroundColor Gray
     Write-Host ""
@@ -484,17 +466,16 @@ switch ($Command.ToLower()) {
   "ngrok-reset" {
     Remove-EnvValue "NGROK_AUTH_TOKEN"
     Remove-EnvValue "NGROK_DOMAIN"
-    Write-Ok "Config ngrok supprimée — relancez : .\khidmeti.ps1 ngrok"
+    Write-Ok "Config ngrok supprimée."
   }
 
   "flutter-run" {
     Write-Host ""
     Write-Host "  flutter run --dart-define=API_BASE_URL=http://$($LOCAL_IP):80" -ForegroundColor Cyan
-    Write-Host ""
     flutter run "--dart-define=API_BASE_URL=http://$($LOCAL_IP):80"
   }
 
-  # ── shells ──────────────────────────────────────────────────────────────────
+  # ── shells ───────────────────────────────────────────────────────────────────
   "shell-api"   { docker exec -it khidmeti-api /bin/sh }
 
   "shell-mongo" {
@@ -508,16 +489,13 @@ switch ($Command.ToLower()) {
     docker exec -it khidmeti-redis redis-cli -a $pass
   }
 
-  # ── tests ───────────────────────────────────────────────────────────────────
+  # ── tests ────────────────────────────────────────────────────────────────────
   "test-api" {
     Write-Header "Tests API"
-    Write-Host "  [1] Health :"
-    try { (Invoke-WebRequest -Uri "http://localhost:3000/health" -UseBasicParsing).Content }
+    try { Write-Host "  Health : $((Invoke-WebRequest -Uri 'http://localhost:3000/health' -UseBasicParsing).Content)" }
     catch { Write-Err "HORS LIGNE" }
-    Write-Host ""
-    Write-Host "  [2] Swagger :"
-    try { Write-Ok "HTTP $((Invoke-WebRequest -Uri 'http://localhost:3000/api/docs' -UseBasicParsing).StatusCode)" }
-    catch { Write-Err "HORS LIGNE" }
+    try { Write-Ok "Swagger : HTTP $((Invoke-WebRequest -Uri 'http://localhost:3000/api/docs' -UseBasicParsing).StatusCode)" }
+    catch { Write-Err "Swagger HORS LIGNE" }
     Write-Host ""
   }
 
@@ -529,25 +507,21 @@ switch ($Command.ToLower()) {
         @{ role="system"; content='Réponds UNIQUEMENT en JSON: {"profession":null,"is_urgent":false,"problem_description":"","confidence":0}' },
         @{ role="user";   content="عندي ماء ساقط من السقف" }
       )
-      options    = @{ num_ctx=2048; think=$false }
+      options     = @{ num_ctx=2048; think=$false }
       temperature = 0.05
       max_tokens  = 200
       stream      = $false
     } | ConvertTo-Json -Depth 5
-
     try {
       $resp = Invoke-RestMethod -Uri "http://localhost:11434/v1/chat/completions" `
         -Method Post -Body $body -ContentType "application/json" -TimeoutSec 60
       Write-Host ($resp | ConvertTo-Json -Depth 5) -ForegroundColor Green
-    } catch {
-      Write-Err "Ollama non disponible : $_"
-    }
+    } catch { Write-Err "Ollama non disponible : $_" }
     Write-Host ""
   }
 
-  # ── scripts ─────────────────────────────────────────────────────────────────
+  # ── scripts ──────────────────────────────────────────────────────────────────
   "scripts" {
-    Write-Header "Scripts : migrations + seeds"
     & $PSCommandPath scripts-migrations
     & $PSCommandPath scripts-seeds
   }
@@ -555,14 +529,12 @@ switch ($Command.ToLower()) {
   "scripts-migrations" {
     Write-Header "Migrations MongoDB"
     $files = Get-ChildItem "scripts\migrations\*.js" -ErrorAction SilentlyContinue
-    if (-not $files) { Write-Info "Aucune migration trouvée."; Write-Host ""; return }
+    if (-not $files) { Write-Info "Aucune migration trouvée."; return }
     $ok = 0; $failed = 0
     foreach ($f in $files) {
-      $success = Invoke-Migration $f.FullName
-      if ($success) { Write-Ok "$($f.Name) OK"; $ok++ }
-      else           { Write-Err "$($f.Name) ECHEC"; $failed++ }
+      if (Invoke-Migration $f.FullName) { Write-Ok "$($f.Name) OK"; $ok++ }
+      else { Write-Err "$($f.Name) ECHEC"; $failed++ }
     }
-    Write-Host ""
     Write-Info "Résultat : $ok OK  |  $failed échec(s)"
     Write-Host ""
     if ($failed -gt 0) { exit 1 }
@@ -571,37 +543,34 @@ switch ($Command.ToLower()) {
   "scripts-seeds" {
     Write-Header "Seeds TypeScript"
     $files = Get-ChildItem "apps\api\src\scripts\seeds\*.ts" -ErrorAction SilentlyContinue
-    if (-not $files) { Write-Info "Aucun seed trouvé."; Write-Host ""; return }
+    if (-not $files) { Write-Info "Aucun seed trouvé."; return }
     $ok = 0; $failed = 0
     foreach ($f in $files) {
-      $success = Invoke-Seed $f.FullName $ScriptArgs
-      if ($success) { Write-Ok "$($f.Name) OK"; $ok++ }
-      else           { Write-Err "$($f.Name) ECHEC"; $failed++ }
+      if (Invoke-Seed $f.FullName $ScriptArgs) { Write-Ok "$($f.Name) OK"; $ok++ }
+      else { Write-Err "$($f.Name) ECHEC"; $failed++ }
     }
-    Write-Host ""
     Write-Info "Résultat : $ok OK  |  $failed échec(s)"
     Write-Host ""
     if ($failed -gt 0) { exit 1 }
   }
 
-  # ── clean ───────────────────────────────────────────────────────────────────
+  # ── clean ────────────────────────────────────────────────────────────────────
   "clean" {
     Write-Host ""
-    Write-Warn "Supprime : MongoDB, Redis, Qdrant, MinIO."
-    Write-Host "  L'image Ollama+modèle est CONSERVÉE dans le cache Docker." -ForegroundColor Green
+    Write-Warn "Supprime TOUS les volumes : MongoDB, Redis, Qdrant, MinIO, Ollama."
+    Write-Host "  Le modèle sera re-téléchargé au prochain : .\khidmeti.ps1 start" -ForegroundColor Gray
     $confirm = Read-Host "  Taper YES pour confirmer"
     if ($confirm -eq "YES") {
       docker compose down -v --remove-orphans
       @("data\mongodb","data\redis","data\qdrant","data\minio") |
         Where-Object { Test-Path $_ } |
         ForEach-Object { Remove-Item -Recurse -Force $_ }
-      Write-Ok "Nettoyage terminé. Image Ollama intacte."
+      Write-Ok "Nettoyage terminé."
     } else {
       Write-Info "Annulé."
     }
   }
 
-  # ── défaut ──────────────────────────────────────────────────────────────────
   default {
     Write-Err "Commande inconnue : $Command"
     Write-Info "Utilisation : .\khidmeti.ps1 help"
