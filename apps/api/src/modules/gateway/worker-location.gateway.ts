@@ -1,6 +1,6 @@
 // apps/api/src/modules/gateway/worker-location.gateway.ts
 //
-// FIX: Repeated "Worker not found" errors in logs
+// FIX 1 — Repeated "Worker not found" errors in logs
 //
 // ROOT CAUSE:
 //   On every WebSocket connection to /workers namespace, handleConnection()
@@ -8,15 +8,30 @@
 //   When a CLIENT connects to this namespace (which happens because Flutter
 //   uses the same socket URL for location updates), the query returns null,
 //   socket.data.isWorker = false, and "Worker not found" is logged as WARNING.
-//   This is NOT an error — it's expected behavior — but the repeated logs
+//   This is NOT an error — it's expected behaviour — but the repeated logs
 //   create noise that hides real errors.
 //
-// FIX:
-//   1. Cache the worker lookup result per UID in a WeakMap to avoid repeated
+// FIX 1:
+//   1. Cache the worker lookup result per UID in a Map to avoid repeated
 //      DB queries when the same worker reconnects.
 //   2. Downgrade "non-worker connected" from WARN to DEBUG.
-//   3. Add connection debouncing: if the same UID reconnects within 2s
-//      (e.g. React Native reconnect loop), skip the DB lookup and reuse cached result.
+//
+// FIX 2 — Map shows no workers despite seeded data
+//
+// ROOT CAUSE:
+//   subscribe:wilaya only called socket.join(room) — no initial state was
+//   emitted. Seeded workers have fake UIDs and never connect via WebSocket,
+//   so they never emit worker:location events. Flutter received zero events
+//   after subscribing and the map stayed empty even though MongoDB had 10
+//   online workers.
+//
+// FIX 2 — workers:snapshot on subscribe:wilaya:
+//   After joining the room, query MongoDB for current online workers in
+//   that wilaya and emit a `workers:snapshot` event directly to the
+//   subscribing socket. Flutter handles `workers:snapshot` to populate
+//   the initial map markers, then `worker:location` / `worker:status` for
+//   live diffs. Non-fatal: snapshot errors are logged at WARN level and
+//   do not disconnect the socket.
 
 import {
   WebSocketGateway,
@@ -43,7 +58,6 @@ interface StatusPayload   { isOnline: boolean; }
 
 // ── Worker profile cache ───────────────────────────────────────────────────────
 // Avoids one MongoDB query per reconnection. TTL: 5 minutes.
-// Structure: uid → { isWorker, wilayaCode, profession, cachedAt }
 
 interface CachedWorkerProfile {
   isWorker:   boolean;
@@ -63,7 +77,6 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
   @WebSocketServer() private readonly server!: Server;
   private readonly logger = new Logger(WorkerLocationGateway.name);
 
-  // Per-uid profile cache — avoids DB query on every reconnect
   private readonly profileCache = new Map<string, CachedWorkerProfile>();
 
   constructor(
@@ -89,7 +102,6 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
       const uid     = decoded.uid;
       socket.data.uid = uid;
 
-      // FIX: Check cache before hitting MongoDB
       const profile = await this.getWorkerProfile(uid);
 
       socket.data.isWorker   = profile.isWorker;
@@ -102,7 +114,7 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
         }
         this.logger.log(`[WS workers] Worker ${uid} connected (${socket.id})`);
       } else {
-        // FIX: Downgraded from WARN to DEBUG — clients connecting to /workers
+        // FIX 1: Downgraded from WARN to DEBUG — clients connecting to /workers
         // is expected behaviour (they subscribe to worker locations on the map).
         this.logger.debug(`[WS workers] Viewer ${uid} connected (${socket.id})`);
       }
@@ -139,10 +151,6 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
       )
       .exec()
       .catch((e: unknown) => this.logger.error('Location persist failed', e));
-
-    // Invalidate cache entry when location changes (wilayaCode may change)
-    // — actually wilayaCode only changes on cell reassignment, not on location ping.
-    // No need to bust cache here.
 
     const event = { workerId, lat, lng, ts: Date.now() };
     if (socket.data.wilayaCode) {
@@ -185,13 +193,73 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
 
   // ── Client → Server: room subscriptions ────────────────────────────────────
 
+  /**
+   * Subscribe to online workers in a wilaya.
+   *
+   * FIX 2 — workers:snapshot:
+   *   After joining the room, emit the current snapshot of online workers
+   *   directly to the subscribing socket so the Flutter map can populate
+   *   initial markers without waiting for live events.
+   *
+   *   Event shape: {
+   *     wilayaCode: number,
+   *     workers: Array<{
+   *       workerId: string, lat: number, lng: number,
+   *       profession: string|null, averageRating: number,
+   *       isOnline: true, ts: number
+   *     }>
+   *   }
+   *
+   *   Non-fatal: snapshot errors are caught and logged — they never
+   *   disconnect the socket or block the room join.
+   */
   @SubscribeMessage('subscribe:wilaya')
   async handleSubscribeWilaya(
     @ConnectedSocket() socket: AuthenticatedSocket,
     @MessageBody() payload: { wilayaCode: number },
   ): Promise<void> {
     if (!payload?.wilayaCode || typeof payload.wilayaCode !== 'number') return;
+
     await socket.join(`wilaya:${payload.wilayaCode}`);
+
+    // ── FIX 2: emit current snapshot to the subscribing socket ──────────────
+    try {
+      const workers = await this.userModel
+        .find({
+          role:      UserRole.Worker,
+          isOnline:  true,
+          wilayaCode: payload.wilayaCode,
+          latitude:  { $ne: null },
+          longitude: { $ne: null },
+        })
+        .select('_id latitude longitude profession averageRating wilayaCode isOnline')
+        .lean()
+        .exec();
+
+      socket.emit('workers:snapshot', {
+        wilayaCode: payload.wilayaCode,
+        workers: workers.map((w: any) => ({
+          workerId:      String(w._id),
+          lat:           w.latitude  as number,
+          lng:           w.longitude as number,
+          profession:    (w.profession as string | null) ?? null,
+          averageRating: (w.averageRating as number) ?? 0,
+          isOnline:      true,
+          ts:            Date.now(),
+        })),
+      });
+
+      this.logger.debug(
+        `[WS workers] snapshot → socket ${socket.id} ` +
+        `wilaya=${payload.wilayaCode} count=${workers.length}`,
+      );
+    } catch (err) {
+      // Non-fatal — the client is still in the room and will receive live events.
+      this.logger.warn(
+        `[WS workers] snapshot failed for wilaya=${payload.wilayaCode}: ` +
+        `${(err as Error).message}`,
+      );
+    }
   }
 
   @SubscribeMessage('subscribe:worker')
@@ -219,10 +287,6 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
 
   // ── Profile cache ────────────────────────────────────────────────────────────
 
-  /**
-   * Returns cached worker profile or fetches from MongoDB.
-   * Avoids one DB round-trip per WebSocket reconnect (common on mobile).
-   */
   private async getWorkerProfile(uid: string): Promise<CachedWorkerProfile> {
     const cached = this.profileCache.get(uid);
     if (cached && Date.now() - cached.cachedAt < PROFILE_CACHE_TTL_MS) {
@@ -242,11 +306,13 @@ export class WorkerLocationGateway implements OnGatewayConnection, OnGatewayDisc
       cachedAt:   Date.now(),
     };
 
-    // Only cache positive results for full TTL.
-    // Cache negative results (non-workers) for 30s to reduce spam on
-    // reconnecting clients, but allow role upgrade to propagate quickly.
+    // Cache negative results for 30s — prevents repeated DB spam on reconnecting
+    // clients while still allowing role upgrades to propagate quickly.
     if (!user) {
-      this.profileCache.set(uid, { ...profile, cachedAt: Date.now() - PROFILE_CACHE_TTL_MS + 30_000 });
+      this.profileCache.set(uid, {
+        ...profile,
+        cachedAt: Date.now() - PROFILE_CACHE_TTL_MS + 30_000,
+      });
     } else {
       this.profileCache.set(uid, profile);
     }
