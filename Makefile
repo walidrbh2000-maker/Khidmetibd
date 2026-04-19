@@ -2,8 +2,9 @@
 ## KHIDMETI BACKEND — Makefile
 ##
 ## WORKFLOW :
-##   make start  → 1ère fois : build Ollama auto (~15 min) + démarrage
-##   make start  → fois suivantes : démarrage en quelques secondes
+##   make start       → 1ère fois : démarre tout + pull modèle avec progression
+##   make start       → fois suivantes : démarrage instantané (modèle en volume)
+##   make ollama-pull → forcer re-pull (changer de modèle)
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -36,11 +37,8 @@ HOST     := $(shell hostname)
 DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
-# ── Dérivé depuis .env ────────────────────────────────────────────────────────
 _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
   | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b')
-_OLLAMA_TAG   := $(shell echo "$(_OLLAMA_MODEL)" | tr ':' '-')
-_OLLAMA_IMAGE := khidmeti-ollama:$(_OLLAMA_TAG)
 
 .DEFAULT_GOAL := help
 
@@ -49,6 +47,7 @@ _OLLAMA_IMAGE := khidmeti-ollama:$(_OLLAMA_TAG)
         logs-qdrant logs-minio logs-nginx logs-mongo-ui \
         logs-ollama logs-whisper \
         health status ai-status dns \
+        ollama-pull \
         minio-buckets minio-console minio-list \
         test-api test-ai firewall backup restore \
         shell-api shell-mongo shell-redis shell-minio shell-qdrant \
@@ -56,8 +55,7 @@ _OLLAMA_IMAGE := khidmeti-ollama:$(_OLLAMA_TAG)
         prod-start prod-update \
         tunnel-install tunnel-quick tunnel-stop tunnel-status \
         flutter-run ngrok ngrok-install ngrok-reset \
-        scripts scripts-migrations scripts-seeds \
-        ollama-build ollama-rebuild
+        scripts scripts-migrations scripts-seeds
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## AIDE
@@ -71,14 +69,13 @@ help: ## Afficher l'aide
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo "  [DÉMARRAGE]"
-	@echo "  start              Tout démarrer (build Ollama auto si besoin)"
+	@echo "  start              Démarrer + pull modèle si absent (progression visible)"
 	@echo "  start-gpu          Démarrer avec GPU NVIDIA"
-	@echo "  stop               Arrêter tous les services"
+	@echo "  stop               Arrêter (volumes conservés)"
 	@echo "  restart            Redémarrer"
 	@echo ""
-	@echo "  [IMAGE OLLAMA]"
-	@echo "  ollama-build       Builder l'image Ollama+modèle (manuel)"
-	@echo "  ollama-rebuild     Forcer rebuild sans cache (nouveau modèle)"
+	@echo "  [OLLAMA]"
+	@echo "  ollama-pull        Pull / mise à jour du modèle (progression visible)"
 	@echo ""
 	@echo "  [BUILD API]"
 	@echo "  build              Builder l'image NestJS"
@@ -92,13 +89,13 @@ help: ## Afficher l'aide
 	@echo "  logs-mongo         Logs MongoDB"
 	@echo ""
 	@echo "  [DIAGNOSTIC]"
-	@echo "  health             Vérifier la santé de tous les services"
-	@echo "  ai-status          Statut IA + taille image Ollama"
+	@echo "  health             Santé de tous les services"
+	@echo "  ai-status          Statut IA + modèles chargés"
 	@echo "  status             Statut + mémoire des conteneurs"
 	@echo "  dns                URLs + config Flutter"
 	@echo ""
 	@echo "  [TUNNEL]"
-	@echo "  ngrok              Tunnel ngrok domaine PERMANENT (recommandé)"
+	@echo "  ngrok              Tunnel ngrok domaine PERMANENT"
 	@echo "  tunnel-quick       Quick Tunnel Cloudflare (URL aléatoire)"
 	@echo ""
 	@echo "  [SCRIPTS]"
@@ -116,47 +113,43 @@ help: ## Afficher l'aide
 	@echo "  shell-mongo        mongosh"
 	@echo ""
 	@echo "  [NETTOYAGE]"
-	@echo "  clean              Supprimer volumes + données (image Ollama conservée)"
+	@echo "  clean              Supprimer volumes + données"
+	@echo "  clean-logs         Vider les logs"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## IMAGE OLLAMA
+## OLLAMA — Pull avec progression visible
 ## ══════════════════════════════════════════════════════════════════════════════
 
-ollama-build: ## Builder l'image Ollama avec modèle intégré (~15 min, une seule fois)
+ollama-pull: ## Pull du modèle avec progression en temps réel (X GB / Y GB)
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Build image Ollama + modèle intégré"
-	@echo "  Modèle  : $(_OLLAMA_MODEL)"
-	@echo "  Image   : $(_OLLAMA_IMAGE)"
-	@echo "  Durée   : ~15 min (une seule fois par machine)"
-	@echo "══════════════════════════════════════════════"
-	@echo ""
-	@docker compose build ollama
-	@echo ""
-	@echo "  ✅ $(_OLLAMA_IMAGE) prête — lancez : make start"
-	@echo ""
-
-ollama-rebuild: ## Forcer rebuild sans cache (changer de modèle)
-	@echo ""
-	@echo "══════════════════════════════════════════════"
-	@echo "  Rebuild Ollama sans cache"
+	@echo "  Pull modèle Ollama"
 	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@docker compose build --no-cache ollama
+	@echo "  ⏳ Attente que Ollama soit prêt..."
+	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do \
+	  printf "."; sleep 2; \
+	done
 	@echo ""
-	@echo "  ✅ $(_OLLAMA_IMAGE) reconstruite — lancez : make start"
+	@echo "  📥 Téléchargement en cours — progression ci-dessous :"
+	@echo "  (ex: pulling abc123... ████░░░░ 2.1 GB / 7.2 GB  28 MB/s  3m12s)"
+	@echo ""
+	@docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL)
+	@echo ""
+	@echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## GESTION DES SERVICES
 ## ══════════════════════════════════════════════════════════════════════════════
 
-start: ## Tout démarrer — build Ollama automatique si l'image est absente
+start: ## Démarrer tous les services + pull modèle Ollama si absent
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Démarrage de Khidmeti"
+	@echo "  Modèle IA : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@mkdir -p logs backups/mongodb data/mongodb data/redis data/qdrant data/minio
@@ -164,19 +157,29 @@ start: ## Tout démarrer — build Ollama automatique si l'image est absente
 		cp .env.example .env 2>/dev/null || true; \
 		echo "  ⚠️  .env créé — configurez FIREBASE_* avant de continuer"; echo ""; \
 	fi
-	@if ! docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
-		echo "  ℹ️  Image Ollama absente ($(_OLLAMA_IMAGE))"; \
-		echo "  → Build automatique (~15 min, une seule fois sur cette machine)..."; \
-		echo ""; \
-		$(MAKE) ollama-build; \
-	else \
-		echo "  ✅ Image Ollama présente ($(_OLLAMA_IMAGE))"; echo ""; \
-	fi
+	@echo "  🚀 Démarrage des services..."
 	@docker compose up -d
 	@echo ""
 	@echo "  ✅ Services démarrés."
 	@echo ""
-	@sleep 8
+	@echo "  ⏳ Attente que Ollama soit prêt..."
+	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do \
+	  printf "."; sleep 2; \
+	done
+	@echo ""
+	@echo ""
+	@if docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(_OLLAMA_MODEL)"; then \
+	  echo "  ✅ Modèle $(_OLLAMA_MODEL) déjà présent — démarrage instantané."; \
+	  echo ""; \
+	else \
+	  echo "  ℹ️  Modèle absent du volume — téléchargement en cours..."; \
+	  echo "  📥 Progression (X GB / Y GB) :"; \
+	  echo ""; \
+	  docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
+	  echo ""; \
+	  echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."; \
+	  echo ""; \
+	fi
 	@$(MAKE) health
 	@$(MAKE) dns
 
@@ -187,18 +190,23 @@ start-gpu: ## Démarrer avec GPU NVIDIA
 	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@if ! docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
-		echo "  ℹ️  Image Ollama absente — build automatique..."; \
-		$(MAKE) ollama-build; \
-	fi
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 	@echo ""
-	@sleep 8
+	@echo "  ⏳ Attente Ollama..."
+	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do printf "."; sleep 2; done
+	@echo ""
+	@if ! docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(_OLLAMA_MODEL)"; then \
+	  echo "  📥 Pull modèle GPU..."; \
+	  docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
+	fi
 	@$(MAKE) health
 
-stop: ## Arrêter tous les services
+stop: ## Arrêter tous les services (volumes conservés — modèle intact)
 	@docker compose down
-	@echo "✅ Services arrêtés."
+	@echo ""
+	@echo "  ✅ Services arrêtés."
+	@echo "  ℹ️  Le modèle Ollama est conservé dans le volume khidmeti-ollama-data."
+	@echo ""
 
 stop-gpu: ## Arrêter les services GPU
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml down
@@ -218,16 +226,16 @@ rebuild: build start ## Rebuild NestJS + redémarrage
 ## LOGS
 ## ══════════════════════════════════════════════════════════════════════════════
 
-logs:         @docker compose logs --tail=100 -f
-logs-api:     @docker compose logs -f api
-logs-mongo:   @docker compose logs -f mongo
-logs-mongo-ui:@docker compose logs -f mongo-express
-logs-redis:   @docker compose logs -f redis
-logs-qdrant:  @docker compose logs -f qdrant
-logs-minio:   @docker compose logs -f minio
-logs-nginx:   @docker compose logs -f nginx
-logs-ollama:  @docker compose logs -f ollama
-logs-whisper: @docker compose logs -f whisper
+logs:          @docker compose logs --tail=100 -f
+logs-api:      @docker compose logs -f api
+logs-mongo:    @docker compose logs -f mongo
+logs-mongo-ui: @docker compose logs -f mongo-express
+logs-redis:    @docker compose logs -f redis
+logs-qdrant:   @docker compose logs -f qdrant
+logs-minio:    @docker compose logs -f minio
+logs-nginx:    @docker compose logs -f nginx
+logs-ollama:   @docker compose logs -f ollama
+logs-whisper:  @docker compose logs -f whisper
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## DIAGNOSTIC
@@ -278,7 +286,7 @@ status: ## Statut + consommation mémoire des conteneurs
 	  | grep khidmeti | sort || true
 	@echo ""
 
-ai-status: ## Statut IA + taille image Ollama
+ai-status: ## Statut IA + modèles disponibles dans Ollama
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Statut IA locale"
@@ -291,22 +299,12 @@ ai-status: ## Statut IA + taille image Ollama
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
 	@echo ""
-	@echo "  Image Docker :"
-	@if docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
-	  SIZE=$$(docker image inspect "$(_OLLAMA_IMAGE)" --format '{{.Size}}' \
-	    | awk '{printf "%.1f GB", $$1/1073741824}'); \
-	  echo "   ✅ $(_OLLAMA_IMAGE) ($$SIZE)"; \
-	else \
-	  echo "   ❌ $(_OLLAMA_IMAGE) absente → sera buildée au prochain : make start"; \
-	fi
+	@echo "  Modèles installés (docker exec ollama list) :"
+	@docker exec khidmeti-ollama ollama list 2>/dev/null || echo "   (Ollama non démarré)"
 	@echo ""
-	@echo "  Modèles chargés dans Ollama :"
-	@curl -s http://localhost:11434/api/tags 2>/dev/null \
-	  | python3 -c "import sys,json; d=json.load(sys.stdin); \
-	    models=d.get('models',[]); \
-	    [print('   ✅ '+m['name']) for m in models] if models \
-	    else print('   (aucun modèle chargé)')" 2>/dev/null \
-	  || echo "   (Ollama non démarré)"
+	@echo "  Volume :"
+	@docker volume inspect khidmeti-ollama-data \
+	  --format "   Chemin : {{.Mountpoint}}" 2>/dev/null || echo "   (volume absent)"
 	@echo ""
 
 dns: ## Afficher les URLs + config Flutter
@@ -632,10 +630,10 @@ clean-logs: ## Vider les logs
 	@find logs/ -name "*.log" -delete 2>/dev/null || true
 	@echo "✅ Logs nettoyés."
 
-clean: ## Supprimer volumes + données (image Ollama conservée)
+clean: ## Supprimer volumes + données (y compris le modèle Ollama)
 	@echo ""
-	@echo "  ⚠️  Supprime : MongoDB, Redis, Qdrant, MinIO."
-	@echo "  L'image Ollama+modèle est conservée dans le cache Docker."
+	@echo "  ⚠️  Supprime : MongoDB, Redis, Qdrant, MinIO ET le modèle Ollama."
+	@echo "  Le modèle sera re-téléchargé au prochain : make start"
 	@echo ""
 	@read -p "  Confirmer ? [y/N] " CONFIRM; \
 	if [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ]; then \

@@ -3,40 +3,32 @@ name: khidmeti
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
-# ARCHITECTURE IA :
-#   Le modèle gemma4:e2b est intégré directement dans l'image Ollama
-#   (baked at build time). Aucun téléchargement au démarrage.
+# STRATÉGIE OLLAMA — Volume (modèle téléchargé une seule fois) :
+#   ✅ Aucun build Docker pour Ollama
+#   ✅ Modèle conservé dans le volume khidmeti-ollama-data
+#   ✅ docker compose down / up → modèle intact, démarrage instantané
+#   ✅ Progression visible en temps réel via : make start / make ollama-pull
 #
-#   Premier démarrage (nouvelle machine) :
-#     → docker compose build ollama  (build ~15 min, une seule fois)
-#     → make start                   (démarrage instantané, modèle prêt)
+# WORKFLOW :
+#   1ère fois      → make start  (pull ~7 GB avec barre de progression)
+#   Fois suivantes → make start  (modèle déjà dans le volume → secondes)
+#   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
 #
-#   Redémarrages suivants :
-#     → make start                   (zéro téléchargement, modèle dans l'image)
-#
-#   Changer de modèle :
-#     1. Modifier OLLAMA_MODEL et OLLAMA_TAG dans .env
-#        ex: OLLAMA_MODEL=gemma4:e4b → OLLAMA_TAG=gemma4-e4b
-#     2. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
-#     3. docker compose build --no-cache ollama
-#     4. make start
-#
-# ⚠️  POURQUOI OLLAMA_TAG et non OLLAMA_MODEL pour le nom de l'image ?
-#   Docker interdit ":" dans les tags d'image (format invalide).
-#   OLLAMA_MODEL=gemma4:e2b → image invalide : khidmeti-ollama:gemma4:e2b ❌
-#   OLLAMA_TAG=gemma4-e2b   → image valide   : khidmeti-ollama:gemma4-e2b ✅
-#   Les deux variables doivent rester synchronisées dans .env.
+# SUPPRIMER le modèle (rare) :
+#   docker volume rm khidmeti-ollama-data
+#   make start
 #
 # Budget mémoire 8 GB RAM :
-#   Ollama + gemma4:e2b chargé  ~3.0 GB  (permanent avec KEEP_ALIVE=-1)
-#   faster-whisper small/int8   ~0.5 GB  (permanent)
-#   MongoDB + Redis + Qdrant    ~1.0 GB
-#   MinIO + nginx + API         ~0.5 GB
-#   OS + Docker                 ~1.5 GB
-#   ──────────────────────────────────
-#   Total                       ~6.5 GB  ✅ marge confortable
+#   Ollama + gemma4:e2b  ~3.0 GB  (KEEP_ALIVE=-1 → permanent en RAM)
+#   faster-whisper       ~0.5 GB
+#   MongoDB + Redis      ~0.7 GB
+#   Qdrant + MinIO       ~0.3 GB
+#   nginx + API          ~0.5 GB
+#   OS + Docker          ~1.5 GB
+#   ─────────────────────────────
+#   Total                ~6.5 GB  ✅
 #
-# GPU (futur) :
+# GPU :
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -51,8 +43,7 @@ volumes:
   qdrant-data:  { name: khidmeti-qdrant-data  }
   minio-data:   { name: khidmeti-minio-data   }
   whisper-data: { name: khidmeti-whisper-data }
-  # NOTE : ollama-data supprimé — le modèle est dans l'image, pas dans un volume.
-  #         Monter un volume sur /root/.ollama cacherait les modèles baked.
+  ollama-data:  { name: khidmeti-ollama-data  }
 
 services:
 
@@ -82,34 +73,31 @@ services:
       - khidmeti-network
     mem_limit: 512m
 
-  # ── Ollama — LLM local avec modèle intégré ──────────────────────────────────
+  # ── Ollama — LLM local (modèle dans le volume ollama-data) ──────────────────
   #
-  #  Le modèle est baked dans l'image Docker (docker/ollama/Dockerfile).
-  #  Aucun volume ne couvre /ollama/models pour éviter de cacher les modèles.
+  #  Image officielle ollama/ollama:latest — aucun build nécessaire.
+  #  Le modèle est téléchargé via `make start` (docker exec ollama pull)
+  #  et stocké dans le volume khidmeti-ollama-data.
   #
-  #  ⚠️  OLLAMA_TAG (ex: gemma4-e2b) ≠ OLLAMA_MODEL (ex: gemma4:e2b)
-  #      Docker interdit ":" dans les tags → utiliser OLLAMA_TAG avec "-"
+  #  La progression du téléchargement s'affiche ainsi :
+  #    pulling manifest
+  #    pulling abc123... ████████░░ 4.1 GB / 7.2 GB  32 MB/s  1m58s
+  #    verifying sha256...
+  #    success
   #
-  #  Paramètres critiques pour 8 GB RAM :
-  #    OLLAMA_MODELS=/ollama/models   → chemin des modèles baked dans l'image
-  #    OLLAMA_NUM_PARALLEL=1          → 1 requête à la fois (évite OOM)
-  #    OLLAMA_MAX_LOADED_MODELS=1     → 1 modèle en RAM max
-  #    OLLAMA_KEEP_ALIVE=-1           → modèle permanent en RAM (zéro cold start)
-  #    OLLAMA_NUM_THREAD=4            → adapter selon votre CPU (nproc --all)
+  #  Paramètres RAM (8 GB) :
+  #    OLLAMA_NUM_PARALLEL=1      → 1 requête à la fois (évite OOM)
+  #    OLLAMA_MAX_LOADED_MODELS=1 → 1 modèle en RAM max
+  #    OLLAMA_KEEP_ALIVE=-1       → modèle permanent (zéro cold start)
+  #    OLLAMA_NUM_THREAD=4        → adapter au CPU (nproc --all)
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    build:
-      context:    .
-      dockerfile: Dockerfile
-      args:
-        OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
-    image: khidmeti-ollama:${OLLAMA_TAG:-gemma4-e2b}
+    image: ollama/ollama:latest
     container_name: khidmeti-ollama
     restart: unless-stopped
-    # AUCUN volume sur /ollama/models — ne pas cacher les modèles baked
-    # AUCUN volume sur /root/.ollama  — idem
+    volumes:
+      - ollama-data:/root/.ollama
     environment:
-      OLLAMA_MODELS:            /ollama/models
       OLLAMA_NUM_PARALLEL:      "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_KEEP_ALIVE:        "-1"
@@ -129,15 +117,6 @@ services:
       start_period: 15s
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
-  #
-  #  Modèle  : Systran/faster-whisper-small (multilingue ~466 MB)
-  #  Langues : Darija / Arabe / Français / Anglais — détection automatique
-  #  Device  : cpu avec int8 quantification → ~3-5s pour 10s d'audio
-  #  API     : compatible OpenAI — POST /v1/audio/transcriptions
-  #
-  #  Le modèle est téléchargé automatiquement au premier appel (~466 MB).
-  #  Storé dans whisper-data pour être conservé entre les redémarrages.
-  # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
     container_name: khidmeti-whisper
