@@ -14,9 +14,11 @@ name: khidmeti
 #   Fois suivantes → make start  (modèle déjà dans le volume → secondes)
 #   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
 #
-# SUPPRIMER le modèle (rare) :
-#   docker volume rm khidmeti-ollama-data
-#   make start
+# VERSIONS ÉPINGLÉES :
+#   Toutes les images utilisent des versions fixes (pas de :latest).
+#   Raison : un `docker compose pull` avec :latest peut casser la prod
+#   si une mise à jour incompatible est publiée.
+#   → Mettre à jour manuellement et tester avant de changer une version.
 #
 # Budget mémoire 8 GB RAM :
 #   Ollama + gemma4:e2b  ~3.0 GB  (KEEP_ALIVE=-1 → permanent en RAM)
@@ -30,6 +32,7 @@ name: khidmeti
 #
 # GPU :
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   make start-gpu
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -53,11 +56,18 @@ services:
       context:    ./apps/api
       dockerfile: Dockerfile
       target:     development
+      args:
+        # Version Node épinglée — surchargeable depuis CI :
+        # docker compose build --build-arg NODE_VERSION=22.14-alpine3.21
+        NODE_VERSION: "20.19-alpine3.21"
     container_name: khidmeti-api
-    restart:  unless-stopped
+    restart: unless-stopped
     env_file: .env
     environment:
       NODE_ENV: development
+      # V8 heap limité à 400 MB (conteneur limité à 512 MB)
+      # Évite les OOM kills silencieux lors de pics de trafic
+      NODE_OPTIONS: "--max-old-space-size=400"
     ports:
       - '3000:3000'
     volumes:
@@ -71,28 +81,34 @@ services:
       whisper: { condition: service_healthy }
     networks:
       - khidmeti-network
-    mem_limit: 512m
+    mem_limit:       512m
+    mem_reservation: 128m
+    # Limiter la taille des logs Docker (évite de remplir le disque en prod)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # ── Ollama — LLM local (modèle dans le volume ollama-data) ──────────────────
+  # ── Ollama — LLM local ──────────────────────────────────────────────────────
   #
-  #  Image officielle ollama/ollama:latest — aucun build nécessaire.
-  #  Le modèle est téléchargé via `make start` (docker exec ollama pull)
-  #  et stocké dans le volume khidmeti-ollama-data.
+  #  Image officielle épinglée — aucun build nécessaire.
+  #  Le modèle est dans le volume khidmeti-ollama-data.
+  #  Téléchargement via `make start` (progression visible dans le terminal).
   #
-  #  La progression du téléchargement s'affiche ainsi :
-  #    pulling manifest
-  #    pulling abc123... ████████░░ 4.1 GB / 7.2 GB  32 MB/s  1m58s
-  #    verifying sha256...
-  #    success
-  #
-  #  Paramètres RAM (8 GB) :
+  #  Paramètres RAM (8 GB CPU) :
   #    OLLAMA_NUM_PARALLEL=1      → 1 requête à la fois (évite OOM)
   #    OLLAMA_MAX_LOADED_MODELS=1 → 1 modèle en RAM max
   #    OLLAMA_KEEP_ALIVE=-1       → modèle permanent (zéro cold start)
-  #    OLLAMA_NUM_THREAD=4        → adapter au CPU (nproc --all)
+  #    OLLAMA_NUM_THREAD=4        → adapter à `nproc --all` de la machine
+  #
+  #  Pour mettre à jour la version :
+  #    1. Changer le tag ci-dessous
+  #    2. docker compose pull ollama
+  #    3. make start (le modèle dans le volume est conservé)
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.6.5
     container_name: khidmeti-ollama
     restart: unless-stopped
     volumes:
@@ -109,6 +125,11 @@ services:
       - khidmeti-network
     mem_limit:       4g
     mem_reservation: 200m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
       test:         ['CMD', 'curl', '-sf', 'http://localhost:11434/']
       interval:     10s
@@ -117,8 +138,13 @@ services:
       start_period: 15s
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
+  #
+  #  Le modèle Whisper est téléchargé au 1er démarrage depuis HuggingFace
+  #  et mis en cache dans whisper-data → les redémarrages suivants sont instantanés.
+  #  start_period=90s : temps nécessaire au 1er téléchargement (~466 MB pour small).
+  # ─────────────────────────────────────────────────────────────────────────────
   whisper:
-    image: fedirz/faster-whisper-server:latest-cpu
+    image: fedirz/faster-whisper-server:0.2.1-cpu
     container_name: khidmeti-whisper
     restart: unless-stopped
     volumes:
@@ -135,16 +161,22 @@ services:
       - khidmeti-network
     mem_limit:       700m
     mem_reservation: 100m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
       test:         ['CMD', 'curl', '-sf', 'http://localhost:8000/health']
       interval:     15s
       timeout:      10s
       retries:      5
-      start_period: 60s
+      # 90s pour couvrir le 1er téléchargement du modèle Whisper (~466 MB)
+      start_period: 90s
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
-    image:          mongo:7.0
+    image:          mongo:7.0.16
     container_name: khidmeti-mongo
     restart:        unless-stopped
     environment:
@@ -155,7 +187,13 @@ services:
       - mongo-data:/data/db
     networks:
       - khidmeti-network
-    mem_limit: 512m
+    mem_limit:       512m
+    mem_reservation: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test:         ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
       interval:     10s
@@ -181,10 +219,15 @@ services:
     networks:
       - khidmeti-network
     mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   # ── Redis 7.2 ───────────────────────────────────────────────────────────────
   redis:
-    image:          redis:7.2-alpine
+    image:          redis:7.2.7-alpine
     container_name: khidmeti-redis
     restart:        unless-stopped
     command: >
@@ -196,9 +239,20 @@ services:
       - redis-data:/data
     networks:
       - khidmeti-network
-    mem_limit: 192m
+    mem_limit:       192m
+    mem_reservation: 32m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
-      test:     ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      # FIX : dans le champ test[], ${REDIS_PASSWORD} n'est pas interpolé
+      # par Docker Compose. On utilise CMD-SHELL + $$REDIS_PASSWORD
+      # (double $$ → Docker Compose le transforme en $ avant exec).
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
       interval: 10s
       timeout:  3s
       retries:  5
@@ -215,7 +269,13 @@ services:
       - '6334:6334'
     networks:
       - khidmeti-network
-    mem_limit: 256m
+    mem_limit:       256m
+    mem_reservation: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
       test:
         - CMD-SHELL
@@ -227,7 +287,7 @@ services:
 
   # ── MinIO ───────────────────────────────────────────────────────────────────
   minio:
-    image:          minio/minio:latest
+    image:          minio/minio:RELEASE.2025-04-08T15-41-24Z
     container_name: khidmeti-minio
     restart:        unless-stopped
     command:        server /data --address ":9001" --console-address ":9002"
@@ -241,7 +301,13 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit: 256m
+    mem_limit:       256m
+    mem_reservation: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
       test:         ['CMD', 'curl', '-f', 'http://localhost:9001/minio/health/live']
       interval:     10s
@@ -251,7 +317,7 @@ services:
 
   # ── MinIO Init ──────────────────────────────────────────────────────────────
   minio-init:
-    image:          minio/mc:latest
+    image:          minio/mc:RELEASE.2025-04-03T17-07-56Z
     container_name: khidmeti-minio-init
     restart:        "no"
     depends_on:
@@ -273,7 +339,7 @@ services:
 
   # ── nginx ───────────────────────────────────────────────────────────────────
   nginx:
-    image:          nginx:1.27-alpine
+    image:          nginx:1.27.4-alpine
     container_name: khidmeti-nginx
     restart:        unless-stopped
     ports:
@@ -284,4 +350,10 @@ services:
       - api
     networks:
       - khidmeti-network
-    mem_limit: 64m
+    mem_limit:       64m
+    mem_reservation: 16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
