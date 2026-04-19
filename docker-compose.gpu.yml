@@ -14,39 +14,43 @@
 #   sudo systemctl restart docker
 #
 # ── Modèles recommandés selon le GPU ────────────────────────────────────────
-#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:12b  + whisper-medium
-#   12 GB VRAM (RTX 3060, 4070)    → gemma4:27b  + whisper-large-v3
-#   16 GB VRAM (RTX 4080, 3090)    → gemma4:31b  + whisper-large-v3
+#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  + whisper-small  (par défaut)
+#   12 GB VRAM (RTX 3060, 4070)    → gemma4:e4b  + whisper-medium
+#   16 GB VRAM (RTX 4080, 3090)    → gemma4:26b  + whisper-large-v3
 #   24 GB VRAM (RTX 3090, 4090)    → gemma4:31b  + whisper-large-v3
 #
 # ── Variables .env à modifier pour GPU ──────────────────────────────────────
-#   OLLAMA_MODEL=gemma4:12b          ← ou 27b, 31b
-#   WHISPER_MODEL=Systran/faster-whisper-large-v3
+#   OLLAMA_MODEL=gemma4:e2b          ← CPU 8 GB RAM (par défaut, inchangé)
+#   OLLAMA_MODEL=gemma4:e4b          ← GPU 8 GB VRAM
+#   OLLAMA_MODEL=gemma4:26b          ← GPU 12 GB VRAM
+#   WHISPER_MODEL=Systran/faster-whisper-large-v3  ← GPU
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
 
   # ── Ollama avec accélération GPU ────────────────────────────────────────────
   #
-  #  Le GPU prend en charge l'intégralité de l'inférence.
-  #  Performances indicatives gemma4:12b (RTX 3070 8GB) :
-  #    texte/image : 0.3-0.8s  (vs 5-15s CPU)
-  #    chargement  : 1-2s      (vs 10-20s CPU)
+  #  OLLAMA_KEEP_ALIVE=-1 :
+  #    Sur GPU, le modèle vit en VRAM — libérer la VRAM n'est utile que si
+  #    plusieurs modèles doivent coexister. Avec OLLAMA_MAX_LOADED_MODELS=1,
+  #    -1 est optimal : modèle toujours chaud, zéro cold start.
   #
-  #  OLLAMA_KEEP_ALIVE passé à 10 min : le modèle reste en VRAM
-  #  (pas de coût de reload contrairement au CPU qui pèse sur la RAM système)
+  #  OLLAMA_NUM_PARALLEL=4 :
+  #    GPU gère le parallélisme natif — augmenter vs CPU (1).
+  #
+  #  OLLAMA_KEEP_ALIVE passé à -1 pour rester cohérent avec docker-compose.yml :
+  #    Le modèle reste en VRAM indéfiniment — pas de coût de reload.
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     environment:
-      # GPU : pas de limite de parallélisme — laisser Ollama gérer
-      OLLAMA_NUM_PARALLEL:       "4"
-      OLLAMA_MAX_LOADED_MODELS:  "1"
-      # Garder le modèle en VRAM plus longtemps (GPU = pas d'impact RAM système)
-      OLLAMA_KEEP_ALIVE:         "10m"
+      OLLAMA_NUM_PARALLEL:        "4"
+      OLLAMA_MAX_LOADED_MODELS:   "1"
+      # Permanent en VRAM — aucun cold start, cohérent avec le mode CPU
+      OLLAMA_KEEP_ALIVE:          "-1"
       # Laisser Ollama utiliser tous les cores CPU pour la pré-tokenisation
-      OLLAMA_NUM_THREAD:         "0"
-      NVIDIA_VISIBLE_DEVICES:    "all"
+      OLLAMA_NUM_THREAD:          "0"
+      NVIDIA_VISIBLE_DEVICES:     "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     # Supprime la limite mémoire CPU (le modèle vit en VRAM)
     mem_limit: null
@@ -61,15 +65,25 @@ services:
 
   # ── Ollama Init GPU — pull le modèle GPU ────────────────────────────────────
   #
-  #  Override du service cpu pour tirer un modèle plus grand.
-  #  OLLAMA_MODEL doit être mis à jour dans .env :
-  #    OLLAMA_MODEL=gemma4:12b  (8 GB VRAM)
-  #    OLLAMA_MODEL=gemma4:27b  (12 GB VRAM)
-  #    OLLAMA_MODEL=gemma4:31b  (16+ GB VRAM)
+  #  Override du service cpu pour tirer un modèle plus grand si besoin.
+  #  OLLAMA_MODEL doit être mis à jour dans .env selon le GPU disponible :
+  #    OLLAMA_MODEL=gemma4:e2b  (8 GB RAM CPU / 8 GB VRAM GPU — défaut)
+  #    OLLAMA_MODEL=gemma4:e4b  (8 GB VRAM GPU — meilleure qualité)
+  #    OLLAMA_MODEL=gemma4:26b  (12 GB VRAM GPU)
+  #    OLLAMA_MODEL=gemma4:31b  (16+ GB VRAM GPU)
   # ─────────────────────────────────────────────────────────────────────────────
   ollama-init:
     environment:
       OLLAMA_HOST: http://ollama:11434
+
+  # ── Ollama Warmup GPU — préchargement en VRAM ──────────────────────────────
+  #
+  #  Identique au mode CPU — charge le modèle en VRAM avant les vraies requêtes.
+  #  Sur GPU, le warmup est encore plus rapide (~1-3s vs ~5-10s sur CPU).
+  # ─────────────────────────────────────────────────────────────────────────────
+  ollama-warmup:
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
 
   # ── faster-whisper avec accélération CUDA ──────────────────────────────────
   #
@@ -78,7 +92,7 @@ services:
   #
   #  Modèles GPU recommandés :
   #    Systran/faster-whisper-medium       → bon équilibre
-  #    Systran/faster-whisper-large-v3    → meilleure qualité (Darija/Arabe)
+  #    Systran/faster-whisper-large-v3     → meilleure qualité (Darija/Arabe)
   #
   #  Vitesse large-v3 sur RTX 3070 : ~0.5s pour 10s d'audio
   #  (vs ~4s sur CPU avec small/int8)
@@ -86,7 +100,7 @@ services:
   whisper:
     image: fedirz/faster-whisper-server:latest-cuda
     environment:
-      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-large-v3}"
+      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
       WHISPER__INFERENCE_DEVICE: "cuda"
       WHISPER__COMPUTE_TYPE:     "float16"
       WHISPER__LANGUAGE:         "auto"
