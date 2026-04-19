@@ -1,5 +1,9 @@
 ## ══════════════════════════════════════════════════════════════════════════════
 ## KHIDMETI BACKEND — Makefile
+##
+## WORKFLOW :
+##   make start  → 1ère fois : build Ollama auto (~15 min) + démarrage
+##   make start  → fois suivantes : démarrage en quelques secondes
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -30,24 +34,30 @@ LOCAL_IP := $(shell \
 
 HOST     := $(shell hostname)
 DATETIME := $(shell date +%Y%m%d-%H%M%S)
+ARGS     ?=
 
-ARGS ?=
+# ── Dérivé depuis .env ────────────────────────────────────────────────────────
+_OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b')
+_OLLAMA_TAG   := $(shell echo "$(_OLLAMA_MODEL)" | tr ':' '-')
+_OLLAMA_IMAGE := khidmeti-ollama:$(_OLLAMA_TAG)
 
 .DEFAULT_GOAL := help
-.PHONY: help start start-gpu stop stop-gpu restart build rebuild logs logs-api \
-        logs-mongo logs-redis logs-qdrant logs-minio logs-nginx logs-mongo-ui \
+
+.PHONY: help start start-gpu stop stop-gpu restart \
+        build rebuild logs logs-api logs-mongo logs-redis \
+        logs-qdrant logs-minio logs-nginx logs-mongo-ui \
         logs-ollama logs-whisper \
-        health status ai-status ai-ready dns \
+        health status ai-status dns \
         minio-buckets minio-console minio-list \
-        test-api test-ai \
-        firewall backup backup-mongo restore list-backups \
+        test-api test-ai firewall backup restore \
         shell-api shell-mongo shell-redis shell-minio shell-qdrant \
-        mongo-stats redis-info redis-flush \
-        clean-logs clean prod-start prod-update \
-        tunnel-install tunnel-quick tunnel-stop tunnel-status flutter-run \
-        ngrok ngrok-install ngrok-reset \
+        mongo-stats redis-info redis-flush clean-logs clean \
+        prod-start prod-update \
+        tunnel-install tunnel-quick tunnel-stop tunnel-status \
+        flutter-run ngrok ngrok-install ngrok-reset \
         scripts scripts-migrations scripts-seeds \
-        ollama-pull
+        ollama-build ollama-rebuild
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## AIDE
@@ -60,29 +70,30 @@ help: ## Afficher l'aide
 	@echo "  OS : $(OS) | Architecture : $(ARCH)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@echo "  [SERVICES]"
-	@echo "  start              Démarrer (CPU, IA locale)"
-	@echo "  start-gpu          Démarrer avec GPU NVIDIA (+ docker-compose.gpu.yml)"
+	@echo "  [DÉMARRAGE]"
+	@echo "  start              Tout démarrer (build Ollama auto si besoin)"
+	@echo "  start-gpu          Démarrer avec GPU NVIDIA"
 	@echo "  stop               Arrêter tous les services"
 	@echo "  restart            Redémarrer"
-	@echo "  build              Builder l'image NestJS"
-	@echo "  rebuild            Rebuild + redémarrage"
 	@echo ""
-	@echo "  [IA LOCALE]"
-	@echo "  ai-status          Vérifier Ollama + Whisper + modèle"
-	@echo "  ai-ready           Attendre que gemma4 soit téléchargé et prêt"
-	@echo "  ollama-pull        Re-télécharger le modèle manuellement"
-	@echo "  test-ai            Tester l'extraction d'intention"
+	@echo "  [IMAGE OLLAMA]"
+	@echo "  ollama-build       Builder l'image Ollama+modèle (manuel)"
+	@echo "  ollama-rebuild     Forcer rebuild sans cache (nouveau modèle)"
+	@echo ""
+	@echo "  [BUILD API]"
+	@echo "  build              Builder l'image NestJS"
+	@echo "  rebuild            Rebuild NestJS + redémarrage"
 	@echo ""
 	@echo "  [LOGS]"
 	@echo "  logs               Tous les logs"
 	@echo "  logs-api           Logs NestJS"
-	@echo "  logs-ollama        Logs Ollama (téléchargement modèle, requêtes)"
+	@echo "  logs-ollama        Logs Ollama"
 	@echo "  logs-whisper       Logs faster-whisper"
 	@echo "  logs-mongo         Logs MongoDB"
 	@echo ""
 	@echo "  [DIAGNOSTIC]"
 	@echo "  health             Vérifier la santé de tous les services"
+	@echo "  ai-status          Statut IA + taille image Ollama"
 	@echo "  status             Statut + mémoire des conteneurs"
 	@echo "  dns                URLs + config Flutter"
 	@echo ""
@@ -105,54 +116,87 @@ help: ## Afficher l'aide
 	@echo "  shell-mongo        mongosh"
 	@echo ""
 	@echo "  [NETTOYAGE]"
-	@echo "  clean              Supprimer volumes + données (destructif !)"
+	@echo "  clean              Supprimer volumes + données (image Ollama conservée)"
+	@echo ""
+
+## ══════════════════════════════════════════════════════════════════════════════
+## IMAGE OLLAMA
+## ══════════════════════════════════════════════════════════════════════════════
+
+ollama-build: ## Builder l'image Ollama avec modèle intégré (~15 min, une seule fois)
+	@echo ""
+	@echo "══════════════════════════════════════════════"
+	@echo "  Build image Ollama + modèle intégré"
+	@echo "  Modèle  : $(_OLLAMA_MODEL)"
+	@echo "  Image   : $(_OLLAMA_IMAGE)"
+	@echo "  Durée   : ~15 min (une seule fois par machine)"
+	@echo "══════════════════════════════════════════════"
+	@echo ""
+	@docker compose build ollama
+	@echo ""
+	@echo "  ✅ $(_OLLAMA_IMAGE) prête — lancez : make start"
+	@echo ""
+
+ollama-rebuild: ## Forcer rebuild sans cache (changer de modèle)
+	@echo ""
+	@echo "══════════════════════════════════════════════"
+	@echo "  Rebuild Ollama sans cache"
+	@echo "  Modèle : $(_OLLAMA_MODEL)"
+	@echo "══════════════════════════════════════════════"
+	@echo ""
+	@docker compose build --no-cache ollama
+	@echo ""
+	@echo "  ✅ $(_OLLAMA_IMAGE) reconstruite — lancez : make start"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## GESTION DES SERVICES
 ## ══════════════════════════════════════════════════════════════════════════════
 
-start: ## Démarrer (CPU, IA 100% locale)
+start: ## Tout démarrer — build Ollama automatique si l'image est absente
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Démarrage de Khidmeti (IA locale)"
+	@echo "  Démarrage de Khidmeti"
 	@echo "══════════════════════════════════════════════"
+	@echo ""
 	@mkdir -p logs backups/mongodb data/mongodb data/redis data/qdrant data/minio
 	@if [ ! -f .env ]; then \
 		cp .env.example .env 2>/dev/null || true; \
-		echo "⚠️  .env créé — configurez FIREBASE_* avant de continuer"; \
+		echo "  ⚠️  .env créé — configurez FIREBASE_* avant de continuer"; echo ""; \
+	fi
+	@if ! docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
+		echo "  ℹ️  Image Ollama absente ($(_OLLAMA_IMAGE))"; \
+		echo "  → Build automatique (~15 min, une seule fois sur cette machine)..."; \
+		echo ""; \
+		$(MAKE) ollama-build; \
+	else \
+		echo "  ✅ Image Ollama présente ($(_OLLAMA_IMAGE))"; echo ""; \
 	fi
 	@docker compose up -d
 	@echo ""
 	@echo "  ✅ Services démarrés."
 	@echo ""
-	@echo "  📥 ollama-init télécharge gemma4:$(shell grep '^OLLAMA_MODEL' .env | cut -d= -f2 | tr -d '[:space:]' || echo 'e2b') en arrière-plan."
-	@echo "     Suivez la progression : make logs-ollama"
-	@echo "     Attendez la fin      : make ai-ready"
-	@echo ""
-	@sleep 10
+	@sleep 8
 	@$(MAKE) health
 	@$(MAKE) dns
 
-start-gpu: ## Démarrer avec GPU NVIDIA (modifez OLLAMA_MODEL dans .env)
+start-gpu: ## Démarrer avec GPU NVIDIA
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Démarrage Khidmeti — GPU NVIDIA"
+	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
-	@echo "  Modèle Ollama : $$(grep '^OLLAMA_MODEL' .env | cut -d= -f2 | tr -d '[:space:]')"
-	@echo "  Modèle Whisper: $$(grep '^WHISPER_MODEL' .env | cut -d= -f2 | tr -d '[:space:]')"
-	@echo ""
+	@if ! docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
+		echo "  ℹ️  Image Ollama absente — build automatique..."; \
+		$(MAKE) ollama-build; \
+	fi
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 	@echo ""
-	@echo "  ✅ Services GPU démarrés."
-	@echo "     Suivi du pull : make logs-ollama"
-	@echo "     Attente prêt  : make ai-ready"
-	@echo ""
-	@sleep 10
+	@sleep 8
 	@$(MAKE) health
 
-stop: ## Arrêter tous les services (CPU)
+stop: ## Arrêter tous les services
 	@docker compose down
 	@echo "✅ Services arrêtés."
 
@@ -166,43 +210,24 @@ restart: stop ## Redémarrer
 
 build: ## Builder l'image NestJS
 	@docker compose build --no-cache api
-	@echo "✅ Build terminé."
+	@echo "✅ Build NestJS terminé."
 
-rebuild: build start ## Rebuild complet + redémarrage
+rebuild: build start ## Rebuild NestJS + redémarrage
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## LOGS
 ## ══════════════════════════════════════════════════════════════════════════════
 
-logs: ## Tous les logs
-	@docker compose logs --tail=100 -f
-
-logs-api: ## Logs NestJS
-	@docker compose logs -f api
-
-logs-mongo: ## Logs MongoDB
-	@docker compose logs -f mongo
-
-logs-mongo-ui: ## Logs Mongo Express
-	@docker compose logs -f mongo-express
-
-logs-redis: ## Logs Redis
-	@docker compose logs -f redis
-
-logs-qdrant: ## Logs Qdrant
-	@docker compose logs -f qdrant
-
-logs-minio: ## Logs MinIO
-	@docker compose logs -f minio
-
-logs-nginx: ## Logs nginx
-	@docker compose logs -f nginx
-
-logs-ollama: ## Logs Ollama (suivre le téléchargement du modèle)
-	@docker compose logs -f ollama ollama-init
-
-logs-whisper: ## Logs faster-whisper
-	@docker compose logs -f whisper
+logs:         @docker compose logs --tail=100 -f
+logs-api:     @docker compose logs -f api
+logs-mongo:   @docker compose logs -f mongo
+logs-mongo-ui:@docker compose logs -f mongo-express
+logs-redis:   @docker compose logs -f redis
+logs-qdrant:  @docker compose logs -f qdrant
+logs-minio:   @docker compose logs -f minio
+logs-nginx:   @docker compose logs -f nginx
+logs-ollama:  @docker compose logs -f ollama
+logs-whisper: @docker compose logs -f whisper
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## DIAGNOSTIC
@@ -221,7 +246,8 @@ health: ## Vérifier la santé de tous les services
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE (HTTP $$code)"
 	@echo -n "  MongoDB     (27017): "; \
-	  docker exec khidmeti-mongo mongosh --quiet --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
+	  docker exec khidmeti-mongo mongosh --quiet \
+	    --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
 	  && echo "✅ OK" || echo "❌ HORS LIGNE"
 	@echo -n "  Redis       (6379) : "; \
 	  REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
@@ -243,14 +269,16 @@ health: ## Vérifier la santé de tous les services
 
 status: ## Statut + consommation mémoire des conteneurs
 	@echo ""
-	@docker ps -a --filter "name=khidmeti" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+	@docker ps -a --filter "name=khidmeti" \
+	  --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 	@echo ""
-	@echo "  Mémoire (services actifs) :"
-	@docker stats --no-stream --format "  {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}" 2>/dev/null \
+	@echo "  Mémoire :"
+	@docker stats --no-stream \
+	  --format "  {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}" 2>/dev/null \
 	  | grep khidmeti | sort || true
 	@echo ""
 
-ai-status: ## Vérifier Ollama + Whisper + modèle téléchargé
+ai-status: ## Statut IA + taille image Ollama
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Statut IA locale"
@@ -263,45 +291,22 @@ ai-status: ## Vérifier Ollama + Whisper + modèle téléchargé
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
 	@echo ""
-	@echo "  Modèles Ollama installés :"
-	@curl -s http://localhost:11434/api/tags 2>/dev/null \
-	  | python3 -c "import sys,json; d=json.load(sys.stdin); [print('   ✅ '+m['name']) for m in d.get('models',[])]" 2>/dev/null \
-	  || echo "   (Ollama non démarré)"
-	@echo ""
-	@EXPECTED=$$(grep '^OLLAMA_MODEL' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]'); \
-	FOUND=$$(curl -s http://localhost:11434/api/tags 2>/dev/null | grep -c "$$EXPECTED" || true); \
-	if [ "$$FOUND" -gt 0 ]; then \
-	  echo "  ✅ Modèle $$EXPECTED prêt — l'IA fonctionne"; \
+	@echo "  Image Docker :"
+	@if docker image inspect "$(_OLLAMA_IMAGE)" > /dev/null 2>&1; then \
+	  SIZE=$$(docker image inspect "$(_OLLAMA_IMAGE)" --format '{{.Size}}' \
+	    | awk '{printf "%.1f GB", $$1/1073741824}'); \
+	  echo "   ✅ $(_OLLAMA_IMAGE) ($$SIZE)"; \
 	else \
-	  echo "  ⏳ Modèle $$EXPECTED en cours de téléchargement..."; \
-	  echo "     make logs-ollama  ← pour suivre la progression"; \
-	  echo "     make ai-ready     ← pour attendre la fin"; \
+	  echo "   ❌ $(_OLLAMA_IMAGE) absente → sera buildée au prochain : make start"; \
 	fi
 	@echo ""
-
-ai-ready: ## Attendre que le modèle soit téléchargé et prêt (bloquant)
-	@echo ""
-	@echo "  ⏳ Attente de la disponibilité du modèle..."
-	@EXPECTED=$$(grep '^OLLAMA_MODEL' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b'); \
-	echo "  Modèle attendu : $$EXPECTED"; \
-	echo ""; \
-	for i in $$(seq 1 120); do \
-	  FOUND=$$(curl -s http://localhost:11434/api/tags 2>/dev/null | grep -c "$$EXPECTED" || true); \
-	  if [ "$$FOUND" -gt 0 ]; then \
-	    echo "  ✅ $$EXPECTED prêt ! L'IA est opérationnelle."; \
-	    break; \
-	  fi; \
-	  echo "  ⏳ [$$(date +%H:%M:%S)] Téléchargement en cours... ($$i/120)"; \
-	  sleep 15; \
-	done
-
-ollama-pull: ## Re-télécharger le modèle Ollama manuellement
-	@echo ""
-	@EXPECTED=$$(grep '^OLLAMA_MODEL' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b'); \
-	echo "  → Pull $$EXPECTED via Ollama..."; \
-	docker exec khidmeti-ollama ollama pull $$EXPECTED
-	@echo ""
-	@echo "  ✅ Modèle prêt."
+	@echo "  Modèles chargés dans Ollama :"
+	@curl -s http://localhost:11434/api/tags 2>/dev/null \
+	  | python3 -c "import sys,json; d=json.load(sys.stdin); \
+	    models=d.get('models',[]); \
+	    [print('   ✅ '+m['name']) for m in models] if models \
+	    else print('   (aucun modèle chargé)')" 2>/dev/null \
+	  || echo "   (Ollama non démarré)"
 	@echo ""
 
 dns: ## Afficher les URLs + config Flutter
@@ -327,7 +332,8 @@ dns: ## Afficher les URLs + config Flutter
 	@echo ""
 	@echo "  flutter run --dart-define=API_BASE_URL=http://$(LOCAL_IP):80"
 	@echo ""
-	@NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
+	@NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env 2>/dev/null \
+	  | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
 	if [ -n "$$NGROK_DOMAIN" ]; then \
 		echo "  Tunnel ngrok : https://$$NGROK_DOMAIN"; \
 		echo "  flutter run --dart-define=API_BASE_URL=https://$$NGROK_DOMAIN"; \
@@ -335,7 +341,7 @@ dns: ## Afficher les URLs + config Flutter
 	fi
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## TUNNEL CLOUDFLARE
+## TUNNELS
 ## ══════════════════════════════════════════════════════════════════════════════
 
 tunnel-install: ## Installer cloudflared
@@ -343,7 +349,7 @@ tunnel-install: ## Installer cloudflared
 		echo "✅ cloudflared déjà installé : $$(cloudflared --version)"; \
 	elif [ -f /etc/debian_version ] || grep -qi ubuntu /etc/os-release 2>/dev/null; then \
 		curl -L --output /tmp/cloudflared.deb \
-		  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb 2>/dev/null; \
+		  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb; \
 		sudo dpkg -i /tmp/cloudflared.deb; \
 	else \
 		curl -L -o /usr/local/bin/cloudflared \
@@ -356,7 +362,8 @@ tunnel-quick: ## Quick Tunnel Cloudflare (URL aléatoire)
 	@cloudflared tunnel --url http://localhost:80
 
 tunnel-stop: ## Arrêter le tunnel Cloudflare
-	@pkill -f 'cloudflared tunnel' 2>/dev/null && echo "✅ Tunnel(s) arrêté(s)." || echo "Aucun tunnel actif."
+	@pkill -f 'cloudflared tunnel' 2>/dev/null \
+	  && echo "✅ Tunnel arrêté." || echo "Aucun tunnel actif."
 
 tunnel-status: ## État du tunnel Cloudflare
 	@ps aux | grep 'cloudflared tunnel' | grep -v grep || echo "Aucun tunnel actif."
@@ -364,16 +371,12 @@ tunnel-status: ## État du tunnel Cloudflare
 flutter-run: ## Lancer Flutter avec l'IP locale
 	@flutter run --dart-define=API_BASE_URL=http://$(LOCAL_IP):80
 
-## ══════════════════════════════════════════════════════════════════════════════
-## TUNNEL NGROK
-## ══════════════════════════════════════════════════════════════════════════════
-
 ngrok-install: ## Installer ngrok
 	@if command -v ngrok >/dev/null 2>&1; then \
 		echo "✅ ngrok déjà installé : $$(ngrok --version)"; \
 	elif [ -f /etc/debian_version ] || grep -qi ubuntu /etc/os-release 2>/dev/null; then \
 		curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-		  | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null 2>&1; \
+		  | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null; \
 		echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
 		  | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null; \
 		sudo apt-get update -qq && sudo apt-get install -y ngrok; \
@@ -384,55 +387,54 @@ ngrok-install: ## Installer ngrok
 		  | sudo tar xz -C /usr/local/bin; \
 	fi
 
-ngrok: ## Lancer le tunnel ngrok avec domaine statique permanent
+ngrok: ## Tunnel ngrok domaine statique permanent
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Tunnel ngrok — Domaine statique permanent"
+	@echo "  Tunnel ngrok — Domaine permanent"
 	@echo "══════════════════════════════════════════════"
-	@if ! command -v ngrok >/dev/null 2>&1; then echo "❌ ngrok introuvable. Lancez : make ngrok-install"; exit 1; fi
-	@NGROK_TOKEN=$$(grep '^NGROK_AUTH_TOKEN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
+	@if ! command -v ngrok >/dev/null 2>&1; then \
+		echo "❌ ngrok introuvable. Lancez : make ngrok-install"; exit 1; \
+	fi
+	@NGROK_TOKEN=$$(grep '^NGROK_AUTH_TOKEN=' .env 2>/dev/null \
+	  | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
 	if [ -z "$$NGROK_TOKEN" ]; then \
-		echo "  → Auth Token : https://dashboard.ngrok.com/get-started/your-authtoken"; \
-		read -p "  Collez votre Auth Token : " NGROK_TOKEN; \
-		if grep -q '^NGROK_AUTH_TOKEN=' .env 2>/dev/null; then \
-			$(SED_I) "s|^NGROK_AUTH_TOKEN=.*|NGROK_AUTH_TOKEN=$$NGROK_TOKEN|" .env; \
-		else \
-			echo "NGROK_AUTH_TOKEN=$$NGROK_TOKEN" >> .env; \
-		fi; \
+		echo "  → https://dashboard.ngrok.com/get-started/your-authtoken"; \
+		read -p "  Auth Token : " NGROK_TOKEN; \
+		grep -q '^NGROK_AUTH_TOKEN=' .env 2>/dev/null \
+		  && $(SED_I) "s|^NGROK_AUTH_TOKEN=.*|NGROK_AUTH_TOKEN=$$NGROK_TOKEN|" .env \
+		  || echo "NGROK_AUTH_TOKEN=$$NGROK_TOKEN" >> .env; \
 	fi; \
 	ngrok config add-authtoken "$$NGROK_TOKEN" 2>/dev/null; \
-	NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
+	NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env 2>/dev/null \
+	  | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
 	if [ -z "$$NGROK_DOMAIN" ]; then \
-		echo "  → Réservez un domaine : https://dashboard.ngrok.com/domains"; \
-		read -p "  Entrez votre domaine statique : " NGROK_DOMAIN; \
-		if grep -q '^NGROK_DOMAIN=' .env 2>/dev/null; then \
-			$(SED_I) "s|^NGROK_DOMAIN=.*|NGROK_DOMAIN=$$NGROK_DOMAIN|" .env; \
-		else \
-			echo "NGROK_DOMAIN=$$NGROK_DOMAIN" >> .env; \
-		fi; \
+		echo "  → https://dashboard.ngrok.com/domains"; \
+		read -p "  Domaine statique : " NGROK_DOMAIN; \
+		grep -q '^NGROK_DOMAIN=' .env 2>/dev/null \
+		  && $(SED_I) "s|^NGROK_DOMAIN=.*|NGROK_DOMAIN=$$NGROK_DOMAIN|" .env \
+		  || echo "NGROK_DOMAIN=$$NGROK_DOMAIN" >> .env; \
 	fi; \
 	NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env | cut -d= -f2- | tr -d '[:space:]' | tr -d '"'); \
 	echo ""; \
-	echo "  URL permanente : https://$$NGROK_DOMAIN"; \
+	echo "  URL : https://$$NGROK_DOMAIN"; \
 	echo "  flutter run --dart-define=API_BASE_URL=https://$$NGROK_DOMAIN"; \
-	echo "  → Ctrl+C pour arrêter"; \
-	echo ""; \
+	echo "  → Ctrl+C pour arrêter"; echo ""; \
 	ngrok http --domain="$$NGROK_DOMAIN" 80
 
 ngrok-reset: ## Réinitialiser la config ngrok
-	@$(SED_I) '/^NGROK_AUTH_TOKEN=/d' .env 2>/dev/null; \
-	$(SED_I) '/^NGROK_DOMAIN=/d' .env 2>/dev/null; \
-	echo "✅ Config ngrok supprimée — relancez : make ngrok"
+	@$(SED_I) '/^NGROK_AUTH_TOKEN=/d' .env 2>/dev/null
+	@$(SED_I) '/^NGROK_DOMAIN=/d' .env 2>/dev/null
+	@echo "✅ Config ngrok supprimée."
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## SCRIPTS — Migrations MongoDB + Seeds TypeScript
+## SCRIPTS — Migrations + Seeds
 ## ══════════════════════════════════════════════════════════════════════════════
 
-scripts: ## Exécuter TOUTES les migrations puis TOUS les seeds
+scripts: ## Exécuter toutes les migrations puis tous les seeds
 	@$(MAKE) scripts-migrations
 	@$(MAKE) scripts-seeds
 
-scripts-migrations: ## Exécuter toutes les migrations
+scripts-migrations: ## Exécuter toutes les migrations MongoDB
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Migrations MongoDB"
@@ -489,22 +491,21 @@ scripts-%:
 	if [ -f "scripts/migrations/$$NAME.js" ]; then \
 	  MONGO_USER=$$(grep '^MONGO_ROOT_USER' .env | cut -d= -f2 | tr -d '[:space:]'); \
 	  MONGO_PASS=$$(grep '^MONGO_ROOT_PASSWORD' .env | cut -d= -f2 | tr -d '[:space:]'); \
-	  echo "  → Migration : $$NAME.js"; \
 	  docker exec -i khidmeti-mongo mongosh \
 	    --quiet -u "$$MONGO_USER" -p "$$MONGO_PASS" \
 	    --authenticationDatabase admin khidmeti < "scripts/migrations/$$NAME.js" \
 	  && echo "  ✅ $$NAME.js OK" || { echo "  ❌ FAILED"; exit 1; }; \
 	elif [ -f "apps/api/src/scripts/seeds/$$NAME.ts" ]; then \
-	  echo "  → Seed : $$NAME.ts $(ARGS)"; \
 	  docker exec khidmeti-api \
 	    npx ts-node --project tsconfig.json "src/scripts/seeds/$$NAME.ts" $(ARGS) \
 	  && echo "  ✅ $$NAME.ts OK" || { echo "  ❌ FAILED"; exit 1; }; \
 	else \
-	  echo ""; \
-	  echo "  ❌ Script '$$NAME' introuvable."; \
-	  ls scripts/migrations/*.js 2>/dev/null | xargs -I{} basename {} .js | sed 's/^/  migration: /' || true; \
-	  ls apps/api/src/scripts/seeds/*.ts 2>/dev/null | xargs -I{} basename {} .ts | sed 's/^/  seed: /' || true; \
-	  echo ""; exit 1; \
+	  echo "❌ Script '$$NAME' introuvable."; \
+	  ls scripts/migrations/*.js 2>/dev/null | xargs -I{} basename {} .js \
+	    | sed 's/^/  migration: /' || true; \
+	  ls apps/api/src/scripts/seeds/*.ts 2>/dev/null | xargs -I{} basename {} .ts \
+	    | sed 's/^/  seed: /' || true; \
+	  exit 1; \
 	fi
 
 ## ══════════════════════════════════════════════════════════════════════════════
@@ -540,27 +541,17 @@ test-api: ## Tester les endpoints principaux
 	@echo ""
 	@echo "  [1] Health :"; curl -s http://localhost:3000/health
 	@echo ""
-	@echo "  [2] Swagger (code HTTP) :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
+	@echo "  [2] Swagger :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
 	@echo ""
 
-test-ai: ## Tester l'extraction d'intention (Ollama direct, sans auth)
+test-ai: ## Tester l'extraction d'intention Darija
 	@echo ""
-	@echo "  Test direct Ollama — extraction d'intention Darija..."
+	@echo "  Test Ollama — extraction Darija..."
 	@echo ""
-	@EXPECTED=$$(grep '^OLLAMA_MODEL' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b'); \
-	curl -s http://localhost:11434/v1/chat/completions \
+	@curl -s http://localhost:11434/v1/chat/completions \
 	  -H "Content-Type: application/json" \
-	  -d "{ \
-	    \"model\": \"$$EXPECTED\", \
-	    \"messages\": [ \
-	      {\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"}, \
-	      {\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"} \
-	    ], \
-	    \"options\": {\"num_ctx\":2048,\"think\":false}, \
-	    \"temperature\":0.05, \
-	    \"max_tokens\":200, \
-	    \"stream\":false \
-	  }" | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible ou modèle non chargé"
+	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":2048,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
+	  | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
@@ -568,7 +559,6 @@ test-ai: ## Tester l'extraction d'intention (Ollama direct, sans auth)
 ## ══════════════════════════════════════════════════════════════════════════════
 
 backup: ## Sauvegarder MongoDB
-	@echo "Sauvegarde — $(DATETIME)"
 	@mkdir -p backups/mongodb/$(DATETIME)
 	@MONGO_USER=$$(grep MONGO_ROOT_USER .env | cut -d= -f2 | tr -d '[:space:]'); \
 	MONGO_PASS=$$(grep MONGO_ROOT_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
@@ -577,10 +567,12 @@ backup: ## Sauvegarder MongoDB
 	  --authenticationDatabase admin --db khidmeti \
 	  --out /tmp/backup_$(DATETIME); \
 	docker cp khidmeti-mongo:/tmp/backup_$(DATETIME) backups/mongodb/$(DATETIME)
-	@echo "  ✅ MongoDB → backups/mongodb/$(DATETIME)"
+	@echo "  ✅ Sauvegarde → backups/mongodb/$(DATETIME)"
 
 restore: ## Restaurer (BACKUP_DATE=YYYYMMDD-HHMMSS)
-	@if [ -z "$(BACKUP_DATE)" ]; then echo "Usage : make restore BACKUP_DATE=20250101-120000"; exit 1; fi
+	@if [ -z "$(BACKUP_DATE)" ]; then \
+		echo "Usage : make restore BACKUP_DATE=20250101-120000"; exit 1; \
+	fi
 	@MONGO_USER=$$(grep MONGO_ROOT_USER .env | cut -d= -f2 | tr -d '[:space:]'); \
 	MONGO_PASS=$$(grep MONGO_ROOT_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker cp backups/mongodb/$(BACKUP_DATE) khidmeti-mongo:/tmp/restore_$(BACKUP_DATE); \
@@ -591,10 +583,10 @@ restore: ## Restaurer (BACKUP_DATE=YYYYMMDD-HHMMSS)
 	@echo "✅ Restauration terminée."
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## SHELL ET DEBUG
+## SHELLS
 ## ══════════════════════════════════════════════════════════════════════════════
 
-shell-api: ## Shell dans le conteneur NestJS
+shell-api: ## Shell dans NestJS
 	@docker exec -it khidmeti-api /bin/sh
 
 shell-mongo: ## mongosh dans MongoDB
@@ -603,7 +595,7 @@ shell-mongo: ## mongosh dans MongoDB
 	docker exec -it khidmeti-mongo mongosh -u "$$MONGO_USER" -p "$$MONGO_PASS" \
 	  --authenticationDatabase admin khidmeti
 
-shell-redis: ## redis-cli dans Redis
+shell-redis: ## redis-cli
 	@REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker exec -it khidmeti-redis redis-cli -a "$$REDIS_PASS"
 
@@ -613,8 +605,9 @@ shell-minio: ## mc client MinIO
 	docker run -it --rm --network khidmeti-network minio/mc:latest \
 	  sh -c "mc alias set local http://minio:9001 $$MINIO_KEY $$MINIO_SECRET && sh"
 
-shell-qdrant: ## Ouvrir le dashboard Qdrant
-	@$(OPEN_CMD) http://localhost:6333/dashboard 2>/dev/null || echo "  → http://localhost:6333/dashboard"
+shell-qdrant: ## Dashboard Qdrant
+	@$(OPEN_CMD) http://localhost:6333/dashboard 2>/dev/null \
+	  || echo "  → http://localhost:6333/dashboard"
 
 mongo-stats: ## Stats MongoDB
 	@MONGO_USER=$$(grep MONGO_ROOT_USER .env | cut -d= -f2 | tr -d '[:space:]'); \
@@ -626,7 +619,7 @@ redis-info: ## Stats Redis
 	@REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker exec khidmeti-redis redis-cli -a "$$REDIS_PASS" INFO server
 
-redis-flush: ## Vider le cache Redis
+redis-flush: ## Vider Redis
 	@REDIS_PASS=$$(grep REDIS_PASSWORD .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker exec khidmeti-redis redis-cli -a "$$REDIS_PASS" FLUSHALL
 	@echo "✅ Cache Redis vidé."
@@ -639,25 +632,24 @@ clean-logs: ## Vider les logs
 	@find logs/ -name "*.log" -delete 2>/dev/null || true
 	@echo "✅ Logs nettoyés."
 
-clean: ## Supprimer volumes + données (DESTRUCTIF — supprime aussi les modèles IA !)
+clean: ## Supprimer volumes + données (image Ollama conservée)
 	@echo ""
-	@echo "  ⚠️  ATTENTION : supprime TOUTES les données ET les modèles IA téléchargés."
-	@echo "  Les modèles devront être re-téléchargés (~7.2 GB) au prochain démarrage."
+	@echo "  ⚠️  Supprime : MongoDB, Redis, Qdrant, MinIO."
+	@echo "  L'image Ollama+modèle est conservée dans le cache Docker."
+	@echo ""
 	@read -p "  Confirmer ? [y/N] " CONFIRM; \
 	if [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ]; then \
 		docker compose down -v --remove-orphans; \
 		docker system prune -f; \
 		rm -rf data/mongodb data/redis data/qdrant data/minio; \
 		echo "✅ Nettoyage terminé."; \
-	else \
-		echo "Annulé."; \
-	fi
+	else echo "Annulé."; fi
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## PRODUCTION
 ## ══════════════════════════════════════════════════════════════════════════════
 
-prod-start: ## Démarrer en mode production
+prod-start: ## Démarrer en production
 	@docker compose up -d
 	@echo "✅ Mode production actif."
 
@@ -666,5 +658,5 @@ prod-update: ## Mettre à jour l'API sans downtime
 	@docker compose up -d --no-deps --build api
 	@echo "✅ API mise à jour."
 
-firewall: ## Afficher les commandes pare-feu
+firewall: ## Commandes pare-feu
 	@echo "  sudo ufw allow 80/tcp 3000/tcp 6333/tcp 8081/tcp 9001/tcp 9002/tcp 11434/tcp 8000/tcp"

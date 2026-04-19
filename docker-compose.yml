@@ -3,17 +3,21 @@ name: khidmeti
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
-# Premier démarrage : make start
-#   → Ollama démarre, puis ollama-init télécharge gemma4:e2b (~7.2 GB)
-#   → ollama-warmup charge le modèle en RAM immédiatement (keep_alive=-1)
-#   → faster-whisper télécharge son modèle au premier appel (~466 MB)
-#   → L'API fonctionne avec le modèle déjà chaud — zéro cold start
+# ARCHITECTURE IA :
+#   Le modèle gemma4:e2b est intégré directement dans l'image Ollama
+#   (baked at build time). Aucun téléchargement au démarrage.
 #
-# Redémarrages suivants (make stop && make start) :
-#   → Le modèle est déjà sur disque (ollama-data volume) — pas de re-download
-#   → ollama-warmup recharge en RAM en ~5-10s
+#   Premier démarrage (nouvelle machine) :
+#     → docker compose build ollama  (build ~15 min, une seule fois)
+#     → make start                   (démarrage instantané, modèle prêt)
 #
-# GPU (futur) : docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   Redémarrages suivants :
+#     → make start                   (zéro téléchargement, modèle dans l'image)
+#
+#   Changer de modèle :
+#     1. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
+#     2. docker compose build --no-cache ollama
+#     3. make start
 #
 # Budget mémoire 8 GB RAM :
 #   Ollama + gemma4:e2b chargé  ~3.0 GB  (permanent avec KEEP_ALIVE=-1)
@@ -23,6 +27,9 @@ name: khidmeti
 #   OS + Docker                 ~1.5 GB
 #   ──────────────────────────────────
 #   Total                       ~6.5 GB  ✅ marge confortable
+#
+# GPU (futur) :
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -35,8 +42,9 @@ volumes:
   redis-data:   { name: khidmeti-redis-data   }
   qdrant-data:  { name: khidmeti-qdrant-data  }
   minio-data:   { name: khidmeti-minio-data   }
-  ollama-data:  { name: khidmeti-ollama-data  }
   whisper-data: { name: khidmeti-whisper-data }
+  # NOTE : ollama-data supprimé — le modèle est dans l'image, pas dans un volume.
+  #         Monter un volume sur /root/.ollama cacherait les modèles baked.
 
 services:
 
@@ -66,38 +74,36 @@ services:
       - khidmeti-network
     mem_limit: 512m
 
-  # ── Ollama — LLM local ──────────────────────────────────────────────────────
+  # ── Ollama — LLM local avec modèle intégré ──────────────────────────────────
   #
-  #  Modèle CPU : gemma4:e2b (Effective 2B)
-  #    Multimodal natif (texte + images), 2.3B paramètres effectifs
-  #    Téléchargement unique ~7.2 GB via ollama-init (volume persistant)
+  #  Le modèle est baked dans l'image Docker (docker/ollama/Dockerfile).
+  #  Aucun volume ne couvre /ollama/models pour éviter de cacher les modèles.
   #
   #  Paramètres critiques pour 8 GB RAM :
-  #    OLLAMA_NUM_PARALLEL=1      → 1 requête à la fois (évite OOM)
-  #    OLLAMA_MAX_LOADED_MODELS=1 → 1 modèle en RAM max
-  #    OLLAMA_KEEP_ALIVE=-1       → modèle PERMANENT en RAM (zéro cold start)
-  #                                 -1 = jamais déchargé automatiquement
-  #    OLLAMA_NUM_THREAD=4        → adapter selon votre CPU (nproc --all)
-  #
-  #  IMPORTANT — OLLAMA_KEEP_ALIVE=-1 vs 3m :
-  #    Avant (3m) : après 3 min d'inactivité → modèle déchargé → cold start
-  #                 de 10-15s au prochain appel (inacceptable en prod)
-  #    Après (-1) : modèle toujours en RAM → réponse en ~1-3s dès le 1er appel
-  #    Coût mémoire : ~3 GB occupés en permanence → acceptable sur 8 GB RAM
+  #    OLLAMA_MODELS=/ollama/models   → chemin des modèles baked dans l'image
+  #    OLLAMA_NUM_PARALLEL=1          → 1 requête à la fois (évite OOM)
+  #    OLLAMA_MAX_LOADED_MODELS=1     → 1 modèle en RAM max
+  #    OLLAMA_KEEP_ALIVE=-1           → modèle permanent en RAM (zéro cold start)
+  #    OLLAMA_NUM_THREAD=4            → adapter selon votre CPU (nproc --all)
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:latest
+    build:
+      context:    ./docker/ollama
+      dockerfile: Dockerfile
+      args:
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+    image: khidmeti-ollama:${OLLAMA_MODEL:-gemma4-e2b}
     container_name: khidmeti-ollama
     restart: unless-stopped
-    volumes:
-      - ollama-data:/root/.ollama
+    # AUCUN volume sur /ollama/models — ne pas cacher les modèles baked
+    # AUCUN volume sur /root/.ollama  — idem
     environment:
-      OLLAMA_NUM_PARALLEL:       "1"
-      OLLAMA_MAX_LOADED_MODELS:  "1"
-      # -1 = keep model in RAM forever — eliminates cold start latency
-      OLLAMA_KEEP_ALIVE:         "-1"
-      OLLAMA_NUM_THREAD:         "4"
-      OLLAMA_FLASH_ATTENTION:    "0"
+      OLLAMA_MODELS:            /ollama/models
+      OLLAMA_NUM_PARALLEL:      "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE:        "-1"
+      OLLAMA_NUM_THREAD:        "4"
+      OLLAMA_FLASH_ATTENTION:   "0"
     ports:
       - '11434:11434'
     networks:
@@ -109,76 +115,7 @@ services:
       interval:     10s
       timeout:      5s
       retries:      6
-      start_period: 20s
-
-  # ── Ollama Init — téléchargement automatique du modèle ─────────────────────
-  #
-  #  S'exécute UNE SEULE FOIS au premier `docker compose up`.
-  #  Si le modèle est déjà présent dans ollama-data, le pull est un no-op rapide.
-  #  N'est PAS dans les depends_on de `api` → ne bloque pas le démarrage.
-  #
-  #  OLLAMA_MODEL défini dans .env (défaut: gemma4:e2b)
-  #  Le volume ollama-data persiste le modèle entre les redémarrages :
-  #    → Premier démarrage  : téléchargement ~7.2 GB (une seule fois)
-  #    → Redémarrages suivants : pull = no-op (<1s), chargement depuis disque
-  # ─────────────────────────────────────────────────────────────────────────────
-  ollama-init:
-    image: ollama/ollama:latest
-    container_name: khidmeti-ollama-init
-    restart: "no"
-    entrypoint: >
-      sh -c "
-        echo '📥 Pulling ${OLLAMA_MODEL:-gemma4:e2b}...' &&
-        ollama pull ${OLLAMA_MODEL:-gemma4:e2b} &&
-        echo '✅ Model downloaded and ready on disk.'
-      "
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    depends_on:
-      ollama: { condition: service_healthy }
-    networks:
-      - khidmeti-network
-
-  # ── Ollama Warmup — préchargement du modèle en RAM ─────────────────────────
-  #
-  #  POURQUOI CE SERVICE EST NÉCESSAIRE :
-  #    ollama-init télécharge le modèle sur disque (ollama-data volume).
-  #    Mais le modèle n'est PAS en RAM jusqu'à la première vraie requête.
-  #    Sans warmup : le premier appel API paie un cold start de 10-15s.
-  #    Avec warmup  : le modèle est en RAM AVANT que l'API ne reçoive des vraies
-  #                   requêtes → premier appel aussi rapide que les suivants.
-  #
-  #  FONCTIONNEMENT :
-  #    Envoie une requête vide avec keep_alive=-1 via l'API Ollama.
-  #    keep_alive=-1 surcharge OLLAMA_KEEP_ALIVE et épingle le modèle en RAM
-  #    jusqu'au prochain redémarrage du conteneur ollama.
-  #
-  #  ORDRE DE DÉMARRAGE GARANTI :
-  #    ollama (healthy) → ollama-init (completed) → ollama-warmup (completed)
-  #    → l'API peut alors traiter des requêtes sans latence initiale
-  #
-  #  NOTE : ce service se termine immédiatement après le warmup (restart: "no").
-  #         Il ne consomme aucune ressource après son exécution.
-  # ─────────────────────────────────────────────────────────────────────────────
-  ollama-warmup:
-    image: curlimages/curl:latest
-    container_name: khidmeti-ollama-warmup
-    restart: "no"
-    entrypoint: >
-      sh -c "
-        echo '🔥 Warming up ${OLLAMA_MODEL:-gemma4:e2b} into RAM...' &&
-        curl -sf --max-time 120 -X POST http://ollama:11434/api/generate \
-          -H 'Content-Type: application/json' \
-          -d '{\"model\":\"${OLLAMA_MODEL:-gemma4:e2b}\",\"prompt\":\"\",\"keep_alive\":-1,\"stream\":false}' \
-          -o /dev/null &&
-        echo '✅ Model is hot in RAM — zero cold start guaranteed.'
-      "
-    environment:
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
-    depends_on:
-      ollama-init: { condition: service_completed_successfully }
-    networks:
-      - khidmeti-network
+      start_period: 15s
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #

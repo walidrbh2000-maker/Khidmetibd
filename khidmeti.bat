@@ -3,11 +3,15 @@
 :: KHIDMETI BACKEND — Windows CMD Script
 :: Usage: khidmeti.bat [command] [args]
 ::
+:: WORKFLOW :
+::   khidmeti.bat start  → 1ère fois : build Ollama auto (~15 min) + démarrage
+::   khidmeti.bat start  → fois suivantes : démarrage en quelques secondes
+::
 :: Requirements: Docker Desktop
 :: ══════════════════════════════════════════════════════════════════════════════
 setlocal enabledelayedexpansion
 
-:: ── Get local IP ──────────────────────────────────────────────────────────────
+:: ── IP locale ─────────────────────────────────────────────────────────────────
 for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /r "IPv4.*192\."') do (
   set LOCAL_IP=%%a
   set LOCAL_IP=!LOCAL_IP: =!
@@ -21,35 +25,51 @@ for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /r "IPv4.*10\."') do (
 set LOCAL_IP=127.0.0.1
 :ip_found
 
-:: ── Route command ─────────────────────────────────────────────────────────────
+:: ── Lire OLLAMA_MODEL depuis .env ─────────────────────────────────────────────
+set OLLAMA_MODEL_VAL=gemma4:e2b
+for /f "tokens=2 delims==" %%a in ('findstr "^OLLAMA_MODEL=" .env 2^>nul') do (
+  set OLLAMA_MODEL_VAL=%%a
+  set OLLAMA_MODEL_VAL=!OLLAMA_MODEL_VAL: =!
+)
+:: Convertir ":" en "-" pour le tag Docker (gemma4:e2b → gemma4-e2b)
+set OLLAMA_TAG=%OLLAMA_MODEL_VAL::=-%
+set OLLAMA_IMAGE=khidmeti-ollama:%OLLAMA_TAG%
+
+:: ── Router la commande ────────────────────────────────────────────────────────
 set CMD=%1
 set ARGS=%2
 if "%CMD%"==""                  goto :help
 if /i "%CMD%"=="help"           goto :help
 if /i "%CMD%"=="start"          goto :start
+if /i "%CMD%"=="start-gpu"      goto :start_gpu
 if /i "%CMD%"=="stop"           goto :stop
 if /i "%CMD%"=="restart"        goto :restart
 if /i "%CMD%"=="build"          goto :build
 if /i "%CMD%"=="rebuild"        goto :rebuild
+if /i "%CMD%"=="ollama-build"   goto :ollama_build
+if /i "%CMD%"=="ollama-rebuild" goto :ollama_rebuild
 if /i "%CMD%"=="health"         goto :health
+if /i "%CMD%"=="ai-status"      goto :ai_status
 if /i "%CMD%"=="status"         goto :status
 if /i "%CMD%"=="logs"           goto :logs
 if /i "%CMD%"=="logs-api"       goto :logs_api
+if /i "%CMD%"=="logs-ollama"    goto :logs_ollama
+if /i "%CMD%"=="logs-whisper"   goto :logs_whisper
+if /i "%CMD%"=="dns"            goto :dns
 if /i "%CMD%"=="tunnel"         goto :tunnel
 if /i "%CMD%"=="ngrok"          goto :ngrok
 if /i "%CMD%"=="ngrok-install"  goto :ngrok_install
 if /i "%CMD%"=="ngrok-reset"    goto :ngrok_reset
 if /i "%CMD%"=="flutter-run"    goto :flutter_run
 if /i "%CMD%"=="clean"          goto :clean
-if /i "%CMD%"=="dns"            goto :dns
 if /i "%CMD%"=="shell-api"      goto :shell_api
 if /i "%CMD%"=="shell-mongo"    goto :shell_mongo
 if /i "%CMD%"=="test-api"       goto :test_api
+if /i "%CMD%"=="test-ai"        goto :test_ai
 if /i "%CMD%"=="scripts"        goto :scripts
 if /i "%CMD%"=="scripts-migrations" goto :scripts_migrations
 if /i "%CMD%"=="scripts-seeds"  goto :scripts_seeds
 
-:: Vérifier si la commande commence par "scripts-"
 set PREFIX=%CMD:~0,8%
 if /i "%PREFIX%"=="scripts-" (
   set SCRIPT_NAME=%CMD:~8%
@@ -60,95 +80,187 @@ echo Commande inconnue : %CMD%
 echo Utilisation : khidmeti.bat help
 exit /b 1
 
-:: ── HELP ──────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: HELP
+:: ═══════════════════════════════════════════════════════════════════════════════
 :help
 echo.
 echo ══════════════════════════════════════════════════════
 echo   KHIDMETI — Commandes Windows CMD
 echo   IP locale : %LOCAL_IP%
+echo   Image     : %OLLAMA_IMAGE%
 echo ══════════════════════════════════════════════════════
 echo.
-echo   [SERVICES]
-echo   khidmeti.bat start              Demarrer tous les services
+echo   [DEMARRAGE]
+echo   khidmeti.bat start              Tout demarrer (build Ollama auto si besoin)
+echo   khidmeti.bat start-gpu          Demarrer avec GPU NVIDIA
 echo   khidmeti.bat stop               Arreter tous les services
 echo   khidmeti.bat restart            Redemarrer
+echo.
+echo   [IMAGE OLLAMA]
+echo   khidmeti.bat ollama-build       Builder l'image Ollama+modele (~15 min)
+echo   khidmeti.bat ollama-rebuild     Forcer rebuild sans cache
+echo.
+echo   [BUILD API]
 echo   khidmeti.bat build              Builder l'image NestJS
 echo   khidmeti.bat rebuild            Rebuild + redemarrage
-echo   khidmeti.bat health             Verifier la sante des services
-echo   khidmeti.bat status             Statut des conteneurs
+echo.
+echo   [LOGS]
 echo   khidmeti.bat logs               Tous les logs (Ctrl+C pour quitter)
-echo   khidmeti.bat logs-api           Logs NestJS uniquement
+echo   khidmeti.bat logs-api           Logs NestJS
+echo   khidmeti.bat logs-ollama        Logs Ollama
+echo   khidmeti.bat logs-whisper       Logs faster-whisper
+echo.
+echo   [DIAGNOSTIC]
+echo   khidmeti.bat health             Sante de tous les services
+echo   khidmeti.bat ai-status          Statut IA + taille image Ollama
+echo   khidmeti.bat status             Statut des conteneurs
 echo   khidmeti.bat dns                URLs + config Flutter
-echo   khidmeti.bat flutter-run        Lancer Flutter avec l'IP locale
-echo   khidmeti.bat shell-api          Shell dans le conteneur NestJS
-echo   khidmeti.bat shell-mongo        mongosh dans MongoDB
-echo   khidmeti.bat test-api           Tester les endpoints
-echo   khidmeti.bat clean              Supprimer toutes les donnees (DESTRUCTIF)
 echo.
-echo   [TUNNEL — Acces distant]
-echo   khidmeti.bat tunnel             Cloudflare Quick Tunnel (URL aleatoire)
+echo   [TUNNEL]
 echo   khidmeti.bat ngrok              Tunnel ngrok PERMANENT (recommande)
-echo   khidmeti.bat ngrok-install      Installer ngrok
-echo   khidmeti.bat ngrok-reset        Changer token ou domaine ngrok
+echo   khidmeti.bat tunnel             Cloudflare Quick Tunnel
 echo.
-echo   [SCRIPTS — Migrations + Seeds]
-echo   khidmeti.bat scripts                        Tout executer
-echo   khidmeti.bat scripts-migrations             Migrations seulement
-echo   khidmeti.bat scripts-seeds                  Seeds seulement
-echo   khidmeti.bat scripts-001_phone_auth_indexes Une migration precise
-echo   khidmeti.bat scripts-seed-workers           Un seed precis
-echo   khidmeti.bat scripts-seed-workers --clear   Seed avec flag
+echo   [SCRIPTS]
+echo   khidmeti.bat scripts                Tout executer
+echo   khidmeti.bat scripts-migrations     Migrations seulement
+echo   khidmeti.bat scripts-seeds          Seeds seulement
+echo   khidmeti.bat scripts-seed-workers   Un script precis
 echo.
-echo   Structure attendue :
-echo     scripts\migrations\*.js         ^(mongosh dans khidmeti-mongo^)
-echo     apps\api\src\scripts\seeds\*.ts ^(ts-node dans khidmeti-api^)
+echo   [DEBUG]
+echo   khidmeti.bat shell-api          Shell NestJS
+echo   khidmeti.bat shell-mongo        mongosh
+echo   khidmeti.bat test-ai            Tester extraction Darija
+echo.
+echo   [NETTOYAGE]
+echo   khidmeti.bat clean              Supprimer donnees (image Ollama conservee)
 echo.
 goto :eof
 
-:: ── START ─────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: OLLAMA BUILD
+:: ═══════════════════════════════════════════════════════════════════════════════
+:ollama_build
+echo.
+echo ══════════════════════════════════════════════
+echo   Build image Ollama + modele integre
+echo   Modele  : %OLLAMA_MODEL_VAL%
+echo   Image   : %OLLAMA_IMAGE%
+echo   Duree   : ~15 min (une seule fois par machine)
+echo ══════════════════════════════════════════════
+echo.
+docker compose build ollama
+if !errorlevel! neq 0 (
+  echo.
+  echo   ERREUR : build Ollama echoue.
+  exit /b 1
+)
+echo.
+echo   OK Image %OLLAMA_IMAGE% prete.
+echo.
+goto :eof
+
+:ollama_rebuild
+echo.
+echo ══════════════════════════════════════════════
+echo   Rebuild Ollama sans cache
+echo   Modele : %OLLAMA_MODEL_VAL%
+echo ══════════════════════════════════════════════
+echo.
+docker compose build --no-cache ollama
+echo.
+echo   OK Image %OLLAMA_IMAGE% reconstruite.
+echo.
+goto :eof
+
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: START
+:: ═══════════════════════════════════════════════════════════════════════════════
 :start
 echo.
 echo ══════════════════════════════════════════════
-echo   Demarrage de Khidmeti Backend...
+echo   Demarrage de Khidmeti
 echo ══════════════════════════════════════════════
-if not exist ".env" (
-  if exist ".env.example" (
-    copy ".env.example" ".env" >nul
-    echo ATTENTION : .env cree depuis .env.example — configurez FIREBASE_* et les cles IA
-  )
-)
+echo.
+
+:: Creer les repertoires necessaires
 if not exist "logs"              mkdir logs
 if not exist "backups\mongodb"   mkdir backups\mongodb
-if not exist "backups\minio"     mkdir backups\minio
 if not exist "data\mongodb"      mkdir data\mongodb
 if not exist "data\redis"        mkdir data\redis
 if not exist "data\qdrant"       mkdir data\qdrant
 if not exist "data\minio"        mkdir data\minio
+
+:: Verifier .env
+if not exist ".env" (
+  if exist ".env.example" (
+    copy ".env.example" ".env" >nul
+    echo   ATTENTION : .env cree — configurez FIREBASE_* avant de continuer
+    echo.
+  )
+)
+
+:: Verifier si l'image Ollama existe
+docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
+if !errorlevel! neq 0 (
+  echo   Image Ollama absente ^(%OLLAMA_IMAGE%^)
+  echo   Build automatique ^(~15 min, une seule fois sur cette machine^)...
+  echo.
+  call :ollama_build
+  if !errorlevel! neq 0 (
+    echo   ERREUR : impossible de builder l'image Ollama.
+    exit /b 1
+  )
+) else (
+  echo   OK Image Ollama presente ^(%OLLAMA_IMAGE%^)
+  echo.
+)
+
+:: Demarrer tous les services
 docker compose up -d
 echo.
-echo   Attente 15s...
-timeout /t 15 /nobreak >nul
+echo   OK Services demarres.
+echo.
+timeout /t 8 /nobreak >nul
 call :health
 call :dns
 goto :eof
 
-:: ── STOP ──────────────────────────────────────────────────────────────────────
+:start_gpu
+echo.
+echo ══════════════════════════════════════════════
+echo   Demarrage Khidmeti — GPU NVIDIA
+echo   Modele : %OLLAMA_MODEL_VAL%
+echo ══════════════════════════════════════════════
+echo.
+docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
+if !errorlevel! neq 0 (
+  echo   Image absente — build automatique...
+  call :ollama_build
+)
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+echo.
+timeout /t 8 /nobreak >nul
+call :health
+goto :eof
+
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: STOP / RESTART / BUILD
+:: ═══════════════════════════════════════════════════════════════════════════════
 :stop
 docker compose down
 echo Services arretes.
 goto :eof
 
-:: ── RESTART ───────────────────────────────────────────────────────────────────
 :restart
 call :stop
 timeout /t 3 /nobreak >nul
 call :start
 goto :eof
 
-:: ── BUILD ─────────────────────────────────────────────────────────────────────
 :build
 docker compose build --no-cache api
-echo Build termine.
+echo Build NestJS termine.
 goto :eof
 
 :rebuild
@@ -156,7 +268,9 @@ call :build
 call :start
 goto :eof
 
-:: ── HEALTH ────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: HEALTH
+:: ═══════════════════════════════════════════════════════════════════════════════
 :health
 echo.
 echo ══════════════════════════════════════════════
@@ -166,18 +280,38 @@ echo.
 curl -s -o nul -w "  NestJS API  (3000) : HTTP %%{http_code}\n" http://localhost:3000/health     2>nul || echo   NestJS API  (3000) : HORS LIGNE
 curl -s -o nul -w "  nginx       (80)   : HTTP %%{http_code}\n" http://localhost/health           2>nul || echo   nginx       (80)   : HORS LIGNE
 curl -s -o nul -w "  Qdrant      (6333) : HTTP %%{http_code}\n" http://localhost:6333/healthz    2>nul || echo   Qdrant      (6333) : HORS LIGNE
-curl -s -o nul -w "  MinIO API   (9001) : HTTP %%{http_code}\n" http://localhost:9001/minio/health/live 2>nul || echo   MinIO       (9001) : HORS LIGNE
-echo.
-echo   Pour MongoDB et Redis : docker ps --filter name=khidmeti
+curl -s -o nul -w "  MinIO       (9001) : HTTP %%{http_code}\n" http://localhost:9001/minio/health/live 2>nul || echo   MinIO API   (9001) : HORS LIGNE
+curl -s -o nul -w "  Ollama      (11434): HTTP %%{http_code}\n" http://localhost:11434/           2>nul || echo   Ollama      (11434): HORS LIGNE
+curl -s -o nul -w "  Whisper     (8000) : HTTP %%{http_code}\n" http://localhost:8000/health     2>nul || echo   Whisper     (8000) : HORS LIGNE
 echo.
 goto :eof
 
-:: ── STATUS ────────────────────────────────────────────────────────────────────
+:ai_status
+echo.
+echo ══════════════════════════════════════════════
+echo   Statut IA locale
+echo ══════════════════════════════════════════════
+echo.
+curl -s -o nul -w "  Ollama  (11434) : HTTP %%{http_code}\n" http://localhost:11434/ 2>nul
+curl -s -o nul -w "  Whisper (8000)  : HTTP %%{http_code}\n" http://localhost:8000/health 2>nul
+echo.
+echo   Image Docker :
+docker image inspect "%OLLAMA_IMAGE%" >nul 2>&1
+if !errorlevel! equ 0 (
+  echo     OK %OLLAMA_IMAGE%
+) else (
+  echo     ABSENT %OLLAMA_IMAGE% — sera buildee au prochain : khidmeti.bat start
+)
+echo.
+goto :eof
+
 :status
 docker ps --filter "name=khidmeti" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 goto :eof
 
-:: ── LOGS ──────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: LOGS
+:: ═══════════════════════════════════════════════════════════════════════════════
 :logs
 docker compose logs --tail=100 -f
 goto :eof
@@ -186,7 +320,17 @@ goto :eof
 docker compose logs -f api
 goto :eof
 
-:: ── DNS / URLs ────────────────────────────────────────────────────────────────
+:logs_ollama
+docker compose logs -f ollama
+goto :eof
+
+:logs_whisper
+docker compose logs -f whisper
+goto :eof
+
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: DNS / URLS
+:: ═══════════════════════════════════════════════════════════════════════════════
 :dns
 echo.
 echo ══════════════════════════════════════════════
@@ -199,7 +343,8 @@ echo   Swagger docs   :  http://localhost:3000/api/docs
 echo   Mongo Express  :  http://localhost:8081
 echo   Qdrant UI      :  http://localhost:6333/dashboard
 echo   MinIO console  :  http://localhost:9002
-echo   MinIO API (S3) :  http://localhost:9001
+echo   Ollama API     :  http://localhost:11434
+echo   Whisper API    :  http://localhost:8000
 echo.
 echo ══════════════════════════════════════════════
 echo   Config Flutter (meme WiFi)
@@ -208,25 +353,22 @@ echo ═════════════════════════
 echo.
 echo   flutter run --dart-define=API_BASE_URL=http://%LOCAL_IP%:80
 echo.
-:: Afficher le domaine ngrok s'il est configuré
 set NGROK_DOMAIN_DNS=
 for /f "tokens=2 delims==" %%a in ('findstr "^NGROK_DOMAIN=" .env 2^>nul') do set NGROK_DOMAIN_DNS=%%a
 if not "%NGROK_DOMAIN_DNS%"=="" (
   echo   Tunnel ngrok : https://%NGROK_DOMAIN_DNS%
   echo   flutter run --dart-define=API_BASE_URL=https://%NGROK_DOMAIN_DNS%
   echo.
-) else (
-  echo   OU : collez l'URL Quick Tunnel dans Firebase Remote Config
-  echo        cle : api_base_url
-  echo.
 )
 goto :eof
 
-:: ── TUNNEL CLOUDFLARE ─────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: TUNNELS
+:: ═══════════════════════════════════════════════════════════════════════════════
 :tunnel
 echo.
-echo   Ctrl+C pour arreter.  URL aleatoire — change a chaque demarrage.
-echo   Pour une URL permanente : khidmeti.bat ngrok
+echo   Ctrl+C pour arreter. URL aleatoire — change a chaque demarrage.
+echo   Pour URL permanente : khidmeti.bat ngrok
 echo.
 where cloudflared >nul 2>&1
 if %errorlevel% neq 0 (
@@ -236,10 +378,6 @@ if %errorlevel% neq 0 (
 )
 cloudflared tunnel --url http://localhost:80
 goto :eof
-
-:: ══════════════════════════════════════════════════════════════════════════════
-:: TUNNEL NGROK — Domaine statique PERMANENT
-:: ══════════════════════════════════════════════════════════════════════════════
 
 :ngrok_install
 echo.
@@ -264,15 +402,10 @@ powershell -Command "Expand-Archive -Path '%TEMP%\ngrok.zip' -DestinationPath 'C
 echo.
 echo   ngrok extrait dans C:\ngrok\
 echo.
-echo   IMPORTANT : ajoutez C:\ngrok\ a votre variable PATH :
-echo   Panneau de configuration -^> Systeme -^> Variables d'environnement
-echo   OU ouvrez PowerShell en admin et tapez :
-echo   [System.Environment]::SetEnvironmentVariable('PATH', $env:PATH+';C:\ngrok', 'Machine')
-echo.
-echo   Etapes suivantes :
-echo   1. Compte gratuit (sans CB) : https://dashboard.ngrok.com/signup
-echo   2. Token         : https://dashboard.ngrok.com/get-started/your-authtoken
-echo   3. Domaine       : https://dashboard.ngrok.com/domains
+echo   Ajoutez C:\ngrok\ a votre variable PATH puis :
+echo   1. Compte : https://dashboard.ngrok.com/signup
+echo   2. Token  : https://dashboard.ngrok.com/get-started/your-authtoken
+echo   3. Domaine: https://dashboard.ngrok.com/domains
 echo   4. khidmeti.bat ngrok
 echo.
 goto :eof
@@ -285,82 +418,62 @@ echo ═════════════════════════
 echo.
 where ngrok >nul 2>&1
 if %errorlevel% neq 0 (
-  echo   ERREUR : ngrok introuvable.
-  echo   Lancez d'abord : khidmeti.bat ngrok-install
-  echo.
+  echo   ERREUR : ngrok introuvable — khidmeti.bat ngrok-install
   exit /b 1
 )
 
-:: ── Lire NGROK_AUTH_TOKEN depuis .env ────────────────────────────────────────
 set NGROK_TOKEN=
 for /f "tokens=2 delims==" %%a in ('findstr "^NGROK_AUTH_TOKEN=" .env 2^>nul') do set NGROK_TOKEN=%%a
 set NGROK_TOKEN=%NGROK_TOKEN: =%
-
 if "%NGROK_TOKEN%"=="" (
-  echo   Etape 1/2 — Auth Token ngrok
-  echo   Obtenez-le sur : https://dashboard.ngrok.com/get-started/your-authtoken
-  echo.
+  echo   Obtenez votre token : https://dashboard.ngrok.com/get-started/your-authtoken
   set /p NGROK_TOKEN="  Collez votre Auth Token : "
-  :: Sauvegarder dans .env
   findstr /v "^NGROK_AUTH_TOKEN=" .env > .env.tmp 2>nul
   echo NGROK_AUTH_TOKEN=!NGROK_TOKEN!>> .env.tmp
   move /y .env.tmp .env >nul
   echo   Token sauvegarde dans .env
   echo.
 )
-
-:: Configurer ngrok
 ngrok config add-authtoken %NGROK_TOKEN% >nul 2>&1
 
-:: ── Lire NGROK_DOMAIN depuis .env ────────────────────────────────────────────
 set NGROK_DOMAIN=
 for /f "tokens=2 delims==" %%a in ('findstr "^NGROK_DOMAIN=" .env 2^>nul') do set NGROK_DOMAIN=%%a
 set NGROK_DOMAIN=%NGROK_DOMAIN: =%
-
 if "%NGROK_DOMAIN%"=="" (
-  echo   Etape 2/2 — Domaine statique ngrok
-  echo   Reservez-en un sur : https://dashboard.ngrok.com/domains
-  echo   Exemple : khidmeti-oran.ngrok-free.app
-  echo.
+  echo   Reservez un domaine : https://dashboard.ngrok.com/domains
   set /p NGROK_DOMAIN="  Entrez votre domaine statique : "
-  :: Sauvegarder dans .env
   findstr /v "^NGROK_DOMAIN=" .env > .env.tmp 2>nul
   echo NGROK_DOMAIN=!NGROK_DOMAIN!>> .env.tmp
   move /y .env.tmp .env >nul
-  echo   Domaine sauvegarde dans .env (ne sera plus demande^)
+  echo   Domaine sauvegarde dans .env
   echo.
 )
 
-echo   Demarrage du tunnel...
-echo.
 echo   URL permanente : https://%NGROK_DOMAIN%
-echo.
 echo   flutter run --dart-define=API_BASE_URL=https://%NGROK_DOMAIN%
-echo.
-echo   -^> Copiez cette URL dans Firebase Remote Config (cle : api_base_url^)
-echo   -^> Ctrl+C pour arreter
+echo   Ctrl+C pour arreter
 echo.
 ngrok http --domain=%NGROK_DOMAIN% 80
 goto :eof
 
 :ngrok_reset
-:: Supprimer NGROK_AUTH_TOKEN et NGROK_DOMAIN du .env
 findstr /v "^NGROK_AUTH_TOKEN=" .env > .env.tmp 2>nul
 move /y .env.tmp .env >nul
 findstr /v "^NGROK_DOMAIN=" .env > .env.tmp 2>nul
 move /y .env.tmp .env >nul
-echo Config ngrok supprimee — relancez : khidmeti.bat ngrok
+echo Config ngrok supprimee.
 goto :eof
 
-:: ── FLUTTER RUN ───────────────────────────────────────────────────────────────
 :flutter_run
 echo.
-echo   Lancement Flutter avec API_BASE_URL=http://%LOCAL_IP%:80
+echo   Flutter avec API_BASE_URL=http://%LOCAL_IP%:80
 echo.
 flutter run --dart-define=API_BASE_URL=http://%LOCAL_IP%:80
 goto :eof
 
-:: ── SHELL ─────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: SHELLS / DEBUG
+:: ═══════════════════════════════════════════════════════════════════════════════
 :shell_api
 docker exec -it khidmeti-api /bin/sh
 goto :eof
@@ -371,29 +484,30 @@ for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_PASSWORD" .env') do set
 docker exec -it khidmeti-mongo mongosh -u "%MONGO_USER%" -p "%MONGO_PASS%" --authenticationDatabase admin khidmeti
 goto :eof
 
-:: ── TEST API ──────────────────────────────────────────────────────────────────
 :test_api
 echo.
 echo   [1] Health :
 curl -s http://localhost:3000/health
 echo.
-echo   [2] Swagger (code HTTP) :
+echo   [2] Swagger :
 curl -s -o nul -w "%%{http_code}" http://localhost:3000/api/docs
-echo.
-echo   Endpoints proteges : jeton Firebase Bearer requis.
-echo   Swagger UI : http://localhost:3000/api/docs
 echo.
 goto :eof
 
-:: ══════════════════════════════════════════════════════════════════════════════
-:: SCRIPTS — Migrations + Seeds
-:: ══════════════════════════════════════════════════════════════════════════════
-
-:scripts
+:test_ai
 echo.
-echo ══════════════════════════════════════════════
-echo   Scripts : migrations + seeds
-echo ══════════════════════════════════════════════
+echo   Test Ollama — extraction Darija...
+echo.
+curl -s http://localhost:11434/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"%OLLAMA_MODEL_VAL%\",\"messages\":[{\"role\":\"system\",\"content\":\"Reponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":2048,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}"
+echo.
+goto :eof
+
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: SCRIPTS
+:: ═══════════════════════════════════════════════════════════════════════════════
+:scripts
 call :scripts_migrations
 call :scripts_seeds
 goto :eof
@@ -404,33 +518,32 @@ echo ═════════════════════════
 echo   Migrations MongoDB
 echo ══════════════════════════════════════════════
 echo.
-for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_USER" .env 2^>nul') do set MIG_MONGO_USER=%%a
-for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_PASSWORD" .env 2^>nul') do set MIG_MONGO_PASS=%%a
-set MIG_COUNT=0
-set MIG_FAILED=0
+for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_USER" .env 2^>nul') do set MIG_USER=%%a
+for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_PASSWORD" .env 2^>nul') do set MIG_PASS=%%a
+set MIG_OK=0
+set MIG_FAIL=0
 if not exist "scripts\migrations\*.js" (
-  echo   Aucune migration trouvee dans scripts\migrations\
-  echo.
+  echo   Aucune migration trouvee.
   goto :migrations_done
 )
 for %%f in (scripts\migrations\*.js) do (
   echo   ^> %%~nxf
   docker exec -i khidmeti-mongo mongosh --quiet ^
-    -u "%MIG_MONGO_USER%" -p "%MIG_MONGO_PASS%" ^
+    -u "%MIG_USER%" -p "%MIG_PASS%" ^
     --authenticationDatabase admin khidmeti < "%%f"
   if !errorlevel! equ 0 (
-    echo     OK %%~nxf
-    set /a MIG_COUNT+=1
+    echo     OK
+    set /a MIG_OK+=1
   ) else (
-    echo     ECHEC %%~nxf
-    set /a MIG_FAILED+=1
+    echo     ECHEC
+    set /a MIG_FAIL+=1
   )
-  echo.
 )
 :migrations_done
-echo   Resultat : %MIG_COUNT% OK  ^|  %MIG_FAILED% echec(s)
 echo.
-if %MIG_FAILED% gtr 0 exit /b 1
+echo   Resultat : %MIG_OK% OK  ^|  %MIG_FAIL% echec(s)
+echo.
+if %MIG_FAIL% gtr 0 exit /b 1
 goto :eof
 
 :scripts_seeds
@@ -439,11 +552,10 @@ echo ═════════════════════════
 echo   Seeds TypeScript
 echo ══════════════════════════════════════════════
 echo.
-set SEED_COUNT=0
-set SEED_FAILED=0
+set SEED_OK=0
+set SEED_FAIL=0
 if not exist "apps\api\src\scripts\seeds\*.ts" (
-  echo   Aucun seed trouve dans apps\api\src\scripts\seeds\
-  echo.
+  echo   Aucun seed trouve.
   goto :seeds_done
 )
 for %%f in (apps\api\src\scripts\seeds\*.ts) do (
@@ -451,69 +563,49 @@ for %%f in (apps\api\src\scripts\seeds\*.ts) do (
   docker exec khidmeti-api ^
     npx ts-node --project tsconfig.json "src/scripts/seeds/%%~nxf" %ARGS%
   if !errorlevel! equ 0 (
-    echo     OK %%~nxf
-    set /a SEED_COUNT+=1
+    echo     OK
+    set /a SEED_OK+=1
   ) else (
-    echo     ECHEC %%~nxf
-    set /a SEED_FAILED+=1
+    echo     ECHEC
+    set /a SEED_FAIL+=1
   )
-  echo.
 )
 :seeds_done
-echo   Resultat : %SEED_COUNT% OK  ^|  %SEED_FAILED% echec(s)
 echo.
-if %SEED_FAILED% gtr 0 exit /b 1
+echo   Resultat : %SEED_OK% OK  ^|  %SEED_FAIL% echec(s)
+echo.
+if %SEED_FAIL% gtr 0 exit /b 1
 goto :eof
 
 :scripts_one
 echo.
 if exist "scripts\migrations\%SCRIPT_NAME%.js" (
-  echo   ^> Migration : %SCRIPT_NAME%.js
-  echo.
   for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_USER" .env 2^>nul') do set ONE_USER=%%a
   for /f "tokens=2 delims==" %%a in ('findstr "^MONGO_ROOT_PASSWORD" .env 2^>nul') do set ONE_PASS=%%a
+  echo   ^> Migration : %SCRIPT_NAME%.js
   docker exec -i khidmeti-mongo mongosh --quiet ^
     -u "%ONE_USER%" -p "%ONE_PASS%" ^
     --authenticationDatabase admin khidmeti < "scripts\migrations\%SCRIPT_NAME%.js"
-  if !errorlevel! equ 0 (
-    echo.
-    echo   OK %SCRIPT_NAME%.js
-  ) else (
-    echo.
-    echo   ECHEC %SCRIPT_NAME%.js
-    exit /b 1
-  )
-  echo.
+  if !errorlevel! equ 0 ( echo   OK ) else ( echo   ECHEC & exit /b 1 )
   goto :eof
 )
 if exist "apps\api\src\scripts\seeds\%SCRIPT_NAME%.ts" (
   echo   ^> Seed : %SCRIPT_NAME%.ts %ARGS%
-  echo.
   docker exec khidmeti-api ^
     npx ts-node --project tsconfig.json "src/scripts/seeds/%SCRIPT_NAME%.ts" %ARGS%
-  if !errorlevel! equ 0 (
-    echo.
-    echo   OK %SCRIPT_NAME%.ts
-  ) else (
-    echo.
-    echo   ECHEC %SCRIPT_NAME%.ts
-    exit /b 1
-  )
-  echo.
+  if !errorlevel! equ 0 ( echo   OK ) else ( echo   ECHEC & exit /b 1 )
   goto :eof
 )
 echo   ERREUR : Script '%SCRIPT_NAME%' introuvable.
-echo.
-echo   Cherche dans :
-echo     scripts\migrations\%SCRIPT_NAME%.js
-echo     apps\api\src\scripts\seeds\%SCRIPT_NAME%.ts
-echo.
 exit /b 1
 
-:: ── CLEAN ─────────────────────────────────────────────────────────────────────
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: CLEAN
+:: ═══════════════════════════════════════════════════════════════════════════════
 :clean
 echo.
-echo   ATTENTION : suppression de TOUTES les donnees Khidmeti.
+echo   ATTENTION : suppression de MongoDB, Redis, Qdrant, MinIO.
+echo   L'image Ollama+modele est CONSERVEE dans le cache Docker.
 set /p CONFIRM="  Taper YES pour confirmer : "
 if /i "%CONFIRM%"=="YES" (
   docker compose down -v --remove-orphans
@@ -521,7 +613,7 @@ if /i "%CONFIRM%"=="YES" (
   if exist "data\redis"   rmdir /s /q data\redis
   if exist "data\qdrant"  rmdir /s /q data\qdrant
   if exist "data\minio"   rmdir /s /q data\minio
-  echo Nettoyage termine.
+  echo Nettoyage termine. Image Ollama intacte.
 ) else (
   echo Annule.
 )

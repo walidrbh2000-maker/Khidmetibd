@@ -1,60 +1,50 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — docker-compose.gpu.yml
 #
-# Override pour machine GPU NVIDIA (futur upgrade).
-# À utiliser EN PLUS du docker-compose.yml principal :
+# Override GPU NVIDIA — à utiliser EN PLUS du docker-compose.yml principal :
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #   make start-gpu
 #
 # ── Prérequis ────────────────────────────────────────────────────────────────
 #   NVIDIA drivers installés sur l'hôte
-#   NVIDIA Container Toolkit : https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
-#   sudo apt install nvidia-container-toolkit
-#   sudo systemctl restart docker
+#   NVIDIA Container Toolkit :
+#     sudo apt install nvidia-container-toolkit
+#     sudo systemctl restart docker
 #
 # ── Modèles recommandés selon le GPU ────────────────────────────────────────
-#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  + whisper-small  (par défaut)
-#   12 GB VRAM (RTX 3060, 4070)    → gemma4:e4b  + whisper-medium
-#   16 GB VRAM (RTX 4080, 3090)    → gemma4:26b  + whisper-large-v3
-#   24 GB VRAM (RTX 3090, 4090)    → gemma4:31b  + whisper-large-v3
+#   8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  (défaut)
+#   8 GB VRAM                      → gemma4:e4b  (meilleure qualité)
+#   12 GB VRAM (RTX 3060, 4070)    → gemma4:26b
+#   16 GB VRAM (RTX 4080, 3090)    → gemma4:31b
 #
-# ── Variables .env à modifier pour GPU ──────────────────────────────────────
-#   OLLAMA_MODEL=gemma4:e2b          ← CPU 8 GB RAM (par défaut, inchangé)
-#   OLLAMA_MODEL=gemma4:e4b          ← GPU 8 GB VRAM
-#   OLLAMA_MODEL=gemma4:26b          ← GPU 12 GB VRAM
-#   WHISPER_MODEL=Systran/faster-whisper-large-v3  ← GPU
+# ── Changer de modèle GPU ───────────────────────────────────────────────────
+#   1. Modifier OLLAMA_MODEL dans .env
+#   2. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
+#   3. make ollama-rebuild
+#   4. make start-gpu
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
 
-  # ── Ollama avec accélération GPU ────────────────────────────────────────────
+  # ── Ollama GPU — même image baked, accélération NVIDIA ─────────────────────
   #
-  #  OLLAMA_KEEP_ALIVE=-1 :
-  #    Sur GPU, le modèle vit en VRAM — libérer la VRAM n'est utile que si
-  #    plusieurs modèles doivent coexister. Avec OLLAMA_MAX_LOADED_MODELS=1,
-  #    -1 est optimal : modèle toujours chaud, zéro cold start.
+  #  L'image contient déjà le modèle (baked at build time).
+  #  On ajoute uniquement les capacités GPU ici.
   #
-  #  OLLAMA_NUM_PARALLEL=4 :
-  #    GPU gère le parallélisme natif — augmenter vs CPU (1).
-  #
-  #  OLLAMA_KEEP_ALIVE passé à -1 pour rester cohérent avec docker-compose.yml :
-  #    Le modèle reste en VRAM indéfiniment — pas de coût de reload.
+  #  OLLAMA_NUM_PARALLEL=4 : GPU gère le parallélisme natif
+  #  OLLAMA_KEEP_ALIVE=-1  : modèle permanent en VRAM
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:latest
     environment:
+      OLLAMA_MODELS:              /ollama/models
       OLLAMA_NUM_PARALLEL:        "4"
       OLLAMA_MAX_LOADED_MODELS:   "1"
-      # Permanent en VRAM — aucun cold start, cohérent avec le mode CPU
       OLLAMA_KEEP_ALIVE:          "-1"
-      # Laisser Ollama utiliser tous les cores CPU pour la pré-tokenisation
       OLLAMA_NUM_THREAD:          "0"
       NVIDIA_VISIBLE_DEVICES:     "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-    # Supprime la limite mémoire CPU (le modèle vit en VRAM)
     mem_limit: null
-    # Accès GPU
     deploy:
       resources:
         reservations:
@@ -63,40 +53,7 @@ services:
               count:        all
               capabilities: [gpu]
 
-  # ── Ollama Init GPU — pull le modèle GPU ────────────────────────────────────
-  #
-  #  Override du service cpu pour tirer un modèle plus grand si besoin.
-  #  OLLAMA_MODEL doit être mis à jour dans .env selon le GPU disponible :
-  #    OLLAMA_MODEL=gemma4:e2b  (8 GB RAM CPU / 8 GB VRAM GPU — défaut)
-  #    OLLAMA_MODEL=gemma4:e4b  (8 GB VRAM GPU — meilleure qualité)
-  #    OLLAMA_MODEL=gemma4:26b  (12 GB VRAM GPU)
-  #    OLLAMA_MODEL=gemma4:31b  (16+ GB VRAM GPU)
-  # ─────────────────────────────────────────────────────────────────────────────
-  ollama-init:
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-
-  # ── Ollama Warmup GPU — préchargement en VRAM ──────────────────────────────
-  #
-  #  Identique au mode CPU — charge le modèle en VRAM avant les vraies requêtes.
-  #  Sur GPU, le warmup est encore plus rapide (~1-3s vs ~5-10s sur CPU).
-  # ─────────────────────────────────────────────────────────────────────────────
-  ollama-warmup:
-    environment:
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
-
-  # ── faster-whisper avec accélération CUDA ──────────────────────────────────
-  #
-  #  Image CUDA (vs latest-cpu en mode standard).
-  #  float16 (fp16) vs int8 : meilleure précision, même vitesse sur GPU.
-  #
-  #  Modèles GPU recommandés :
-  #    Systran/faster-whisper-medium       → bon équilibre
-  #    Systran/faster-whisper-large-v3     → meilleure qualité (Darija/Arabe)
-  #
-  #  Vitesse large-v3 sur RTX 3070 : ~0.5s pour 10s d'audio
-  #  (vs ~4s sur CPU avec small/int8)
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── faster-whisper CUDA ────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cuda
     environment:
@@ -104,7 +61,6 @@ services:
       WHISPER__INFERENCE_DEVICE: "cuda"
       WHISPER__COMPUTE_TYPE:     "float16"
       WHISPER__LANGUAGE:         "auto"
-      # beam_size=5 sur GPU : meilleure précision sans coût notable
       WHISPER__BEAM_SIZE:        "5"
     mem_limit: null
     deploy:
@@ -115,13 +71,13 @@ services:
               count:        1
               capabilities: [gpu]
 
-  # ── API — limites mémoire levées sur machine GPU (typiquement 16-32 GB RAM) ─
+  # ── Limites levées sur machine GPU ────────────────────────────────────────
   api:
     mem_limit: null
 
-  # ── Services infrastructure — limites levées ─────────────────────────────────
   mongo:
     mem_limit: null
+
   redis:
     mem_limit: null
     command: >
@@ -129,11 +85,15 @@ services:
       --requirepass ${REDIS_PASSWORD}
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
+
   qdrant:
     mem_limit: null
+
   minio:
     mem_limit: null
+
   mongo-express:
     mem_limit: null
+
   nginx:
     mem_limit: null
