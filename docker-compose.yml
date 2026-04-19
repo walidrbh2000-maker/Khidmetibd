@@ -15,9 +15,17 @@ name: khidmeti
 #     → make start                   (zéro téléchargement, modèle dans l'image)
 #
 #   Changer de modèle :
-#     1. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
-#     2. docker compose build --no-cache ollama
-#     3. make start
+#     1. Modifier OLLAMA_MODEL et OLLAMA_TAG dans .env
+#        ex: OLLAMA_MODEL=gemma4:e4b → OLLAMA_TAG=gemma4-e4b
+#     2. Modifier ARG OLLAMA_MODEL dans docker/ollama/Dockerfile
+#     3. docker compose build --no-cache ollama
+#     4. make start
+#
+# ⚠️  POURQUOI OLLAMA_TAG et non OLLAMA_MODEL pour le nom de l'image ?
+#   Docker interdit ":" dans les tags d'image (format invalide).
+#   OLLAMA_MODEL=gemma4:e2b → image invalide : khidmeti-ollama:gemma4:e2b ❌
+#   OLLAMA_TAG=gemma4-e2b   → image valide   : khidmeti-ollama:gemma4-e2b ✅
+#   Les deux variables doivent rester synchronisées dans .env.
 #
 # Budget mémoire 8 GB RAM :
 #   Ollama + gemma4:e2b chargé  ~3.0 GB  (permanent avec KEEP_ALIVE=-1)
@@ -79,6 +87,9 @@ services:
   #  Le modèle est baked dans l'image Docker (docker/ollama/Dockerfile).
   #  Aucun volume ne couvre /ollama/models pour éviter de cacher les modèles.
   #
+  #  ⚠️  OLLAMA_TAG (ex: gemma4-e2b) ≠ OLLAMA_MODEL (ex: gemma4:e2b)
+  #      Docker interdit ":" dans les tags → utiliser OLLAMA_TAG avec "-"
+  #
   #  Paramètres critiques pour 8 GB RAM :
   #    OLLAMA_MODELS=/ollama/models   → chemin des modèles baked dans l'image
   #    OLLAMA_NUM_PARALLEL=1          → 1 requête à la fois (évite OOM)
@@ -92,7 +103,7 @@ services:
       dockerfile: Dockerfile
       args:
         OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
-    image: khidmeti-ollama:${OLLAMA_MODEL:-gemma4-e2b}
+    image: khidmeti-ollama:${OLLAMA_TAG:-gemma4-e2b}
     container_name: khidmeti-ollama
     restart: unless-stopped
     # AUCUN volume sur /ollama/models — ne pas cacher les modèles baked
