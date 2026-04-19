@@ -14,6 +14,14 @@
 //   Ils sont visibles dans MongoDB et dans l'API REST,
 //   mais ne peuvent PAS se connecter via Firebase Auth.
 //   → Parfait pour tester : browsing worker, cartes, recherche IA.
+//
+// FIX — geographic_cells vides :
+//   Le seed précédent créait les workers avec un cellId mais n'insérait pas
+//   les documents GeographicCell correspondants. L'endpoint
+//   GET /location/cells/:cellId/workers fonctionnait (requête sur users)
+//   mais GET /location/cells/:cellId/adjacent retournait une erreur car
+//   la collection geographic_cells était vide.
+//   Ce script crée désormais toutes les GeographicCell nécessaires.
 // ══════════════════════════════════════════════════════════════════════════════
 
 import mongoose from 'mongoose';
@@ -28,14 +36,14 @@ const WILAYA_CODE = 31;
 
 // ── Coordonnées de quartiers d'Oran pour avoir des workers répartis ───────────
 const ORAN_LOCATIONS = [
-  { name: 'Es Senia',      lat: 35.6481,  lng: -0.6030 },
-  { name: 'Bir El Djir',   lat: 35.7128,  lng: -0.5538 },
-  { name: 'Oran Centre',   lat: 35.6969,  lng: -0.6331 },
-  { name: 'Hay Yasmine',   lat: 35.6750,  lng: -0.6200 },
-  { name: 'Plateaux',      lat: 35.7050,  lng: -0.6500 },
-  { name: 'Gambetta',      lat: 35.7110,  lng: -0.6420 },
-  { name: 'Belgaid',       lat: 35.6600,  lng: -0.6700 },
-  { name: 'Sidi El Bachir', lat: 35.6850, lng: -0.6100 },
+  { name: 'Es Senia',       lat: 35.6481,  lng: -0.6030 },
+  { name: 'Bir El Djir',    lat: 35.7128,  lng: -0.5538 },
+  { name: 'Oran Centre',    lat: 35.6969,  lng: -0.6331 },
+  { name: 'Hay Yasmine',    lat: 35.6750,  lng: -0.6200 },
+  { name: 'Plateaux',       lat: 35.7050,  lng: -0.6500 },
+  { name: 'Gambetta',       lat: 35.7110,  lng: -0.6420 },
+  { name: 'Belgaid',        lat: 35.6600,  lng: -0.6700 },
+  { name: 'Sidi El Bachir', lat: 35.6850,  lng: -0.6100 },
 ];
 
 // ── Données des travailleurs de test ──────────────────────────────────────────
@@ -153,7 +161,7 @@ const TEST_WORKERS = [
   },
 ];
 
-// ── Mongoose Schema (minimal — identique à user.schema.ts) ────────────────────
+// ── Mongoose Schema : users (minimal — identique à user.schema.ts) ────────────
 const UserSchema = new mongoose.Schema(
   {
     _id:            { type: String, required: true },
@@ -182,9 +190,54 @@ const UserSchema = new mongoose.Schema(
   { collection: 'users', versionKey: false },
 );
 
+// ── Mongoose Schema : geographic_cells (identique à geographic-cell.schema.ts)
+// FIX: ajout de ce schéma pour créer les cellules manquantes.
+const GeoCellSchema = new mongoose.Schema(
+  {
+    _id:            { type: String, required: true },
+    wilayaCode:     { type: Number, required: true },
+    centerLat:      { type: Number, required: true },
+    centerLng:      { type: Number, required: true },
+    radius:         { type: Number, default: 5.0 },
+    adjacentCellIds:{ type: [String], default: [] },
+  },
+  { collection: 'geographic_cells', versionKey: false },
+);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Encode un geohash à précision 6 (identique à LocationService) */
+const CELL_PRECISION = 2;
+
+/** Construit le cellId (identique à LocationService.buildCellId) */
+function buildCellId(lat: number, lng: number, wilayaCode: number): string {
+  const rLat = +lat.toFixed(CELL_PRECISION);
+  const rLng = +lng.toFixed(CELL_PRECISION);
+  return `${wilayaCode}_${rLat.toFixed(CELL_PRECISION)}_${rLng.toFixed(CELL_PRECISION)}`;
+}
+
+/** Retourne les 8 cellIds adjacents (identique à LocationService.getAdjacentCellIds) */
+function getAdjacentCellIds(cellId: string): string[] {
+  const parts = cellId.split('_');
+  if (parts.length !== 3) return [];
+  const [wilayaStr, latStr, lngStr] = parts;
+  const wilayaCode = parseInt(wilayaStr, 10);
+  const lat  = parseFloat(latStr);
+  const lng  = parseFloat(lngStr);
+  const step = Math.pow(10, -CELL_PRECISION);
+
+  const ids: string[] = [];
+  for (let dLat = -1; dLat <= 1; dLat++) {
+    for (let dLng = -1; dLng <= 1; dLng++) {
+      if (dLat === 0 && dLng === 0) continue;
+      const adjLat = +(lat + dLat * step).toFixed(CELL_PRECISION);
+      const adjLng = +(lng + dLng * step).toFixed(CELL_PRECISION);
+      ids.push(`${wilayaCode}_${adjLat.toFixed(CELL_PRECISION)}_${adjLng.toFixed(CELL_PRECISION)}`);
+    }
+  }
+  return ids;
+}
+
+/** Encode un geohash à précision 6 (identique à LocationService.encodeGeoHash) */
 function encodeGeoHash(lat: number, lng: number, precision = 6): string {
   const BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
   let hash = '', isEven = true, bit = 0, ch = 0;
@@ -204,12 +257,6 @@ function encodeGeoHash(lat: number, lng: number, precision = 6): string {
   return hash;
 }
 
-/** Construit le cellId (identique à LocationService) */
-function buildCellId(lat: number, lng: number, wilayaCode: number): string {
-  const p = 2;
-  return `${wilayaCode}_${lat.toFixed(p)}_${lng.toFixed(p)}`;
-}
-
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -220,17 +267,25 @@ async function main() {
   console.log('══════════════════════════════════════════════\n');
 
   await mongoose.connect(MONGODB_URI);
-  console.log('✅ Connecté à MongoDB');
+  console.log('✅ Connecté à MongoDB\n');
 
-  const UserModel = mongoose.model('User', UserSchema);
+  const UserModel    = mongoose.model('User',            UserSchema);
+  const GeoCellModel = mongoose.model('GeographicCell',  GeoCellSchema);
 
+  // ── Nettoyage optionnel ─────────────────────────────────────────────────────
   if (shouldClear) {
-    const del = await UserModel.deleteMany({ _id: /^seed-worker-/ });
-    console.log(`🗑️  ${del.deletedCount} worker(s) seed supprimés\n`);
+    const delWorkers = await UserModel.deleteMany({ _id: /^seed-worker-/ });
+    const delCells   = await GeoCellModel.deleteMany({
+      _id: { $in: TEST_WORKERS.map(w => buildCellId(w.location.lat, w.location.lng, WILAYA_CODE)) },
+    });
+    console.log(`🗑️  ${delWorkers.deletedCount} worker(s) seed supprimés`);
+    console.log(`🗑️  ${delCells.deletedCount} cellule(s) seed supprimées\n`);
   }
 
-  let created = 0;
-  let skipped = 0;
+  // ── Seed des workers ────────────────────────────────────────────────────────
+  console.log('  Workers :');
+  let workerCreated = 0;
+  let workerSkipped = 0;
 
   for (const w of TEST_WORKERS) {
     const { lat, lng } = w.location;
@@ -238,7 +293,7 @@ async function main() {
     const geoHash = encodeGeoHash(lat, lng, 6);
 
     // Bayesian average identique à UsersService.applyRating()
-    const ratingSum = w.rating * w.jobs;
+    const ratingSum   = w.rating * w.jobs;
     const C = 3.5, m = 10;
     const bayesianAvg = (m * C + ratingSum) / (m + w.jobs);
 
@@ -256,20 +311,20 @@ async function main() {
       lastUpdated:    new Date(),
       lastCellUpdate: new Date(),
       profileImageUrl: null,
-      fcmToken:       null,
-      profession:     w.profession,
-      isOnline:       w.isOnline ?? true,
-      averageRating:  bayesianAvg,
-      ratingCount:    w.jobs,
+      fcmToken:        null,
+      profession:      w.profession,
+      isOnline:        w.isOnline ?? true,
+      averageRating:   bayesianAvg,
+      ratingCount:     w.jobs,
       ratingSum,
-      jobsCompleted:  w.jobs,
-      responseRate:   0.85,
-      lastActiveAt:   null,
+      jobsCompleted:   w.jobs,
+      responseRate:    0.85,
+      lastActiveAt:    null,
     };
 
     try {
       await UserModel.create(doc);
-      created++;
+      workerCreated++;
       console.log(
         `  ✅ ${w.name.padEnd(22)} | ${w.profession.padEnd(16)} ` +
         `| ${w.location.name.padEnd(15)} ` +
@@ -277,20 +332,78 @@ async function main() {
       );
     } catch (err: any) {
       if (err.code === 11000) {
-        skipped++;
-        console.log(`  ⏭️  ${w.name} déjà existant — ignoré (utilise ARGS=--clear pour re-seed)`);
+        workerSkipped++;
+        console.log(`  ⏭️  ${w.name} déjà existant — ignoré`);
       } else {
         throw err;
       }
     }
   }
 
+  // ── FIX: Seed des GeographicCell ───────────────────────────────────────────
+  // Collecte les cellIds uniques de tous les workers et les upsert.
+  // Sans ces documents, GET /location/cells/:cellId/adjacent échoue et
+  // les clients qui démarrent avec un cellId ne trouvent pas les workers voisins.
+  console.log('\n  Cellules géographiques :');
+  let cellCreated = 0;
+  let cellSkipped = 0;
+
+  // Utiliser un Map pour dédupliquer les cellIds (plusieurs workers peuvent
+  // partager la même cellule car buildCellId arrondit à 2 décimales).
+  const uniqueCells = new Map<string, { lat: number; lng: number }>();
+  for (const w of TEST_WORKERS) {
+    const cellId = buildCellId(w.location.lat, w.location.lng, WILAYA_CODE);
+    if (!uniqueCells.has(cellId)) {
+      uniqueCells.set(cellId, { lat: w.location.lat, lng: w.location.lng });
+    }
+  }
+
+  for (const [cellId, { lat, lng }] of uniqueCells) {
+    const adjacentCellIds = getAdjacentCellIds(cellId);
+
+    const cellDoc = {
+      wilayaCode:     WILAYA_CODE,
+      centerLat:      +lat.toFixed(CELL_PRECISION),
+      centerLng:      +lng.toFixed(CELL_PRECISION),
+      radius:         5.0,
+      adjacentCellIds,
+    };
+
+    try {
+      // findByIdAndUpdate + upsert = idempotent : crée si absent, no-op si présent.
+      const result = await GeoCellModel.findByIdAndUpdate(
+        cellId,
+        { $setOnInsert: cellDoc },
+        { upsert: true, new: false },
+      ).exec();
+
+      if (result === null) {
+        // null returned by findByIdAndUpdate when upsert creates a new doc
+        cellCreated++;
+        console.log(`  ✅ Cellule créée : ${cellId}`);
+      } else {
+        cellSkipped++;
+        console.log(`  ⏭️  Cellule déjà existante : ${cellId}`);
+      }
+    } catch (err: any) {
+      if (err.code === 11000) {
+        cellSkipped++;
+        console.log(`  ⏭️  Cellule déjà existante : ${cellId}`);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  // ── Résumé ─────────────────────────────────────────────────────────────────
   console.log('\n══════════════════════════════════════════════');
-  console.log(`  ✅ ${created} créé(s)  |  ⏭️  ${skipped} ignoré(s)`);
+  console.log(`  Workers  : ✅ ${workerCreated} créé(s)  |  ⏭️  ${workerSkipped} ignoré(s)`);
+  console.log(`  Cellules : ✅ ${cellCreated} créée(s)  |  ⏭️  ${cellSkipped} ignorée(s)`);
   console.log('══════════════════════════════════════════════');
-  console.log('\n  Test rapide :');
-  console.log(`  curl http://localhost:3000/workers?wilayaCode=31&isOnline=true`);
-  console.log(`  curl http://localhost:3000/workers?wilayaCode=31&profession=plumber\n`);
+  console.log('\n  Tests rapides :');
+  console.log('  curl http://localhost:3000/workers?wilayaCode=31&isOnline=true');
+  console.log('  curl http://localhost:3000/workers?wilayaCode=31&profession=plumber');
+  console.log('  curl http://localhost:3000/location/cells/31_35.65_-0.60/adjacent\n');
 
   await mongoose.disconnect();
 }
