@@ -34,26 +34,34 @@ name: khidmeti
 #              Fonctionnalités conservées : texte + image, 140+ langues, 128K ctx.
 #              Fonctionnalités perdues : audio (non utilisé — Whisper prend en charge).
 #
+# FIXES v5 :
+#
+#   ✅ API mem_limit : 512m → 1g
+#              NestJS + Socket.io + Firebase Admin + ts-node (seeds) consomment
+#              ~600-700 MB en développement. 512m était insuffisant et provoquait
+#              "FATAL ERROR: Ineffective mark-compacts near heap limit".
+#
+#   ✅ NODE_OPTIONS : --max-old-space-size=400 → --max-old-space-size=768
+#              Limite V8 old-space portée à 768 MB.
+#              Raison : docker exec ts-node (seeds) tourne dans le même
+#              container et hérite de NODE_OPTIONS. À 400 MB, le compilateur
+#              TypeScript est OOM-killed silencieusement → seed FAILED.
+#              768 MB laisse ~256 MB d'overhead V8 sous la mem_limit de 1g.
+#
 # BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) :
 #   Ollama + gemma3:4b    ~4.0 GB  (modèle 3.3 GB + runtime 0.7 GB)
 #   faster-whisper-small  ~0.7 GB
-#   NestJS API            ~0.5 GB
+#   NestJS API            ~0.8 GB  (↑ depuis 0.5 GB)
 #   MongoDB               ~0.4 GB
 #   Redis                 ~0.2 GB
 #   Qdrant                ~0.2 GB
 #   MinIO                 ~0.5 GB
 #   nginx + mongo-express ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total      ~6.8 GB
+#   Conteneurs total      ~7.1 GB
 #   OS + Docker daemon    ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                 ~8.3 GB  ✅ (marge 7.7 GB sur 16 GB)
-#
-# BUDGET DISQUE 32 GB (Codespace) :
-#   Docker images         ~20-24 GB
-#   gemma3:4b             ~3.3 GB
-#   ─────────────────────────────
-#   TOTAL                 ~23-27 GB  ✅ (marge 5-9 GB sur 32 GB)
+#   TOTAL                 ~8.6 GB  ✅ (marge 7.4 GB sur 16 GB)
 #
 # WORKFLOW :
 #   1ère fois      → make start  (pull image Ollama latest + modèle gemma3:4b)
@@ -77,6 +85,23 @@ volumes:
 services:
 
   # ── NestJS API ──────────────────────────────────────────────────────────────
+  #
+  # FIX v5 :
+  #   mem_limit : 512m → 1g
+  #   NODE_OPTIONS : --max-old-space-size=400 → --max-old-space-size=768
+  #
+  #   POURQUOI 768 MB pour V8 :
+  #     V8 réserve de l'espace heap au-delà du old-space (code space, map space,
+  #     large object space, etc.). Une règle empirique : laisser ~25% d'overhead
+  #     entre max-old-space-size et mem_limit.
+  #     1024 MB * 0.75 = 768 MB → overhead 256 MB → pas d'OOM container.
+  #
+  #   POURQUOI ts-node seeds échouaient :
+  #     `docker exec khidmeti-api npx ts-node ...` crée un nouveau processus Node
+  #     dans le même container. Il hérite de NODE_OPTIONS du container.
+  #     À 400 MB, le compilateur TypeScript (tsc en mémoire) dépasse la limite
+  #     et est tué silencieusement → exit code 1 → "seed FAILED".
+  # ─────────────────────────────────────────────────────────────────────────────
   api:
     build:
       context:    ./apps/api
@@ -88,8 +113,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV:    development
-      NODE_OPTIONS: "--max-old-space-size=400"
+      NODE_ENV:     development
+      NODE_OPTIONS: "--max-old-space-size=768"
     ports:
       - '3000:3000'
     volumes:
@@ -103,8 +128,8 @@ services:
       whisper: { condition: service_started  }
     networks:
       - khidmeti-network
-    mem_limit:       512m
-    mem_reservation: 128m
+    mem_limit:       1g
+    mem_reservation: 256m
     logging:
       driver: json-file
       options:

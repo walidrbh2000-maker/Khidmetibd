@@ -106,8 +106,9 @@ services:
     mem_reservation: null
     environment:
       NODE_ENV: development
-      # GPU machine : plus de RAM disponible → heap V8 plus généreux
-      NODE_OPTIONS: "--max-old-space-size=512"
+      # FIX v5 : 512 → 768 MB — cohérence avec docker-compose.yml CPU
+      # Sur machine GPU la RAM est abondante, mais 768 reste raisonnable.
+      NODE_OPTIONS: "--max-old-space-size=768"
 
   mongo:
     mem_limit: null
