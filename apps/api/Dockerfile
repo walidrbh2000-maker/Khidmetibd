@@ -14,6 +14,13 @@
 #   Le modèle gemma4 réside dans le volume `khidmeti-ollama-data`,
 #   indépendant de ce build → `make rebuild` ne retélécharge jamais le modèle.
 #
+# FIX NODE_OPTIONS :
+#   --max-old-space-size=400 → --max-old-space-size=768
+#   Raison : 400 MB causait un OOM crash du process NestJS en développement
+#   (FATAL ERROR: Ineffective mark-compacts near heap limit) et tuait
+#   silencieusement les `docker exec ts-node` des seeds (exit code 1).
+#   768 MB = mem_limit(1g) * 0.75 → overhead V8 de 256 MB garanti.
+#
 # UTILISATION :
 #   Development  → docker compose up (target: development, volumes montés)
 #   Production   → docker compose -f docker-compose.prod.yml up (target: production)
@@ -85,8 +92,11 @@ RUN npm run build
 FROM deps AS development
 
 ENV NODE_ENV=development
-# V8 heap limité à 400 MB (conteneur limité à 512 MB dans docker-compose)
-ENV NODE_OPTIONS="--max-old-space-size=400"
+# FIX v5 : 400 → 768 MB
+#   400 MB causait un OOM du process NestJS en dev et tuait silencieusement
+#   les `docker exec ts-node` lancés par `make scripts-seeds`.
+#   768 MB = mem_limit(1g) * 0.75 — laisse 256 MB d'overhead V8.
+ENV NODE_OPTIONS="--max-old-space-size=768"
 
 # Copier les sources pour le cas où le volume n'est pas monté
 COPY --chown=node:node . .
@@ -116,7 +126,8 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV NODE_OPTIONS="--max-old-space-size=400"
+# FIX v5 : 400 → 768 MB (cohérence avec le stage development)
+ENV NODE_OPTIONS="--max-old-space-size=768"
 
 # Mettre à jour les paquets Alpine (correctifs CVE) au moment du build
 # rm -rf /var/cache/apk/* → réduit la taille de l'image
