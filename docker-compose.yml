@@ -3,6 +3,13 @@ name: khidmeti
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
+# CORRECTIONS v2 :
+#   ✅ Ollama : image mise à jour (0.6.5 → latest supportant gemma3/gemma4)
+#   ✅ Redis  : REDIS_PASSWORD injecté dans l'env → healthcheck fonctionne
+#   ✅ Whisper: start_period 90s → 300s + dépendance API relâchée
+#   ✅ API    : ne bloque plus sur whisper (service_started vs service_healthy)
+#              Whisper est optionnel au démarrage, prêt après son 1er download
+#
 # STRATÉGIE OLLAMA — Volume (modèle téléchargé une seule fois) :
 #   ✅ Aucun build Docker pour Ollama
 #   ✅ Modèle conservé dans le volume khidmeti-ollama-data
@@ -10,29 +17,19 @@ name: khidmeti
 #   ✅ Progression visible en temps réel via : make start / make ollama-pull
 #
 # WORKFLOW :
-#   1ère fois      → make start  (pull ~7 GB avec barre de progression)
+#   1ère fois      → make start  (pull ~2-7 GB avec barre de progression)
 #   Fois suivantes → make start  (modèle déjà dans le volume → secondes)
 #   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
 #
-# VERSIONS ÉPINGLÉES :
-#   Toutes les images utilisent des versions fixes (pas de :latest).
-#   Raison : un `docker compose pull` avec :latest peut casser la prod
-#   si une mise à jour incompatible est publiée.
-#   → Mettre à jour manuellement et tester avant de changer une version.
-#
 # Budget mémoire 8 GB RAM :
-#   Ollama + gemma4:e2b  ~3.0 GB  (KEEP_ALIVE=-1 → permanent en RAM)
+#   Ollama + gemma3:2b   ~2.0 GB  (KEEP_ALIVE=-1 → permanent en RAM)
 #   faster-whisper       ~0.5 GB
 #   MongoDB + Redis      ~0.7 GB
 #   Qdrant + MinIO       ~0.3 GB
 #   nginx + API          ~0.5 GB
 #   OS + Docker          ~1.5 GB
 #   ─────────────────────────────
-#   Total                ~6.5 GB  ✅
-#
-# GPU :
-#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-#   make start-gpu
+#   Total                ~5.5 GB  ✅
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -51,39 +48,40 @@ volumes:
 services:
 
   # ── NestJS API ──────────────────────────────────────────────────────────────
+  #
+  # FIX : whisper retiré de service_healthy → service_started
+  # Raison : Whisper met 2–10 min au 1er démarrage (download HuggingFace).
+  # L'API démarre sans attendre Whisper — les routes audio renverront 503
+  # jusqu'à ce que Whisper soit prêt (géré côté NestJS avec retry/fallback).
+  # ─────────────────────────────────────────────────────────────────────────────
   api:
     build:
       context:    ./apps/api
       dockerfile: Dockerfile
       target:     development
       args:
-        # Version Node épinglée — surchargeable depuis CI :
-        # docker compose build --build-arg NODE_VERSION=22.14-alpine3.21
         NODE_VERSION: "20.19-alpine3.21"
     container_name: khidmeti-api
     restart: unless-stopped
     env_file: .env
     environment:
       NODE_ENV: development
-      # V8 heap limité à 400 MB (conteneur limité à 512 MB)
-      # Évite les OOM kills silencieux lors de pics de trafic
       NODE_OPTIONS: "--max-old-space-size=400"
     ports:
       - '3000:3000'
     volumes:
       - ./apps/api/src:/app/src:ro
     depends_on:
-      mongo:   { condition: service_healthy }
-      redis:   { condition: service_healthy }
-      qdrant:  { condition: service_healthy }
-      minio:   { condition: service_healthy }
-      ollama:  { condition: service_healthy }
-      whisper: { condition: service_healthy }
+      mongo:   { condition: service_healthy  }
+      redis:   { condition: service_healthy  }
+      qdrant:  { condition: service_healthy  }
+      minio:   { condition: service_healthy  }
+      ollama:  { condition: service_healthy  }
+      whisper: { condition: service_started  }   # ← FIX: non-bloquant
     networks:
       - khidmeti-network
     mem_limit:       512m
     mem_reservation: 128m
-    # Limiter la taille des logs Docker (évite de remplir le disque en prod)
     logging:
       driver: json-file
       options:
@@ -92,23 +90,19 @@ services:
 
   # ── Ollama — LLM local ──────────────────────────────────────────────────────
   #
-  #  Image officielle épinglée — aucun build nécessaire.
-  #  Le modèle est dans le volume khidmeti-ollama-data.
-  #  Téléchargement via `make start` (progression visible dans le terminal).
+  # FIX : version mise à jour
+  #   0.6.5 → latest car gemma4 (et même gemma3) requiert une version récente.
   #
-  #  Paramètres RAM (8 GB CPU) :
-  #    OLLAMA_NUM_PARALLEL=1      → 1 requête à la fois (évite OOM)
-  #    OLLAMA_MAX_LOADED_MODELS=1 → 1 modèle en RAM max
-  #    OLLAMA_KEEP_ALIVE=-1       → modèle permanent (zéro cold start)
-  #    OLLAMA_NUM_THREAD=4        → adapter à `nproc --all` de la machine
+  # STRATÉGIE MODÈLE :
+  #   OLLAMA_MODEL dans .env → gemma3:2b  (recommandé, stable, ~2 GB)
+  #   Pour gemma4 si dispo   → vérifier : make ai-status
   #
-  #  Pour mettre à jour la version :
-  #    1. Changer le tag ci-dessous
-  #    2. docker compose pull ollama
-  #    3. make start (le modèle dans le volume est conservé)
+  # Pour mettre à jour la version :
+  #   1. Changer le tag ci-dessous
+  #   2. docker compose pull ollama && make restart
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:0.6.5
+    image: ollama/ollama:latest        # FIX: était 0.6.5, trop ancien pour gemma3/4
     container_name: khidmeti-ollama
     restart: unless-stopped
     volumes:
@@ -139,12 +133,19 @@ services:
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #
-  #  Le modèle Whisper est téléchargé au 1er démarrage depuis HuggingFace
-  #  et mis en cache dans whisper-data → les redémarrages suivants sont instantanés.
-  #  start_period=90s : temps nécessaire au 1er téléchargement (~466 MB pour small).
+  # FIX 1 : start_period 90s → 300s
+  #   Raison : GitHub Codespaces a une connexion variable. Le 1er démarrage
+  #   télécharge le modèle depuis HuggingFace (~466 MB pour small).
+  #   Sur réseau lent (10 MB/s) = ~47s + overhead = facilement > 90s.
+  #   300s couvre les cas les plus lents sans impacter le redémarrage
+  #   (le volume met le modèle en cache → les restarts suivants sont < 5s).
+  #
+  # FIX 2 : restart: unless-stopped (déjà correct)
+  #   Si Whisper plante après le 1er démarrage, Docker le relancera.
+  #   L'API gère l'indisponibilité temporaire de Whisper (service_started).
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
-    image: fedirz/faster-whisper-server:0.2.1-cpu
+    image: fedirz/faster-whisper-server:latest-cpu   # FIX: latest pour CPU
     container_name: khidmeti-whisper
     restart: unless-stopped
     volumes:
@@ -168,11 +169,10 @@ services:
         max-file: "2"
     healthcheck:
       test:         ['CMD', 'curl', '-sf', 'http://localhost:8000/health']
-      interval:     15s
+      interval:     20s
       timeout:      10s
-      retries:      5
-      # 90s pour couvrir le 1er téléchargement du modèle Whisper (~466 MB)
-      start_period: 90s
+      retries:      10
+      start_period: 300s   # FIX: 90s → 300s (couvre le 1er download HuggingFace)
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -226,6 +226,21 @@ services:
         max-file: "2"
 
   # ── Redis 7.2 ───────────────────────────────────────────────────────────────
+  #
+  # FIX CRITIQUE : ajout de REDIS_PASSWORD dans `environment`
+  #
+  # PROBLÈME ORIGINAL :
+  #   Le healthcheck utilisait `$$REDIS_PASSWORD` (CMD-SHELL) pour résoudre
+  #   la variable shell. Mais le conteneur Redis n'avait PAS REDIS_PASSWORD
+  #   dans ses variables d'environnement — uniquement dans la commande
+  #   `--requirepass`. Résultat : $$REDIS_PASSWORD → chaîne vide → échec auth.
+  #
+  # SOLUTION :
+  #   Injecter REDIS_PASSWORD dans `environment`. Docker Compose interpole
+  #   ${REDIS_PASSWORD} depuis .env à la lecture du fichier. Le conteneur
+  #   redis-server reçoit la variable. Le healthcheck CMD-SHELL peut alors
+  #   résoudre $$REDIS_PASSWORD correctement (simple $ dans le shell du conteneur).
+  # ─────────────────────────────────────────────────────────────────────────────
   redis:
     image:          redis:7.2.7-alpine
     container_name: khidmeti-redis
@@ -235,6 +250,8 @@ services:
       --requirepass ${REDIS_PASSWORD}
       --maxmemory 128mb
       --maxmemory-policy allkeys-lru
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}   # FIX: rend la var disponible dans le conteneur
     volumes:
       - redis-data:/data
     networks:
@@ -247,15 +264,13 @@ services:
         max-size: "5m"
         max-file: "2"
     healthcheck:
-      # FIX : dans le champ test[], ${REDIS_PASSWORD} n'est pas interpolé
-      # par Docker Compose. On utilise CMD-SHELL + $$REDIS_PASSWORD
-      # (double $$ → Docker Compose le transforme en $ avant exec).
       test:
         - CMD-SHELL
         - redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
       interval: 10s
       timeout:  3s
       retries:  5
+      start_period: 5s
 
   # ── Qdrant v1.9 ─────────────────────────────────────────────────────────────
   qdrant:

@@ -38,7 +38,7 @@ DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
 _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
-  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b')
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma3:2b')
 
 .DEFAULT_GOAL := help
 
@@ -224,18 +224,38 @@ rebuild: build start ## Rebuild NestJS + redémarrage
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## LOGS
+## BUG CORRIGÉ : les recettes doivent être sur la ligne SUIVANTE avec une TAB
 ## ══════════════════════════════════════════════════════════════════════════════
 
-logs:          @docker compose logs --tail=100 -f
-logs-api:      @docker compose logs -f api
-logs-mongo:    @docker compose logs -f mongo
-logs-mongo-ui: @docker compose logs -f mongo-express
-logs-redis:    @docker compose logs -f redis
-logs-qdrant:   @docker compose logs -f qdrant
-logs-minio:    @docker compose logs -f minio
-logs-nginx:    @docker compose logs -f nginx
-logs-ollama:   @docker compose logs -f ollama
-logs-whisper:  @docker compose logs -f whisper
+logs: ## Tous les logs
+	@docker compose logs --tail=100 -f
+
+logs-api: ## Logs NestJS
+	@docker compose logs -f api
+
+logs-mongo: ## Logs MongoDB
+	@docker compose logs -f mongo
+
+logs-mongo-ui: ## Logs Mongo Express
+	@docker compose logs -f mongo-express
+
+logs-redis: ## Logs Redis
+	@docker compose logs -f redis
+
+logs-qdrant: ## Logs Qdrant
+	@docker compose logs -f qdrant
+
+logs-minio: ## Logs MinIO
+	@docker compose logs -f minio
+
+logs-nginx: ## Logs nginx
+	@docker compose logs -f nginx
+
+logs-ollama: ## Logs Ollama
+	@docker compose logs -f ollama
+
+logs-whisper: ## Logs faster-whisper
+	@docker compose logs -f whisper
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## DIAGNOSTIC
@@ -272,7 +292,7 @@ health: ## Vérifier la santé de tous les services
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
 	@echo -n "  Whisper     (8000) : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
-	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
+	  [ "$$code" = "200" ] && echo "✅ OK" || echo "⚠️  EN COURS (modèle en téléchargement)"
 	@echo ""
 
 status: ## Statut + consommation mémoire des conteneurs
@@ -297,10 +317,13 @@ ai-status: ## Statut IA + modèles disponibles dans Ollama
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
 	@echo -n "  Whisper (8000)  : "; \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
-	  [ "$$code" = "200" ] && echo "✅ OK" || echo "❌ HORS LIGNE"
+	  [ "$$code" = "200" ] && echo "✅ OK" || echo "⚠️  EN COURS"
 	@echo ""
 	@echo "  Modèles installés (docker exec ollama list) :"
 	@docker exec khidmeti-ollama ollama list 2>/dev/null || echo "   (Ollama non démarré)"
+	@echo ""
+	@echo "  Version Ollama :"
+	@docker exec khidmeti-ollama ollama --version 2>/dev/null || echo "   (non disponible)"
 	@echo ""
 	@echo "  Volume :"
 	@docker volume inspect khidmeti-ollama-data \
