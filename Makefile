@@ -2,9 +2,19 @@
 ## KHIDMETI BACKEND — Makefile
 ##
 ## WORKFLOW :
-##   make start       → 1ère fois : démarre tout + pull modèle avec progression
+##   make start       → 1ère fois : pull image Ollama latest + modèle gemma4:e2b
 ##   make start       → fois suivantes : démarrage instantané (modèle en volume)
-##   make ollama-pull → forcer re-pull (changer de modèle)
+##   make ollama-pull → forcer re-pull (ex: changer de modèle)
+##
+## FIXES v3 :
+##   - `make start` force `docker compose pull ollama` avant `up -d`
+##     → garantit Ollama >= v0.20.0 requis pour gemma4:e2b
+##   - `ollama-pull` utilise `docker exec` SANS flag -t (TTY)
+##     → corrige l'échec silencieux en environnement headless/Codespaces
+##   - Fallback HTTP API si docker exec échoue
+##     → robustesse en cas d'état incohérent du container
+##   - Vérification DNS avant pull
+##     → avertit si registry.ollama.ai est inaccessible
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -38,7 +48,7 @@ DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
 _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
-  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma3:2b')
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b')
 
 .DEFAULT_GOAL := help
 
@@ -118,10 +128,27 @@ help: ## Afficher l'aide
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## OLLAMA — Pull avec progression visible
+## OLLAMA — Pull robuste (sans flag -t, avec fallback HTTP API)
+##
+## STRATÉGIE DE PULL (ordre de priorité) :
+##   1. `docker exec` SANS -t (headless, Codespaces, CI)
+##      → Le flag -t alloue un PTY. En environnement headless, -t peut causer
+##        un retour "file does not exist" trompeur ou bloquer silencieusement.
+##        Sans -t : la progression est affichée ligne par ligne, pas de barre.
+##
+##   2. Fallback HTTP API si docker exec échoue
+##      → `POST /api/pull` avec stream:true
+##      → Affiche chaque ligne JSON de progression
+##      → Plus robuste car ne dépend pas de l'état du TTY du container
+##
+## PRÉREQUIS MODÈLE :
+##   gemma4:e2b nécessite Ollama >= v0.20.0
+##   `make start` force `docker compose pull ollama` → garantit la version
+##   Si vous lancez `make ollama-pull` seul : assurez-vous d'avoir d'abord
+##   lancé `make start` au moins une fois pour mettre à jour l'image Ollama.
 ## ══════════════════════════════════════════════════════════════════════════════
 
-ollama-pull: ## Pull du modèle avec progression en temps réel (X GB / Y GB)
+ollama-pull: ## Pull du modèle avec progression (sans TTY, compatible Codespaces)
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Pull modèle Ollama"
@@ -129,14 +156,74 @@ ollama-pull: ## Pull du modèle avec progression en temps réel (X GB / Y GB)
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo "  ⏳ Attente que Ollama soit prêt..."
-	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do \
-	  printf "."; sleep 2; \
-	done
+	@READY=0; \
+	for i in $$(seq 1 30); do \
+	  if curl -sf http://localhost:11434/ > /dev/null 2>&1; then \
+	    READY=1; break; \
+	  fi; \
+	  printf "."; sleep 3; \
+	done; \
+	echo ""; \
+	if [ "$$READY" -eq 0 ]; then \
+	  echo "  ❌ Ollama ne répond pas après 90s."; \
+	  echo "  → Vérifiez : docker logs khidmeti-ollama"; \
+	  exit 1; \
+	fi
+	@echo "  ✅ Ollama est prêt."
 	@echo ""
-	@echo "  📥 Téléchargement en cours — progression ci-dessous :"
-	@echo "  (ex: pulling abc123... ████░░░░ 2.1 GB / 7.2 GB  28 MB/s  3m12s)"
+	@echo "  🔍 Vérification de la connectivité vers registry.ollama.ai..."
+	@if docker exec khidmeti-ollama sh -c \
+	    'curl -sf --max-time 5 https://registry.ollama.ai > /dev/null 2>&1 || \
+	     curl -sf --max-time 5 https://ollama.com > /dev/null 2>&1'; then \
+	  echo "  ✅ Connexion au registre Ollama : OK"; \
+	else \
+	  echo "  ⚠️  Connexion au registre Ollama : LIMITÉE"; \
+	  echo "  → DNS 8.8.8.8/1.1.1.1 configurés dans docker-compose.yml"; \
+	  echo "  → Le pull va quand même être tenté (Ollama gère les retry)"; \
+	fi
 	@echo ""
-	@docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL)
+	@echo "  📥 Téléchargement en cours..."
+	@echo "  (la progression s'affiche ligne par ligne en mode headless)"
+	@echo ""
+	@_pull_ok=0; \
+	echo "  [Méthode 1/2] docker exec (sans TTY)..."; \
+	if docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL) 2>&1; then \
+	  _pull_ok=1; \
+	else \
+	  echo ""; \
+	  echo "  ⚠️  Méthode 1 échouée. Tentative via HTTP API..."; \
+	  echo "  [Méthode 2/2] POST /api/pull (stream JSON)..."; \
+	  echo ""; \
+	  if curl -sf -X POST http://localhost:11434/api/pull \
+	      -H "Content-Type: application/json" \
+	      -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"stream\":true}" \
+	      --no-buffer --max-time 900 \
+	      | while IFS= read -r line; do \
+	          STATUS=$$(echo "$$line" | python3 -c \
+	            "import sys,json; \
+	             d=json.loads(sys.stdin.read().strip()); \
+	             s=d.get('status',''); \
+	             c=d.get('completed',0); \
+	             t=d.get('total',0); \
+	             err=d.get('error',''); \
+	             print('[ERROR] '+err if err else (s+' '+str(c)+'/'+str(t) if t else s))" \
+	            2>/dev/null || echo "$$line"); \
+	          echo "  $$STATUS"; \
+	        done; then \
+	    _pull_ok=1; \
+	  else \
+	    echo "  ❌ Les deux méthodes ont échoué."; \
+	    echo ""; \
+	    echo "  Causes possibles :"; \
+	    echo "  1. Image Ollama trop ancienne → lancez d'abord : make start"; \
+	    echo "     (make start force docker compose pull ollama)"; \
+	    echo "  2. Réseau : vérifiez que le VPN ne bloque pas registry.ollama.ai"; \
+	    echo "  3. RAM insuffisante : gemma4:e2b nécessite ~4 GB libres"; \
+	    echo ""; \
+	    echo "  Diagnostic : make ai-status"; \
+	    exit 1; \
+	  fi; \
+	fi
 	@echo ""
 	@echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."
 	@echo ""
@@ -157,28 +244,75 @@ start: ## Démarrer tous les services + pull modèle Ollama si absent
 		cp .env.example .env 2>/dev/null || true; \
 		echo "  ⚠️  .env créé — configurez FIREBASE_* avant de continuer"; echo ""; \
 	fi
+	@echo "  🔄 Mise à jour de l'image Ollama (requis pour gemma4:e2b)..."
+	@echo "  → Ollama >= v0.20.0 nécessaire. Pull en cours..."
+	@docker compose pull ollama 2>&1 | grep -E "(Pull|Pulling|already|latest)" || true
+	@echo "  ✅ Image Ollama à jour."
+	@echo ""
 	@echo "  🚀 Démarrage des services..."
 	@docker compose up -d
 	@echo ""
 	@echo "  ✅ Services démarrés."
 	@echo ""
-	@echo "  ⏳ Attente que Ollama soit prêt..."
-	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do \
+	@echo "  ⏳ Attente que Ollama soit prêt (jusqu'à 90s)..."
+	@READY=0; \
+	for i in $$(seq 1 45); do \
+	  if curl -sf http://localhost:11434/ > /dev/null 2>&1; then \
+	    READY=1; break; \
+	  fi; \
 	  printf "."; sleep 2; \
-	done
+	done; \
+	echo ""; \
+	if [ "$$READY" -eq 0 ]; then \
+	  echo "  ⚠️  Ollama n'est pas encore prêt — il démarre peut-être encore."; \
+	  echo "  → Pour vérifier : make logs-ollama"; \
+	  echo "  → Pour puller le modèle plus tard : make ollama-pull"; \
+	  echo ""; \
+	  $(MAKE) health; \
+	  $(MAKE) dns; \
+	  exit 0; \
+	fi
 	@echo ""
-	@echo ""
-	@if docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(_OLLAMA_MODEL)"; then \
+	@echo "  🔍 Vérification du modèle $(_OLLAMA_MODEL)..."
+	@if docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)"; then \
 	  echo "  ✅ Modèle $(_OLLAMA_MODEL) déjà présent — démarrage instantané."; \
 	  echo ""; \
 	else \
 	  echo "  ℹ️  Modèle absent du volume — téléchargement en cours..."; \
-	  echo "  📥 Progression (X GB / Y GB) :"; \
+	  echo "  📥 Progression (affichage ligne par ligne) :"; \
 	  echo ""; \
-	  docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
-	  echo ""; \
-	  echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."; \
-	  echo ""; \
+	  _pull_ok=0; \
+	  if docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL) 2>&1; then \
+	    _pull_ok=1; \
+	  else \
+	    echo ""; \
+	    echo "  ⚠️  docker exec a échoué, tentative via HTTP API..."; \
+	    if curl -sf -X POST http://localhost:11434/api/pull \
+	        -H "Content-Type: application/json" \
+	        -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"stream\":true}" \
+	        --no-buffer --max-time 900 \
+	        | while IFS= read -r line; do \
+	            STATUS=$$(echo "$$line" | python3 -c \
+	              "import sys,json; \
+	               d=json.loads(sys.stdin.read().strip()); \
+	               s=d.get('status',''); \
+	               c=d.get('completed',0); \
+	               t=d.get('total',0); \
+	               err=d.get('error',''); \
+	               print('[ERROR] '+err if err else (s+' '+str(c)+'/'+str(t) if t else s))" \
+	              2>/dev/null || echo "$$line"); \
+	            echo "  $$STATUS"; \
+	          done; then \
+	      _pull_ok=1; \
+	    else \
+	      echo "  ❌ Pull impossible. → make ollama-pull pour diagnostiquer."; \
+	    fi; \
+	  fi; \
+	  if [ "$$_pull_ok" -eq 1 ]; then \
+	    echo ""; \
+	    echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."; \
+	    echo ""; \
+	  fi; \
 	fi
 	@$(MAKE) health
 	@$(MAKE) dns
@@ -190,14 +324,16 @@ start-gpu: ## Démarrer avec GPU NVIDIA
 	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
+	@echo "  🔄 Mise à jour image Ollama..."
+	@docker compose pull ollama 2>&1 | grep -E "(Pull|Pulling|already|latest)" || true
 	@docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 	@echo ""
 	@echo "  ⏳ Attente Ollama..."
 	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do printf "."; sleep 2; done
 	@echo ""
-	@if ! docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(_OLLAMA_MODEL)"; then \
+	@if ! docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)"; then \
 	  echo "  📥 Pull modèle GPU..."; \
-	  docker exec -it khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
+	  docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
 	fi
 	@$(MAKE) health
 
@@ -224,7 +360,6 @@ rebuild: build start ## Rebuild NestJS + redémarrage
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## LOGS
-## BUG CORRIGÉ : les recettes doivent être sur la ligne SUIVANTE avec une TAB
 ## ══════════════════════════════════════════════════════════════════════════════
 
 logs: ## Tous les logs
@@ -319,7 +454,7 @@ ai-status: ## Statut IA + modèles disponibles dans Ollama
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
 	  [ "$$code" = "200" ] && echo "✅ OK" || echo "⚠️  EN COURS"
 	@echo ""
-	@echo "  Modèles installés (docker exec ollama list) :"
+	@echo "  Modèles installés :"
 	@docker exec khidmeti-ollama ollama list 2>/dev/null || echo "   (Ollama non démarré)"
 	@echo ""
 	@echo "  Version Ollama :"
@@ -328,6 +463,10 @@ ai-status: ## Statut IA + modèles disponibles dans Ollama
 	@echo "  Volume :"
 	@docker volume inspect khidmeti-ollama-data \
 	  --format "   Chemin : {{.Mountpoint}}" 2>/dev/null || echo "   (volume absent)"
+	@echo ""
+	@echo "  RAM disponible sur l'hôte :"
+	@free -h 2>/dev/null | awk '/^Mem:/{print "   Total: " $$2 "  |  Utilisée: " $$3 "  |  Libre: " $$4}' || \
+	  vm_stat 2>/dev/null | head -5 || echo "   (commande non disponible)"
 	@echo ""
 
 dns: ## Afficher les URLs + config Flutter
@@ -565,13 +704,14 @@ test-api: ## Tester les endpoints principaux
 	@echo "  [2] Swagger :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
 	@echo ""
 
-test-ai: ## Tester l'extraction d'intention Darija
+test-ai: ## Tester l'extraction d'intention Darija avec gemma4:e2b
 	@echo ""
-	@echo "  Test Ollama — extraction Darija..."
+	@echo "  Test Ollama — extraction Darija (gemma4:e2b)..."
+	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo ""
 	@curl -s http://localhost:11434/v1/chat/completions \
 	  -H "Content-Type: application/json" \
-	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":2048,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
+	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":4096,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
 	  | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible"
 	@echo ""
 

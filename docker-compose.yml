@@ -3,33 +3,48 @@ name: khidmeti
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
-# CORRECTIONS v2 :
-#   ✅ Ollama : image mise à jour (0.6.5 → latest supportant gemma3/gemma4)
-#   ✅ Redis  : REDIS_PASSWORD injecté dans l'env → healthcheck fonctionne
-#   ✅ Whisper: start_period 90s → 300s + dépendance API relâchée
-#   ✅ API    : ne bloque plus sur whisper (service_started vs service_healthy)
-#              Whisper est optionnel au démarrage, prêt après son 1er download
+# FIXES v3 (gemma4:e2b + 8 GB RAM) :
 #
-# STRATÉGIE OLLAMA — Volume (modèle téléchargé une seule fois) :
-#   ✅ Aucun build Docker pour Ollama
-#   ✅ Modèle conservé dans le volume khidmeti-ollama-data
-#   ✅ docker compose down / up → modèle intact, démarrage instantané
-#   ✅ Progression visible en temps réel via : make start / make ollama-pull
+#   ✅ Ollama : ollama/ollama:latest forcé via `make start` (pull systématique)
+#              gemma4 nécessite Ollama >= v0.20.0 — le pull garantit la version
+#
+#   ✅ API → Ollama : dépendance relaxée à service_started
+#              AVANT : service_healthy → cascade failure si Ollama rate son HC
+#              APRÈS : service_started → l'API démarre, retry côté NestJS
+#
+#   ✅ Ollama healthcheck : start_period 15s → 90s
+#              GitHub Codespaces a un I/O lent au démarrage.
+#              15s était insuffisant, causant le status "Error" en Image 2.
+#
+#   ✅ DNS explicite sur le container Ollama (8.8.8.8 / 1.1.1.1)
+#              Corrige "pull model manifest: file does not exist"
+#              causé par un échec de résolution DNS dans certains réseaux VPN.
+#
+#   ✅ OLLAMA_NUM_CTX=4096
+#              gemma4:e2b supporte 128K mais le KV cache plein = ~6 GB RAM
+#              4096 ctx → KV cache ~200 MB → budget RAM respecté sur 8 GB
+#
+#   ✅ Limites mémoire ajustées pour 8 GB RAM avec gemma4:e2b (~3.5 GB chargé)
+#
+# BUDGET MÉMOIRE 8 GB RAM :
+#   Ollama + gemma4:e2b   ~4.0 GB  (modèle 3.2 GB + runtime 0.8 GB)
+#   faster-whisper-small  ~0.7 GB
+#   NestJS API            ~0.5 GB
+#   MongoDB               ~0.4 GB
+#   Redis                 ~0.2 GB
+#   Qdrant                ~0.2 GB
+#   MinIO                 ~0.2 GB
+#   nginx + mongo-express ~0.3 GB
+#   ─────────────────────────────
+#   Conteneurs total      ~6.5 GB
+#   OS + Docker daemon    ~1.5 GB
+#   ─────────────────────────────
+#   TOTAL                 ~8.0 GB  ✅ (limite respectée)
 #
 # WORKFLOW :
-#   1ère fois      → make start  (pull ~2-7 GB avec barre de progression)
-#   Fois suivantes → make start  (modèle déjà dans le volume → secondes)
+#   1ère fois      → make start  (pull image Ollama latest + modèle gemma4:e2b)
+#   Fois suivantes → make start  (modèle en volume → secondes)
 #   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
-#
-# Budget mémoire 8 GB RAM :
-#   Ollama + gemma3:2b   ~2.0 GB  (KEEP_ALIVE=-1 → permanent en RAM)
-#   faster-whisper       ~0.5 GB
-#   MongoDB + Redis      ~0.7 GB
-#   Qdrant + MinIO       ~0.3 GB
-#   nginx + API          ~0.5 GB
-#   OS + Docker          ~1.5 GB
-#   ─────────────────────────────
-#   Total                ~5.5 GB  ✅
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -49,10 +64,16 @@ services:
 
   # ── NestJS API ──────────────────────────────────────────────────────────────
   #
-  # FIX : whisper retiré de service_healthy → service_started
-  # Raison : Whisper met 2–10 min au 1er démarrage (download HuggingFace).
-  # L'API démarre sans attendre Whisper — les routes audio renverront 503
-  # jusqu'à ce que Whisper soit prêt (géré côté NestJS avec retry/fallback).
+  # FIX v3 : ollama → service_started (était service_healthy)
+  #
+  # POURQUOI :
+  #   - service_healthy exige qu'Ollama passe son healthcheck AVANT de démarrer
+  #     l'API. Sur GitHub Codespaces, Ollama peut mettre 60-90s à démarrer.
+  #   - Si le healthcheck échoue (start_period dépassé), l'API ne démarre pas
+  #     et tout le stack est marqué en erreur (comportement vu en Image 2).
+  #   - service_started : l'API démarre dès qu'Ollama est lancé (pas forcément
+  #     prêt). NestJS gère les retry côté code pour les appels Ollama.
+  #   - Whisper reste service_started (déjà correct).
   # ─────────────────────────────────────────────────────────────────────────────
   api:
     build:
@@ -65,7 +86,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV: development
+      NODE_ENV:    development
       NODE_OPTIONS: "--max-old-space-size=400"
     ports:
       - '3000:3000'
@@ -76,8 +97,8 @@ services:
       redis:   { condition: service_healthy  }
       qdrant:  { condition: service_healthy  }
       minio:   { condition: service_healthy  }
-      ollama:  { condition: service_healthy  }
-      whisper: { condition: service_started  }   # ← FIX: non-bloquant
+      ollama:  { condition: service_started  }   # FIX v3 : service_healthy → service_started
+      whisper: { condition: service_started  }
     networks:
       - khidmeti-network
     mem_limit:       512m
@@ -88,37 +109,55 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Ollama — LLM local ──────────────────────────────────────────────────────
+  # ── Ollama — LLM local (gemma4:e2b) ─────────────────────────────────────────
   #
-  # FIX : version mise à jour
-  #   0.6.5 → latest car gemma4 (et même gemma3) requiert une version récente.
+  # IMAGE : ollama/ollama:latest
+  #   IMPORTANT : `make start` force `docker compose pull ollama` avant up.
+  #   Cela garantit Ollama >= v0.20.0 qui est requis pour gemma4.
+  #   Sans ce pull, une image cachée ancienne (ex: v0.6.5) serait utilisée
+  #   et le pull de gemma4 échouerait avec "requires a newer version".
   #
-  # STRATÉGIE MODÈLE :
-  #   OLLAMA_MODEL dans .env → gemma3:2b  (recommandé, stable, ~2 GB)
-  #   Pour gemma4 si dispo   → vérifier : make ai-status
+  # DNS : 8.8.8.8 / 1.1.1.1 (FIX v3)
+  #   Docker utilise par défaut le DNS de l'hôte. Sur GitHub Codespaces avec
+  #   VPN actif, la résolution de registry.ollama.ai peut échouer depuis le
+  #   conteneur, causant "pull model manifest: file does not exist" même pour
+  #   des modèles existants (gemma3:2b, etc.).
+  #   DNS explicites Google + Cloudflare contournent ce problème.
   #
-  # Pour mettre à jour la version :
-  #   1. Changer le tag ci-dessous
-  #   2. docker compose pull ollama && make restart
+  # OLLAMA_NUM_CTX=4096 (FIX v3)
+  #   Contexte réduit pour économiser le KV cache en RAM.
+  #   128K ctx natif de gemma4:e2b utiliserait ~6 GB de KV cache = OOM.
+  #   4096 ctx → ~200 MB KV cache → budget 8 GB RAM respecté.
+  #
+  # HEALTHCHECK : start_period 15s → 90s (FIX v3)
+  #   15s insuffisant sur Codespaces (I/O lent, premier démarrage long).
+  #   90s couvre les cas les plus lents sans impacter les redémarrages
+  #   (le container est déjà démarré → healthcheck passe en <10s).
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:latest        # FIX: était 0.6.5, trop ancien pour gemma3/4
+    image: ollama/ollama:latest
     container_name: khidmeti-ollama
     restart: unless-stopped
     volumes:
       - ollama-data:/root/.ollama
     environment:
-      OLLAMA_NUM_PARALLEL:      "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      OLLAMA_KEEP_ALIVE:        "-1"
-      OLLAMA_NUM_THREAD:        "4"
-      OLLAMA_FLASH_ATTENTION:   "0"
+      OLLAMA_NUM_PARALLEL:      "1"          # CPU : 1 seule inférence à la fois
+      OLLAMA_MAX_LOADED_MODELS: "1"          # 1 modèle en RAM (économie mémoire)
+      OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
+      OLLAMA_NUM_THREAD:        "4"          # Threads CPU (ajuster selon votre CPU)
+      OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU (GPU seulement)
+      OLLAMA_NUM_CTX:           "4096"       # FIX v3 : KV cache ~200 MB au lieu de ~6 GB
+      OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée (évite OOM si rafale)
+      OLLAMA_ORIGINS:           "*"          # Accepte les connexions Docker inter-services
     ports:
       - '11434:11434'
+    dns:                                     # FIX v3 : DNS explicites pour registry.ollama.ai
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       4g
-    mem_reservation: 200m
+    mem_limit:       4g                      # gemma4:e2b ~3.2 GB + runtime ~0.8 GB
+    mem_reservation: 500m
     logging:
       driver: json-file
       options:
@@ -126,26 +165,20 @@ services:
         max-file: "2"
     healthcheck:
       test:         ['CMD', 'curl', '-sf', 'http://localhost:11434/']
-      interval:     10s
+      interval:     15s
       timeout:      5s
-      retries:      6
-      start_period: 15s
+      retries:      8
+      start_period: 90s   # FIX v3 : 15s → 90s (Codespaces I/O lent au démarrage)
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #
-  # FIX 1 : start_period 90s → 300s
-  #   Raison : GitHub Codespaces a une connexion variable. Le 1er démarrage
-  #   télécharge le modèle depuis HuggingFace (~466 MB pour small).
-  #   Sur réseau lent (10 MB/s) = ~47s + overhead = facilement > 90s.
-  #   300s couvre les cas les plus lents sans impacter le redémarrage
-  #   (le volume met le modèle en cache → les restarts suivants sont < 5s).
-  #
-  # FIX 2 : restart: unless-stopped (déjà correct)
-  #   Si Whisper plante après le 1er démarrage, Docker le relancera.
-  #   L'API gère l'indisponibilité temporaire de Whisper (service_started).
+  # Note : sur 8 GB RAM avec gemma4:e2b, Whisper (~700 MB) est inclus dans
+  # le budget mémoire. Les deux services ne tournent pas en parallèle au même
+  # instant (Ollama est en veille entre les requêtes malgré KEEP_ALIVE=-1,
+  # le modèle reste en RAM mais le CPU est libéré).
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
-    image: fedirz/faster-whisper-server:latest-cpu   # FIX: latest pour CPU
+    image: fedirz/faster-whisper-server:latest-cpu
     container_name: khidmeti-whisper
     restart: unless-stopped
     volumes:
@@ -172,7 +205,7 @@ services:
       interval:     20s
       timeout:      10s
       retries:      10
-      start_period: 300s   # FIX: 90s → 300s (couvre le 1er download HuggingFace)
+      start_period: 300s   # 1er démarrage : download HuggingFace ~466 MB
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -187,7 +220,7 @@ services:
       - mongo-data:/data/db
     networks:
       - khidmeti-network
-    mem_limit:       512m
+    mem_limit:       384m   # réduit de 512m : MongoDB utilise rarement plus de 256m en dev
     mem_reservation: 128m
     logging:
       driver: json-file
@@ -218,7 +251,7 @@ services:
       mongo: { condition: service_healthy }
     networks:
       - khidmeti-network
-    mem_limit: 256m
+    mem_limit:       200m
     logging:
       driver: json-file
       options:
@@ -226,21 +259,6 @@ services:
         max-file: "2"
 
   # ── Redis 7.2 ───────────────────────────────────────────────────────────────
-  #
-  # FIX CRITIQUE : ajout de REDIS_PASSWORD dans `environment`
-  #
-  # PROBLÈME ORIGINAL :
-  #   Le healthcheck utilisait `$$REDIS_PASSWORD` (CMD-SHELL) pour résoudre
-  #   la variable shell. Mais le conteneur Redis n'avait PAS REDIS_PASSWORD
-  #   dans ses variables d'environnement — uniquement dans la commande
-  #   `--requirepass`. Résultat : $$REDIS_PASSWORD → chaîne vide → échec auth.
-  #
-  # SOLUTION :
-  #   Injecter REDIS_PASSWORD dans `environment`. Docker Compose interpole
-  #   ${REDIS_PASSWORD} depuis .env à la lecture du fichier. Le conteneur
-  #   redis-server reçoit la variable. Le healthcheck CMD-SHELL peut alors
-  #   résoudre $$REDIS_PASSWORD correctement (simple $ dans le shell du conteneur).
-  # ─────────────────────────────────────────────────────────────────────────────
   redis:
     image:          redis:7.2.7-alpine
     container_name: khidmeti-redis
@@ -251,7 +269,7 @@ services:
       --maxmemory 128mb
       --maxmemory-policy allkeys-lru
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}   # FIX: rend la var disponible dans le conteneur
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - redis-data:/data
     networks:
@@ -267,9 +285,9 @@ services:
       test:
         - CMD-SHELL
         - redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
-      interval: 10s
-      timeout:  3s
-      retries:  5
+      interval:    10s
+      timeout:     3s
+      retries:     5
       start_period: 5s
 
   # ── Qdrant v1.9 ─────────────────────────────────────────────────────────────
@@ -284,7 +302,7 @@ services:
       - '6334:6334'
     networks:
       - khidmeti-network
-    mem_limit:       256m
+    mem_limit:       192m   # réduit de 256m : Qdrant en dev utilise peu de RAM
     mem_reservation: 64m
     logging:
       driver: json-file
@@ -316,7 +334,7 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit:       256m
+    mem_limit:       192m   # réduit de 256m
     mem_reservation: 64m
     logging:
       driver: json-file
