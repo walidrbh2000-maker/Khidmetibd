@@ -6,7 +6,7 @@ name: khidmeti
 # FIXES v3 (gemma4:e2b + 8 GB RAM) :
 #
 #   ✅ Ollama : ollama/ollama:latest forcé via `make start` (pull systématique)
-#              gemma4 nécessite Ollama >= v0.20.0 — le pull garantit la version
+#              gemma3:4b nécessite Ollama >= v0.6 — le pull garantit la version
 #
 #   ✅ API → Ollama : dépendance relaxée à service_started
 #              AVANT : service_healthy → cascade failure si Ollama rate son HC
@@ -14,37 +14,28 @@ name: khidmeti
 #
 #   ✅ Ollama healthcheck : start_period 15s → 90s
 #              GitHub Codespaces a un I/O lent au démarrage.
-#              15s était insuffisant, causant le status "Error" en Image 2.
 #
 #   ✅ DNS explicite sur le container Ollama (8.8.8.8 / 1.1.1.1)
 #              Corrige "pull model manifest: file does not exist"
-#              causé par un échec de résolution DNS dans certains réseaux VPN.
 #
 #   ✅ OLLAMA_NUM_CTX=4096
-#              gemma4:e2b supporte 128K mais le KV cache plein = ~12 GB RAM
-#              4096 ctx → KV cache ~200 MB → budget RAM respecté sur 8 GB
+#              Limite le KV cache à ~200 MB pour respecter le budget RAM.
 #
-#   ✅ Limites mémoire ajustées pour 8 GB RAM avec gemma4:e2b (~3.5 GB chargé)
-#
-# FIXES v4 (16 GB RAM — Codespace 4-core) :
+# FIXES v4 (Codespace 4-core 16 GB RAM / 32 GB disque) :
 #
 #   ✅ MinIO mem_limit : 192m → 512m
 #              MinIO RELEASE.2025 requiert 512 MB minimum.
-#              192m provoquait exit code 137 (OOM kill) au démarrage.
-#              Confirmé : 256m = crash console, 512m = stable.
+#              192m et 256m provoquent exit code 137 (OOM kill).
 #
-#   ✅ Ollama mem_limit : 4g → 8g
-#              gemma4:e2b = 7.2 GB sur disque → ~6-7 GB RAM chargé (Q4_K_M).
-#              4g bloquait le chargement du modèle en mémoire.
-#              Sur 16 GB RAM : 8g est la limite correcte.
-#
-#   ✅ OLLAMA_NUM_CTX : 4096 → 8192
-#              Calculé pour 8 GB (modèle 3.5 GB supposé, maintenant 7 GB réel).
-#              Sur 16 GB : modèle ~7 GB + services ~2.5 GB + KV 8192 ~400 MB
-#              = ~10 GB / 16 GB ✅  — meilleure qualité de raisonnement.
+#   ✅ Modèle : gemma4:e2b → gemma3:4b
+#              gemma4:e2b = 7.2 GB → trop grand pour Codespace 32 GB.
+#              Docker images (~20-24 GB) + 7.2 GB = dépassement disque garanti.
+#              gemma3:4b = 3.3 GB → laisse 5-9 GB libres ✅
+#              Fonctionnalités conservées : texte + image, 140+ langues, 128K ctx.
+#              Fonctionnalités perdues : audio (non utilisé — Whisper prend en charge).
 #
 # BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) :
-#   Ollama + gemma4:e2b   ~8.0 GB  (modèle 7.2 GB + runtime 0.8 GB)
+#   Ollama + gemma3:4b    ~4.0 GB  (modèle 3.3 GB + runtime 0.7 GB)
 #   faster-whisper-small  ~0.7 GB
 #   NestJS API            ~0.5 GB
 #   MongoDB               ~0.4 GB
@@ -53,13 +44,19 @@ name: khidmeti
 #   MinIO                 ~0.5 GB
 #   nginx + mongo-express ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total      ~10.8 GB
+#   Conteneurs total      ~6.8 GB
 #   OS + Docker daemon    ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                 ~12.3 GB  ✅ (marge 3.7 GB sur 16 GB)
+#   TOTAL                 ~8.3 GB  ✅ (marge 7.7 GB sur 16 GB)
+#
+# BUDGET DISQUE 32 GB (Codespace) :
+#   Docker images         ~20-24 GB
+#   gemma3:4b             ~3.3 GB
+#   ─────────────────────────────
+#   TOTAL                 ~23-27 GB  ✅ (marge 5-9 GB sur 32 GB)
 #
 # WORKFLOW :
-#   1ère fois      → make start  (pull image Ollama latest + modèle gemma4:e2b)
+#   1ère fois      → make start  (pull image Ollama latest + modèle gemma3:4b)
 #   Fois suivantes → make start  (modèle en volume → secondes)
 #   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
 # ══════════════════════════════════════════════════════════════════════════════
@@ -80,18 +77,6 @@ volumes:
 services:
 
   # ── NestJS API ──────────────────────────────────────────────────────────────
-  #
-  # FIX v3 : ollama → service_started (était service_healthy)
-  #
-  # POURQUOI :
-  #   - service_healthy exige qu'Ollama passe son healthcheck AVANT de démarrer
-  #     l'API. Sur GitHub Codespaces, Ollama peut mettre 60-90s à démarrer.
-  #   - Si le healthcheck échoue (start_period dépassé), l'API ne démarre pas
-  #     et tout le stack est marqué en erreur (comportement vu en Image 2).
-  #   - service_started : l'API démarre dès qu'Ollama est lancé (pas forcément
-  #     prêt). NestJS gère les retry côté code pour les appels Ollama.
-  #   - Whisper reste service_started (déjà correct).
-  # ─────────────────────────────────────────────────────────────────────────────
   api:
     build:
       context:    ./apps/api
@@ -114,7 +99,7 @@ services:
       redis:   { condition: service_healthy  }
       qdrant:  { condition: service_healthy  }
       minio:   { condition: service_healthy  }
-      ollama:  { condition: service_started  }   # FIX v3 : service_healthy → service_started
+      ollama:  { condition: service_started  }
       whisper: { condition: service_started  }
     networks:
       - khidmeti-network
@@ -126,32 +111,22 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Ollama — LLM local (gemma4:e2b) ─────────────────────────────────────────
+  # ── Ollama — LLM local (gemma3:4b) ──────────────────────────────────────────
   #
   # IMAGE : ollama/ollama:latest
-  #   IMPORTANT : `make start` force `docker compose pull ollama` avant up.
-  #   Cela garantit Ollama >= v0.20.0 qui est requis pour gemma4.
-  #   Sans ce pull, une image cachée ancienne (ex: v0.6.5) serait utilisée
-  #   et le pull de gemma4 échouerait avec "requires a newer version".
+  #   `make start` force `docker compose pull ollama` → garantit Ollama >= 0.6
+  #   requis pour gemma3:4b (multimodal engine).
   #
-  # DNS : 8.8.8.8 / 1.1.1.1 (FIX v3)
-  #   Docker utilise par défaut le DNS de l'hôte. Sur GitHub Codespaces avec
-  #   VPN actif, la résolution de registry.ollama.ai peut échouer depuis le
-  #   conteneur, causant "pull model manifest: file does not exist" même pour
-  #   des modèles existants (gemma3:2b, etc.).
-  #   DNS explicites Google + Cloudflare contournent ce problème.
+  # MODÈLE : gemma3:4b (3.3 GB disque, ~3.5 GB RAM)
+  #   Texte + Image, 128K context, 140+ langues incluant arabe/darija/français.
+  #   Analyse de photos de sinistres (fuite, désordre, prise brûlée, etc.).
+  #   Audio : géré par faster-whisper séparément → pas besoin dans Ollama.
   #
-  # OLLAMA_NUM_CTX=8192 (FIX v4, était 4096)
-  #   Sur 16 GB RAM : modèle ~7 GB + services ~2.5 GB + KV 8192 ~400 MB = ~10 GB ✅
-  #   4096 était calculé pour 8 GB avec un modèle supposé 3.5 GB (incorrect).
-  #   128K ctx natif = KV cache ~12 GB → toujours trop pour 16 GB avec services.
+  # DNS : 8.8.8.8 / 1.1.1.1
+  #   Corrige les échecs de résolution DNS vers registry.ollama.ai sur Codespaces.
   #
-  # mem_limit=8g (FIX v4, était 4g)
-  #   gemma4:e2b = 7.2 GB sur disque (Q4_K_M multimodal avec PLE).
-  #   RAM chargée : ~6-7 GB. La limite de 4g empêchait le chargement du modèle.
-  #
-  # HEALTHCHECK : start_period 90s (FIX v3)
-  #   15s insuffisant sur Codespaces (I/O lent, premier démarrage long).
+  # OLLAMA_NUM_CTX=4096
+  #   KV cache ~200 MB → total ~6.2 GB sur 16 GB ✅
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -165,18 +140,18 @@ services:
       OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
       OLLAMA_NUM_THREAD:        "4"          # Threads CPU (4-core Codespace)
       OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU (GPU seulement)
-      OLLAMA_NUM_CTX:           "8192"       # FIX v4 : 4096 → 8192 (KV ~400 MB sur 16 GB)
+      OLLAMA_NUM_CTX:           "4096"       # KV cache ~200 MB — suffisant pour Khidmeti
       OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée (évite OOM si rafale)
       OLLAMA_ORIGINS:           "*"          # Accepte les connexions Docker inter-services
     ports:
       - '11434:11434'
-    dns:                                     # FIX v3 : DNS explicites pour registry.ollama.ai
+    dns:
       - 8.8.8.8
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       8g                      # FIX v4 : 4g → 8g (gemma4:e2b ~7 GB RAM chargé)
-    mem_reservation: 1g                      # FIX v4 : 500m → 1g
+    mem_limit:       4g                      # gemma3:4b ~3.3 GB + runtime ~0.7 GB
+    mem_reservation: 500m
     logging:
       driver: json-file
       options:
@@ -187,7 +162,7 @@ services:
       interval:     15s
       timeout:      5s
       retries:      8
-      start_period: 90s   # FIX v3 : 15s → 90s (Codespaces I/O lent au démarrage)
+      start_period: 90s
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   whisper:
@@ -218,7 +193,7 @@ services:
       interval:     20s
       timeout:      10s
       retries:      10
-      start_period: 300s   # 1er démarrage : download HuggingFace ~466 MB
+      start_period: 300s
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -335,8 +310,7 @@ services:
   #
   # mem_limit=512m (FIX v4, était 192m)
   #   MinIO RELEASE.2025+ requiert un minimum de 512 MB pour fonctionner.
-  #   192m et 256m provoquent un exit code 137 (OOM kill) lors de l'init
-  #   ou à la première utilisation de la console web.
+  #   192m et 256m provoquaient exit code 137 (OOM kill) au démarrage.
   # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:RELEASE.2025-04-08T15-41-24Z

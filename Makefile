@@ -2,13 +2,13 @@
 ## KHIDMETI BACKEND — Makefile
 ##
 ## WORKFLOW :
-##   make start       → 1ère fois : pull image Ollama latest + modèle gemma4:e2b
+##   make start       → 1ère fois : pull image Ollama latest + modèle gemma3:4b
 ##   make start       → fois suivantes : démarrage instantané (modèle en volume)
 ##   make ollama-pull → forcer re-pull (ex: changer de modèle)
 ##
 ## FIXES v3 :
 ##   - `make start` force `docker compose pull ollama` avant `up -d`
-##     → garantit Ollama >= v0.20.0 requis pour gemma4:e2b
+##     → garantit Ollama >= v0.6 requis pour gemma3:4b (multimodal engine)
 ##   - `ollama-pull` utilise `docker exec` SANS flag -t (TTY)
 ##     → corrige l'échec silencieux en environnement headless/Codespaces
 ##   - Fallback HTTP API si docker exec échoue
@@ -20,9 +20,12 @@
 ##   - Détection des erreurs JSON dans le stream Méthode 2
 ##     → exit 1 si [ERROR] détecté dans le flux pull (corrige faux succès)
 ##   - Vérification espace disque avant pull
-##     → échec explicite si < 8 GB libres (gemma4:e2b = 7.2 GB)
+##     → échec explicite si < 4 GB libres (gemma3:4b = 3.3 GB)
 ##   - Nouveau target clean-ollama-partial
 ##     → supprime les fichiers .partial laissés par un pull interrompu
+##   - Modèle : gemma4:e2b → gemma3:4b
+##     → gemma4:e2b (7.2 GB) ne tenait pas dans Codespace 32 GB
+##     → gemma3:4b (3.3 GB) = texte + image + 140+ langues (arabe/darija/fr/en)
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -56,7 +59,7 @@ DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
 _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
-  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma4:e2b')
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma3:4b')
 
 .DEFAULT_GOAL := help
 
@@ -142,22 +145,18 @@ help: ## Afficher l'aide
 ##
 ## STRATÉGIE DE PULL (ordre de priorité) :
 ##   1. `docker exec` SANS -t (headless, Codespaces, CI)
-##      → Le flag -t alloue un PTY. En environnement headless, -t peut causer
-##        un retour "file does not exist" trompeur ou bloquer silencieusement.
-##        Sans -t : la progression est affichée ligne par ligne, pas de barre.
-##
 ##   2. Fallback HTTP API si docker exec échoue
 ##      → `POST /api/pull` avec stream:true
-##      → Affiche chaque ligne JSON de progression
-##      → Si le JSON contient "error", exit 1 immédiatement (FIX v4)
+##      → Si le JSON contient "error", exit 1 immédiatement
 ##
-## VÉRIFICATION ESPACE DISQUE (FIX v4) :
-##   gemma4:e2b = 7.2 GB → 8 GB libres requis minimum.
+## VÉRIFICATION ESPACE DISQUE :
+##   gemma3:4b = 3.3 GB → 4 GB libres requis minimum.
 ##   Un pull interrompu (no space left) laisse un fichier *-partial.
 ##   Utiliser `make clean-ollama-partial` pour libérer cet espace.
+##   Si disque trop plein : `docker system prune -f` libère les images inutilisées.
 ##
 ## PRÉREQUIS MODÈLE :
-##   gemma4:e2b nécessite Ollama >= v0.20.0
+##   gemma3:4b nécessite Ollama >= v0.6
 ##   `make start` force `docker compose pull ollama` → garantit la version
 ## ══════════════════════════════════════════════════════════════════════════════
 
@@ -199,12 +198,12 @@ ollama-pull: ## Pull du modèle avec progression (sans TTY, compatible Codespace
 	@_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
 	_free_gb=$$(( $$_free_kb / 1024 / 1024 )); \
 	echo "     Espace libre : ~$${_free_gb} GB"; \
-	if [ "$$_free_kb" -lt 8388608 ]; then \
+	if [ "$$_free_kb" -lt 4194304 ]; then \
 	  echo ""; \
-	  echo "  ❌ Espace disque insuffisant ($${_free_gb} GB libres, 8 GB requis)."; \
+	  echo "  ❌ Espace disque insuffisant ($${_free_gb} GB libres, 4 GB requis)."; \
 	  echo ""; \
 	  echo "  Solutions :"; \
-	  echo "    make clean-ollama-partial   → supprime les fichiers partiels (~7 GB)"; \
+	  echo "    make clean-ollama-partial   → supprime les fichiers partiels (~3 GB)"; \
 	  echo "    docker system prune -f      → nettoie images/conteneurs inutilisés"; \
 	  echo "    df -h                       → diagnostic complet"; \
 	  exit 1; \
@@ -247,10 +246,11 @@ ollama-pull: ## Pull du modèle avec progression (sans TTY, compatible Codespace
 	    echo ""; \
 	    echo "  Causes possibles :"; \
 	    echo "  1. Disque plein → make clean-ollama-partial puis réessayez"; \
+	    echo "     docker system prune -f  (libère images Docker inutilisées)"; \
 	    echo "  2. Image Ollama trop ancienne → lancez d'abord : make start"; \
 	    echo "     (make start force docker compose pull ollama)"; \
 	    echo "  3. Réseau : vérifiez que le VPN ne bloque pas registry.ollama.ai"; \
-	    echo "  4. RAM insuffisante : gemma4:e2b nécessite ~4 GB libres"; \
+	    echo "  4. RAM insuffisante : gemma3:4b nécessite ~4 GB libres"; \
 	    echo ""; \
 	    echo "  Diagnostic : make ai-status"; \
 	    exit 1; \
@@ -278,8 +278,8 @@ start: ## Démarrer tous les services + pull modèle Ollama si absent
 		cp .env.example .env 2>/dev/null || true; \
 		echo "  ⚠️  .env créé — configurez FIREBASE_* avant de continuer"; echo ""; \
 	fi
-	@echo "  🔄 Mise à jour de l'image Ollama (requis pour gemma4:e2b)..."
-	@echo "  → Ollama >= v0.20.0 nécessaire. Pull en cours..."
+	@echo "  🔄 Mise à jour de l'image Ollama (requis pour $(_OLLAMA_MODEL))..."
+	@echo "  → Ollama >= v0.6 nécessaire. Pull en cours..."
 	@docker compose pull ollama 2>&1 | grep -E "(Pull|Pulling|already|latest)" || true
 	@echo "  ✅ Image Ollama à jour."
 	@echo ""
@@ -342,6 +342,7 @@ start: ## Démarrer tous les services + pull modèle Ollama si absent
 	    else \
 	      echo "  ❌ Pull impossible."; \
 	      echo "  → make clean-ollama-partial  (si disque plein)"; \
+	      echo "  → docker system prune -f     (libère images inutilisées)"; \
 	      echo "  → make ollama-pull           (pour diagnostiquer)"; \
 	    fi; \
 	  fi; \
@@ -751,14 +752,14 @@ test-api: ## Tester les endpoints principaux
 	@echo "  [2] Swagger :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
 	@echo ""
 
-test-ai: ## Tester l'extraction d'intention Darija avec gemma4:e2b
+test-ai: ## Tester l'extraction d'intention Darija avec gemma3:4b
 	@echo ""
-	@echo "  Test Ollama — extraction Darija (gemma4:e2b)..."
+	@echo "  Test Ollama — extraction Darija ($(_OLLAMA_MODEL))..."
 	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo ""
 	@curl -s http://localhost:11434/v1/chat/completions \
 	  -H "Content-Type: application/json" \
-	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":4096,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
+	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":4096},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
 	  | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible"
 	@echo ""
 
