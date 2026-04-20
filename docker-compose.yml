@@ -21,25 +21,42 @@ name: khidmeti
 #              causé par un échec de résolution DNS dans certains réseaux VPN.
 #
 #   ✅ OLLAMA_NUM_CTX=4096
-#              gemma4:e2b supporte 128K mais le KV cache plein = ~6 GB RAM
+#              gemma4:e2b supporte 128K mais le KV cache plein = ~12 GB RAM
 #              4096 ctx → KV cache ~200 MB → budget RAM respecté sur 8 GB
 #
 #   ✅ Limites mémoire ajustées pour 8 GB RAM avec gemma4:e2b (~3.5 GB chargé)
 #
-# BUDGET MÉMOIRE 8 GB RAM :
-#   Ollama + gemma4:e2b   ~4.0 GB  (modèle 3.2 GB + runtime 0.8 GB)
+# FIXES v4 (16 GB RAM — Codespace 4-core) :
+#
+#   ✅ MinIO mem_limit : 192m → 512m
+#              MinIO RELEASE.2025 requiert 512 MB minimum.
+#              192m provoquait exit code 137 (OOM kill) au démarrage.
+#              Confirmé : 256m = crash console, 512m = stable.
+#
+#   ✅ Ollama mem_limit : 4g → 8g
+#              gemma4:e2b = 7.2 GB sur disque → ~6-7 GB RAM chargé (Q4_K_M).
+#              4g bloquait le chargement du modèle en mémoire.
+#              Sur 16 GB RAM : 8g est la limite correcte.
+#
+#   ✅ OLLAMA_NUM_CTX : 4096 → 8192
+#              Calculé pour 8 GB (modèle 3.5 GB supposé, maintenant 7 GB réel).
+#              Sur 16 GB : modèle ~7 GB + services ~2.5 GB + KV 8192 ~400 MB
+#              = ~10 GB / 16 GB ✅  — meilleure qualité de raisonnement.
+#
+# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) :
+#   Ollama + gemma4:e2b   ~8.0 GB  (modèle 7.2 GB + runtime 0.8 GB)
 #   faster-whisper-small  ~0.7 GB
 #   NestJS API            ~0.5 GB
 #   MongoDB               ~0.4 GB
 #   Redis                 ~0.2 GB
 #   Qdrant                ~0.2 GB
-#   MinIO                 ~0.2 GB
+#   MinIO                 ~0.5 GB
 #   nginx + mongo-express ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total      ~6.5 GB
+#   Conteneurs total      ~10.8 GB
 #   OS + Docker daemon    ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                 ~8.0 GB  ✅ (limite respectée)
+#   TOTAL                 ~12.3 GB  ✅ (marge 3.7 GB sur 16 GB)
 #
 # WORKFLOW :
 #   1ère fois      → make start  (pull image Ollama latest + modèle gemma4:e2b)
@@ -124,15 +141,17 @@ services:
   #   des modèles existants (gemma3:2b, etc.).
   #   DNS explicites Google + Cloudflare contournent ce problème.
   #
-  # OLLAMA_NUM_CTX=4096 (FIX v3)
-  #   Contexte réduit pour économiser le KV cache en RAM.
-  #   128K ctx natif de gemma4:e2b utiliserait ~6 GB de KV cache = OOM.
-  #   4096 ctx → ~200 MB KV cache → budget 8 GB RAM respecté.
+  # OLLAMA_NUM_CTX=8192 (FIX v4, était 4096)
+  #   Sur 16 GB RAM : modèle ~7 GB + services ~2.5 GB + KV 8192 ~400 MB = ~10 GB ✅
+  #   4096 était calculé pour 8 GB avec un modèle supposé 3.5 GB (incorrect).
+  #   128K ctx natif = KV cache ~12 GB → toujours trop pour 16 GB avec services.
   #
-  # HEALTHCHECK : start_period 15s → 90s (FIX v3)
+  # mem_limit=8g (FIX v4, était 4g)
+  #   gemma4:e2b = 7.2 GB sur disque (Q4_K_M multimodal avec PLE).
+  #   RAM chargée : ~6-7 GB. La limite de 4g empêchait le chargement du modèle.
+  #
+  # HEALTHCHECK : start_period 90s (FIX v3)
   #   15s insuffisant sur Codespaces (I/O lent, premier démarrage long).
-  #   90s couvre les cas les plus lents sans impacter les redémarrages
-  #   (le container est déjà démarré → healthcheck passe en <10s).
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -144,9 +163,9 @@ services:
       OLLAMA_NUM_PARALLEL:      "1"          # CPU : 1 seule inférence à la fois
       OLLAMA_MAX_LOADED_MODELS: "1"          # 1 modèle en RAM (économie mémoire)
       OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
-      OLLAMA_NUM_THREAD:        "4"          # Threads CPU (ajuster selon votre CPU)
+      OLLAMA_NUM_THREAD:        "4"          # Threads CPU (4-core Codespace)
       OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU (GPU seulement)
-      OLLAMA_NUM_CTX:           "4096"       # FIX v3 : KV cache ~200 MB au lieu de ~6 GB
+      OLLAMA_NUM_CTX:           "8192"       # FIX v4 : 4096 → 8192 (KV ~400 MB sur 16 GB)
       OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée (évite OOM si rafale)
       OLLAMA_ORIGINS:           "*"          # Accepte les connexions Docker inter-services
     ports:
@@ -156,8 +175,8 @@ services:
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       4g                      # gemma4:e2b ~3.2 GB + runtime ~0.8 GB
-    mem_reservation: 500m
+    mem_limit:       8g                      # FIX v4 : 4g → 8g (gemma4:e2b ~7 GB RAM chargé)
+    mem_reservation: 1g                      # FIX v4 : 500m → 1g
     logging:
       driver: json-file
       options:
@@ -171,12 +190,6 @@ services:
       start_period: 90s   # FIX v3 : 15s → 90s (Codespaces I/O lent au démarrage)
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
-  #
-  # Note : sur 8 GB RAM avec gemma4:e2b, Whisper (~700 MB) est inclus dans
-  # le budget mémoire. Les deux services ne tournent pas en parallèle au même
-  # instant (Ollama est en veille entre les requêtes malgré KEEP_ALIVE=-1,
-  # le modèle reste en RAM mais le CPU est libéré).
-  # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
     container_name: khidmeti-whisper
@@ -220,7 +233,7 @@ services:
       - mongo-data:/data/db
     networks:
       - khidmeti-network
-    mem_limit:       384m   # réduit de 512m : MongoDB utilise rarement plus de 256m en dev
+    mem_limit:       384m
     mem_reservation: 128m
     logging:
       driver: json-file
@@ -302,7 +315,7 @@ services:
       - '6334:6334'
     networks:
       - khidmeti-network
-    mem_limit:       192m   # réduit de 256m : Qdrant en dev utilise peu de RAM
+    mem_limit:       192m
     mem_reservation: 64m
     logging:
       driver: json-file
@@ -319,6 +332,12 @@ services:
       start_period: 30s
 
   # ── MinIO ───────────────────────────────────────────────────────────────────
+  #
+  # mem_limit=512m (FIX v4, était 192m)
+  #   MinIO RELEASE.2025+ requiert un minimum de 512 MB pour fonctionner.
+  #   192m et 256m provoquent un exit code 137 (OOM kill) lors de l'init
+  #   ou à la première utilisation de la console web.
+  # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:RELEASE.2025-04-08T15-41-24Z
     container_name: khidmeti-minio
@@ -334,8 +353,8 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit:       192m   # réduit de 256m
-    mem_reservation: 64m
+    mem_limit:       512m   # FIX v4 : 192m → 512m (MinIO 2025 minimum confirmé)
+    mem_reservation: 128m   # FIX v4 : 64m → 128m
     logging:
       driver: json-file
       options:
