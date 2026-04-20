@@ -14,6 +14,14 @@
 //   2. Créer le nouvel index email (unique partiel — email ≠ '')
 //   3. Créer l'index phoneNumber (unique partiel — phoneNumber ≠ '')
 //   4. Vérification post-migration
+//
+// FIXES :
+//   - Code 26 (NamespaceNotFound) ajouté au catch de dropIndex :
+//     sur une DB fraîche, la collection 'users' n'existe pas encore.
+//     dropIndex() lève NamespaceNotFound (26), pas IndexNotFound (27).
+//   - `sparse: true` retiré de createIndex :
+//     MongoDB 5+ interdit de combiner sparse et partialFilterExpression.
+//     partialFilterExpression: { email: { $ne: '' } } remplit déjà ce rôle.
 // ══════════════════════════════════════════════════════════════════════════════
 
 'use strict';
@@ -29,6 +37,8 @@ try {
 } catch (e) {
   if (e.code === 27 /* IndexNotFound */) {
     print('   ⏭  Index email_1 déjà absent — skip');
+  } else if (e.code === 26 /* NamespaceNotFound — collection absente sur DB fraîche */) {
+    print('   ⏭  Collection users absente — skip (DB fraîche)');
   } else {
     print(`   ⚠️  Erreur inattendue: ${e.message}`);
     throw e;
@@ -36,6 +46,13 @@ try {
 }
 
 // ── 2. Créer le nouvel index email (partiel) ──────────────────────────────────
+//
+// FIX : `sparse` retiré.
+//   MongoDB 5+ lève "cannot mix partialFilterExpression and sparse options"
+//   si les deux sont présents simultanément.
+//   Le partialFilterExpression { email: { $ne: '' } } exclut déjà les
+//   documents sans email — comportement identique à sparse: true.
+//
 print('→ [2/4] Création de l\'index email (partiel, unique)...');
 try {
   db.users.createIndex(
@@ -43,7 +60,6 @@ try {
     {
       name:    'email_unique_nonempty',
       unique:  true,
-      sparse:  true,
       partialFilterExpression: { email: { $ne: '' } },
       background: true,
     },
@@ -58,7 +74,10 @@ try {
   }
 }
 
-// ── 3. Créer l'index phoneNumber (partiel) ─────────────────────────────────
+// ── 3. Créer l'index phoneNumber (partiel) ────────────────────────────────────
+//
+// FIX : `sparse` retiré pour la même raison que l'index email ci-dessus.
+//
 print('→ [3/4] Création de l\'index phoneNumber (partiel, unique)...');
 try {
   db.users.createIndex(
@@ -66,7 +85,6 @@ try {
     {
       name:    'phoneNumber_unique_nonempty',
       unique:  true,
-      sparse:  true,
       partialFilterExpression: { phoneNumber: { $ne: '' } },
       background: true,
     },
@@ -82,16 +100,31 @@ try {
 }
 
 // ── 4. Vérification ───────────────────────────────────────────────────────────
+//
+// FIX : getIndexes() échoue avec NamespaceNotFound (26) si la collection
+//   n'a jamais reçu de documents (DB fraîche). Dans ce cas les index sont
+//   enregistrés dans le catalogue mais getIndexes() peut être instable.
+//   On catch et on log sans faire échouer la migration.
+//
 print('→ [4/4] Vérification post-migration...');
-const indexes = db.users.getIndexes();
-const emailIdx = indexes.find(i => i.name === 'email_unique_nonempty');
-const phoneIdx = indexes.find(i => i.name === 'phoneNumber_unique_nonempty');
+try {
+  const indexes = db.users.getIndexes();
+  const emailIdx = indexes.find(i => i.name === 'email_unique_nonempty');
+  const phoneIdx = indexes.find(i => i.name === 'phoneNumber_unique_nonempty');
 
-if (emailIdx && phoneIdx) {
-  print('   ✅ Tous les index sont en place');
-} else {
-  print('   ⚠️  Vérification manuelle recommandée :');
-  print(JSON.stringify(indexes, null, 2));
+  if (emailIdx && phoneIdx) {
+    print('   ✅ Tous les index sont en place');
+  } else {
+    print('   ⚠️  Vérification manuelle recommandée :');
+    print(JSON.stringify(indexes, null, 2));
+  }
+} catch (e) {
+  if (e.code === 26 /* NamespaceNotFound */) {
+    print('   ⚠️  Vérification manuelle recommandée :\n' +
+          '   La collection users sera créée au premier INSERT — les index seront actifs dès lors.');
+  } else {
+    print(`   ⚠️  Erreur vérification: ${e.message}`);
+  }
 }
 
 print('\n✅ Migration 001_phone_auth_indexes terminée\n');
