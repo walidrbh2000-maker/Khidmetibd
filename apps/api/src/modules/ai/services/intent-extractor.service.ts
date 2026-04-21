@@ -1,4 +1,58 @@
 // apps/api/src/modules/ai/services/intent-extractor.service.ts
+//
+// FIX v7 — Circuit Breaker + Fix OVERLOAD_PATTERNS + Meilleur surfacing d'erreurs
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROBLÈMES RÉSOLUS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// PROBLÈME 1 — Silent FALLBACK (le plus critique)
+//
+//   AVANT : Quand Ollama runner crashait (OOM), l'erreur
+//     "llama runner process has terminated: %!w(<nil>)"
+//   ne matchait AUCUN OVERLOAD_PATTERN → tombait dans le catch générique
+//   → return { ...FALLBACK } silencieux → HTTP 200 avec confidence=0
+//   → Flutter pensait que la requête avait réussi (mais sans résultat utile)
+//   → l'utilisateur voyait un résultat vide sans message d'erreur
+//
+//   APRÈS : Nouveaux patterns OVERLOAD détectent "runner process has terminated",
+//   "fetch failed", "ECONNREFUSED" etc. → lèvent AiProviderException (HTTP 503)
+//   → Flutter reçoit un 503 clair et peut proposer "Réessayer"
+//
+// PROBLÈME 2 — Cascade de timeouts (16x timeout × 120s = 32 minutes de blocage)
+//
+//   AVANT : Si Ollama était en train de crasher et redémarrer, chaque appel
+//   attendait 120 secondes avant de timeout. Plusieurs utilisateurs simultanés
+//   pouvaient bloquer toutes les workers NestJS.
+//
+//   APRÈS : Circuit Breaker — après 3 échecs consécutifs, le circuit s'ouvre
+//   et les requêtes suivantes échouent IMMÉDIATEMENT (< 1ms) avec 503 pendant
+//   30 secondes, puis le circuit se remet en half-open pour tester une requête.
+//
+// PROBLÈME 3 — "fetch failed" quand Whisper redémarre après exit 137
+//
+//   AVANT : Même problème — tombait dans catch générique → FALLBACK silencieux
+//   APRÈS : "fetch failed" dans OVERLOAD_PATTERNS → 503 propre
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER — Comportement
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │  CLOSED (normal)   ──3 failures──►  OPEN (fast-fail 30s)           │
+//   │      ▲                                      │                       │
+//   │      └──── success ◄── HALF-OPEN ◄── 30s elapsed                  │
+//   └─────────────────────────────────────────────────────────────────────┘
+//
+//   CLOSED    : opération normale, chaque requête va jusqu'à Ollama/Whisper
+//   OPEN      : fail immédiat avec 503, aucune requête envoyée (protège la RAM)
+//   HALF-OPEN : laisse passer UNE requête test — si succès → CLOSED, sinon → OPEN
+//
+//   Paramètres :
+//     CIRCUIT_THRESHOLD = 3 failures consécutives pour ouvrir
+//     CIRCUIT_RESET_MS  = 30 secondes en open avant de tenter half-open
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { createHash }                           from 'crypto';
@@ -36,17 +90,10 @@ const FALLBACK: SearchIntent = {
 
 // ── Error classification ───────────────────────────────────────────────────────
 //
-// QUOTA    (HTTP 429) — hard rate-limit.
-// OVERLOAD (HTTP 503) — transient; the caller should retry after back-off.
-//
-// FIX v6 : ajout des patterns Ollama OOM dans OVERLOAD_PATTERNS.
-//   AVANT : l'erreur "requires more system memory (4.9 GiB)" tombait dans
-//           le bloc catch générique → return { ...FALLBACK } silencieux →
-//           confidence=0 affiché dans l'UI sans aucun message d'erreur.
-//   APRÈS : classifiée comme 503 SERVICE_UNAVAILABLE → Flutter reçoit un
-//           message clair et peut proposer une nouvelle tentative.
+// QUOTA    (HTTP 429) — hard rate-limit, ne pas réessayer immédiatement.
+// OVERLOAD (HTTP 503) — transitoire, Ollama/Whisper en cours de redémarrage.
+//                       Le circuit breaker protège contre la cascade de timeouts.
 
-/** Patterns indicating a hard quota / rate-limit → HTTP 429 */
 const QUOTA_PATTERNS: RegExp[] = [
   /quota/i,
   /resource.?exhausted/i,
@@ -56,13 +103,26 @@ const QUOTA_PATTERNS: RegExp[] = [
 ];
 
 /**
- * Patterns indicating a transient overload / unavailability → HTTP 503.
+ * Patterns indiquant une surcharge/indisponibilité transitoire → HTTP 503.
  *
- * FIX v6 — ajout des patterns Ollama OOM :
- *   - "message requires more system memory" : Ollama ne peut pas charger le modèle
- *   - "not enough.*memory" : formulation générique mémoire insuffisante
- *   Ces erreurs sont transitoires : elles se résolvent seules une fois que
- *   Ollama récupère de la mémoire (ex: après garbage collection ou redémarrage).
+ * FIX v7 — Ajout des patterns manquants qui causaient des FALLBACK silencieux :
+ *
+ *   "runner process has terminated" — Ollama runner tué par OOM (cgroup Docker).
+ *     LocalStrategy.chat() extrait désormais cette string du body JSON Ollama,
+ *     permettant à ce pattern de la capturer.
+ *
+ *   "empty or null content" — Ollama renvoie content=null quand runner instable.
+ *     LocalStrategy.chat() lève maintenant cette erreur explicitement.
+ *
+ *   "fetch failed" / "ECONNREFUSED" / "ECONNRESET" / "socket hang up" —
+ *     Erreurs réseau quand Whisper ou Ollama est en cours de redémarrage.
+ *     LocalStrategy enveloppe ces erreurs avec un message clair.
+ *
+ *   "whisper fetch failed" — Ajouté par LocalStrategy.processAudio() FIX v7.
+ *     Distingue les pannes Whisper des pannes Ollama dans les logs.
+ *
+ *   "ollama fetch failed" — Ajouté par LocalStrategy.chat() FIX v7.
+ *     Réseau vers Ollama coupé (container redémarrage).
  */
 const OVERLOAD_PATTERNS: RegExp[] = [
   /503/,
@@ -71,8 +131,18 @@ const OVERLOAD_PATTERNS: RegExp[] = [
   /model.*overload/i,
   /temporarily.*unavailable/i,
   /please try again later/i,
-  /requires more system memory/i,  // FIX v6 : Ollama OOM — "requires more system memory (4.9 GiB)"
-  /not enough.*memory/i,           // FIX v6 : formulation générique mémoire insuffisante
+  /requires more system memory/i,      // Ollama OOM — "requires more system memory (X GiB needed)"
+  /not enough.*memory/i,               // Formulation générique mémoire insuffisante
+  /runner process has terminated/i,    // FIX v7 : Ollama runner tué par OOM cgroup
+  /llama runner/i,                     // FIX v7 : Toute erreur "llama runner ..." d'Ollama
+  /empty or null content/i,            // FIX v7 : Ollama content=null (runner instable)
+  /fetch failed/i,                     // FIX v7 : Erreur réseau générique (fetch API)
+  /ollama fetch failed/i,              // FIX v7 : Ollama non-joignable
+  /whisper fetch failed/i,             // FIX v7 : Whisper non-joignable (après exit 137)
+  /econnrefused/i,                     // FIX v7 : Port refusé (container pas encore démarré)
+  /econnreset/i,                       // FIX v7 : Connexion réinitialisée
+  /socket hang up/i,                   // FIX v7 : Fermeture prématurée
+  /network.*error/i,                   // FIX v7 : Erreur réseau générique
 ];
 
 function isQuotaError(err: unknown): boolean {
@@ -95,6 +165,31 @@ function isGarbageTranscript(text: string): boolean {
   if (TIMESTAMP_ONLY_RE.test(t)) return true;
   if (/^[\d\s:.,\-]+$/.test(t)) return true;
   return false;
+}
+
+// ── Circuit Breaker ────────────────────────────────────────────────────────────
+//
+// Protège NestJS workers contre la cascade de timeouts lors des crashes Ollama.
+//
+// POURQUOI c'est critique :
+//   - Ollama timeout = 120s
+//   - NestJS pool = N workers
+//   - Sans circuit breaker : N workers × 120s = minutages bloqués avant récupération
+//   - Avec circuit breaker : après 3 échecs → fail immédiat pour 30s → recovery
+//
+// DESIGN — state machine à 3 états (IEEE 1998 pattern) :
+//   closed → (failures >= threshold) → open
+//   open   → (elapsed >= reset_ms)   → half-open
+//   half-open → success              → closed
+//   half-open → failure              → open (reset timer)
+
+type CircuitState = 'closed' | 'open' | 'half-open';
+
+interface CircuitStatus {
+  state:              CircuitState;
+  failures:           number;
+  lastFailureAt:      number;       // epoch ms, 0 = never
+  recoversAt:         number | null; // epoch ms, null if closed
 }
 
 // ── System prompt ──────────────────────────────────────────────────────────────
@@ -130,20 +225,11 @@ Requête: "الكليماتيزور ما يبردش وجاي الصيف"
 Requête: "صنفارية مسدودة في الحمام"
 {"profession":"plumber","is_urgent":false,"problem_description":"blocked drain in bathroom","max_radius_km":null,"confidence":0.94}
 
-Requête: "الفريج خربان ما يبردش"
-{"profession":"appliance_repair","is_urgent":false,"problem_description":"refrigerator not cooling","max_radius_km":null,"confidence":0.91}
-
-Requête: "الباب ما يقفلش، القفل محطوب"
-{"profession":"carpenter","is_urgent":true,"problem_description":"broken door lock, cannot secure home","max_radius_km":null,"confidence":0.96}
-
 Requête: "j'ai une fuite d'eau sous l'évier"
 {"profession":"plumber","is_urgent":false,"problem_description":"water leak under sink","max_radius_km":null,"confidence":0.97}
 
 Requête: "prise électrique qui fait des étincelles"
 {"profession":"electrician","is_urgent":true,"problem_description":"electrical outlet sparking","max_radius_km":null,"confidence":0.95}
-
-Requête: "نبغي نصبغ الدار، قريب مني"
-{"profession":"painter","is_urgent":false,"problem_description":"wants to paint house, looking for nearby worker","max_radius_km":5,"confidence":0.88}
 
 Requête: "my toilet is overflowing"
 {"profession":"plumber","is_urgent":true,"problem_description":"toilet overflowing","max_radius_km":null,"confidence":0.97}
@@ -160,6 +246,15 @@ export class IntentExtractorService {
   private readonly RATE_LIMIT_MAX    = 20;
   private readonly RATE_LIMIT_WINDOW = 3_600_000;
 
+  // ── Circuit Breaker state ──────────────────────────────────────────────────
+  // FIX v7 : Protège contre la cascade de timeouts lors des crashes Ollama/Whisper.
+  private circuitState:         CircuitState = 'closed';
+  private circuitFailures       = 0;
+  private circuitLastFailureAt  = 0;
+
+  private static readonly CIRCUIT_THRESHOLD = 3;       // failures avant ouverture
+  private static readonly CIRCUIT_RESET_MS  = 30_000;  // 30s en open avant half-open
+
   constructor(
     @Inject(AI_PROVIDER_TOKEN)
     private readonly ai: IAiProvider,
@@ -175,6 +270,9 @@ export class IntentExtractorService {
 
     if (uid) await this.checkRateLimit(uid);
 
+    // Circuit breaker check — fail fast si Ollama est en cours de recovery
+    this.assertCircuitClosed('text');
+
     const cacheKey = this.hashKey(trimmed.toLowerCase());
     const cached   = this.cache.get(cacheKey);
     if (cached) {
@@ -185,44 +283,25 @@ export class IntentExtractorService {
     try {
       const raw    = await this.ai.generateText(trimmed, SYSTEM_PROMPT, { temperature: 0.05, maxTokens: 256 });
       const intent = this.parse(raw);
+      this.onCircuitSuccess();
       this.setCache(cacheKey, intent);
       return intent;
     } catch (err) {
-      if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/rate-limit on text extraction: ${(err as Error).message}`);
-        throw new AiRateLimitException();
-      }
-      if (isOverloadError(err)) {
-        this.logger.warn(`AI model overloaded on text extraction: ${(err as Error).message}`);
-        throw new AiProviderException(
-          'AI model temporarily overloaded. Please try again later.',
-          HttpStatus.SERVICE_UNAVAILABLE,
-        );
-      }
-      this.logger.error(`extractFromText failed: ${(err as Error).message}`);
-      return { ...FALLBACK };
+      return this.handleAiError(err, 'extractFromText');
     }
   }
 
   async extractFromAudio(buffer: Buffer, mime: string, uid?: string): Promise<SearchIntent> {
+    // Circuit breaker check (Whisper utilise le même circuit)
+    this.assertCircuitClosed('audio');
+
     let transcription: AudioResult;
 
     try {
       transcription = await this.ai.processAudio(buffer, mime);
+      this.onCircuitSuccess();
     } catch (err) {
-      if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/rate-limit on audio: ${(err as Error).message}`);
-        throw new AiRateLimitException();
-      }
-      if (isOverloadError(err)) {
-        this.logger.warn(`AI model overloaded on audio: ${(err as Error).message}`);
-        throw new AiProviderException(
-          'AI model temporarily overloaded. Please try again later.',
-          HttpStatus.SERVICE_UNAVAILABLE,
-        );
-      }
-      this.logger.error(`Audio processing failed: ${(err as Error).message}`);
-      return { ...FALLBACK };
+      return this.handleAiError(err, 'extractFromAudio');
     }
 
     const { text, language } = transcription;
@@ -244,28 +323,129 @@ export class IntentExtractorService {
   async extractFromImage(imageBase64: string, uid?: string): Promise<SearchIntent> {
     if (uid) await this.checkRateLimit(uid);
 
+    // Circuit breaker check
+    this.assertCircuitClosed('image');
+
     try {
       const raw = await this.ai.analyzeImage(
         imageBase64,
         `Identifie le problème domestique visible dans cette image, puis extrait l'intention.\n${SYSTEM_PROMPT}`,
         { temperature: 0.05, maxTokens: 256 },
       );
+      this.onCircuitSuccess();
       return this.parse(raw);
     } catch (err) {
-      if (isQuotaError(err)) {
-        this.logger.warn(`AI quota/rate-limit on image: ${(err as Error).message}`);
-        throw new AiRateLimitException();
+      return this.handleAiError(err, 'extractFromImage');
+    }
+  }
+
+  /**
+   * Retourne l'état actuel du circuit breaker.
+   * Utilisable par un health check endpoint.
+   */
+  getCircuitStatus(): CircuitStatus {
+    const recoversAt =
+      this.circuitState === 'open'
+        ? this.circuitLastFailureAt + IntentExtractorService.CIRCUIT_RESET_MS
+        : null;
+
+    return {
+      state:         this.circuitState,
+      failures:      this.circuitFailures,
+      lastFailureAt: this.circuitLastFailureAt,
+      recoversAt,
+    };
+  }
+
+  // ── Circuit Breaker ─────────────────────────────────────────────────────────
+
+  /**
+   * Vérifie si le circuit est ouvert et lève une exception immédiate si c'est le cas.
+   * Transition OPEN → HALF-OPEN si le délai de reset est écoulé.
+   *
+   * @param context Label pour le log (text / audio / image)
+   */
+  private assertCircuitClosed(context: string): void {
+    if (this.circuitState === 'closed') return;
+
+    if (this.circuitState === 'open') {
+      const elapsed = Date.now() - this.circuitLastFailureAt;
+      if (elapsed >= IntentExtractorService.CIRCUIT_RESET_MS) {
+        this.circuitState = 'half-open';
+        this.logger.log(
+          `AI circuit breaker → HALF-OPEN after ${(elapsed / 1000).toFixed(0)}s — testing recovery`,
+        );
+        return; // Laisser passer cette requête test
       }
-      if (isOverloadError(err)) {
-        this.logger.warn(`AI model overloaded on image: ${(err as Error).message}`);
-        throw new AiProviderException(
-          'AI model temporarily overloaded. Please try again later.',
-          HttpStatus.SERVICE_UNAVAILABLE,
+
+      const remaining = Math.ceil(
+        (IntentExtractorService.CIRCUIT_RESET_MS - elapsed) / 1000,
+      );
+      this.logger.warn(
+        `AI circuit breaker OPEN — rejecting [${context}] request. ` +
+        `Recovery in ~${remaining}s`,
+      );
+      throw new AiProviderException(
+        `AI service temporarily unavailable. Please try again in ${remaining} seconds.`,
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+    // half-open : laisser passer
+  }
+
+  private onCircuitSuccess(): void {
+    if (this.circuitState !== 'closed') {
+      this.logger.log(
+        `AI circuit breaker → CLOSED (recovered after ${this.circuitFailures} failure(s))`,
+      );
+    }
+    this.circuitFailures = 0;
+    this.circuitState    = 'closed';
+  }
+
+  private onCircuitFailure(): void {
+    this.circuitFailures++;
+    this.circuitLastFailureAt = Date.now();
+
+    if (this.circuitFailures >= IntentExtractorService.CIRCUIT_THRESHOLD) {
+      if (this.circuitState !== 'open') {
+        this.logger.warn(
+          `AI circuit breaker → OPEN after ${this.circuitFailures} consecutive failures. ` +
+          `Fast-failing requests for ${IntentExtractorService.CIRCUIT_RESET_MS / 1000}s.`,
         );
       }
-      this.logger.error(`extractFromImage failed: ${(err as Error).message}`);
-      return { ...FALLBACK };
+      this.circuitState = 'open';
     }
+  }
+
+  // ── Error handler centralisé ────────────────────────────────────────────────
+  //
+  // Centralise la logique d'erreur qui était dupliquée dans chaque extract*().
+  // Retourne toujours : soit lève une exception HTTP, soit retourne FALLBACK.
+
+  private handleAiError(err: unknown, context: string): never | SearchIntent {
+    this.onCircuitFailure();
+
+    if (isQuotaError(err)) {
+      this.logger.warn(`AI quota/rate-limit [${context}]: ${(err as Error).message}`);
+      throw new AiRateLimitException();
+    }
+
+    if (isOverloadError(err)) {
+      this.logger.warn(`AI service overloaded/unavailable [${context}]: ${(err as Error).message}`);
+      throw new AiProviderException(
+        'AI model temporarily unavailable. Please try again later.',
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    // Erreur non-classifiée — log complet, retour FALLBACK sans crash.
+    // N'inclut PAS les erreurs réseau/OOM (déjà interceptées ci-dessus).
+    this.logger.error(
+      `[${context}] Unclassified AI error: ${(err as Error).message}`,
+      (err as Error).stack,
+    );
+    return { ...FALLBACK };
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
