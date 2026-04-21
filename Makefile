@@ -2,30 +2,16 @@
 ## KHIDMETI BACKEND — Makefile
 ##
 ## WORKFLOW :
-##   make start       → 1ère fois : pull image Ollama latest + modèle gemma3:4b
-##   make start       → fois suivantes : démarrage instantané (modèle en volume)
-##   make ollama-pull → forcer re-pull (ex: changer de modèle)
+##   make start              → démarrer les services
+##   make ollama-pull-all    → pull les deux modèles (1ère fois uniquement)
+##   make start              → fois suivantes : démarrage instantané (volumes)
+##   make ollama-pull        → forcer re-pull du modèle texte
 ##
-## FIXES v3 :
-##   - `make start` force `docker compose pull ollama` avant `up -d`
-##     → garantit Ollama >= v0.6 requis pour gemma3:4b (multimodal engine)
-##   - `ollama-pull` utilise `docker exec` SANS flag -t (TTY)
-##     → corrige l'échec silencieux en environnement headless/Codespaces
-##   - Fallback HTTP API si docker exec échoue
-##     → robustesse en cas d'état incohérent du container
-##   - Vérification DNS avant pull
-##     → avertit si registry.ollama.ai est inaccessible
-##
-## FIXES v4 :
-##   - Détection des erreurs JSON dans le stream Méthode 2
-##     → exit 1 si [ERROR] détecté dans le flux pull (corrige faux succès)
-##   - Vérification espace disque avant pull
-##     → échec explicite si < 4 GB libres (gemma3:4b = 3.3 GB)
-##   - Nouveau target clean-ollama-partial
-##     → supprime les fichiers .partial laissés par un pull interrompu
-##   - Modèle : gemma4:e2b → gemma3:4b
-##     → gemma4:e2b (7.2 GB) ne tenait pas dans Codespace 32 GB
-##     → gemma3:4b (3.3 GB) = texte + image + 140+ langues (arabe/darija/fr/en)
+## FIXES v8 — DUAL-MODEL :
+##   - `ollama-pull-all` : pull gemma3:1b (texte) + moondream (vision)
+##   - `ollama-pull` : pull du modèle texte seul (OLLAMA_MODEL)
+##   - `test-ai` : testé sur gemma3:1b
+##   - Budget mémoire réduit : 6.5 GB → 1.5 GB
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -59,7 +45,10 @@ DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
 _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
-  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma3:4b')
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'gemma3:1b')
+
+_OLLAMA_VISION_MODEL := $(shell grep '^OLLAMA_VISION_MODEL' .env 2>/dev/null \
+  | cut -d= -f2 | tr -d '[:space:]' || echo 'moondream')
 
 .DEFAULT_GOAL := help
 
@@ -68,7 +57,7 @@ _OLLAMA_MODEL := $(shell grep '^OLLAMA_MODEL' .env 2>/dev/null \
         logs-qdrant logs-minio logs-nginx logs-mongo-ui \
         logs-ollama logs-whisper \
         health status ai-status dns \
-        ollama-pull \
+        ollama-pull ollama-pull-all \
         minio-buckets minio-console minio-list \
         test-api test-ai firewall backup restore \
         shell-api shell-mongo shell-redis shell-minio shell-qdrant \
@@ -88,16 +77,19 @@ help: ## Afficher l'aide
 	@echo "══════════════════════════════════════════════"
 	@echo "  KHIDMETI — Commandes disponibles"
 	@echo "  OS : $(OS) | Architecture : $(ARCH)"
+	@echo "  Modèle texte  : $(_OLLAMA_MODEL)"
+	@echo "  Modèle vision : $(_OLLAMA_VISION_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo "  [DÉMARRAGE]"
-	@echo "  start              Démarrer + pull modèle si absent (progression visible)"
+	@echo "  start              Démarrer les services"
 	@echo "  start-gpu          Démarrer avec GPU NVIDIA"
 	@echo "  stop               Arrêter (volumes conservés)"
 	@echo "  restart            Redémarrer"
 	@echo ""
-	@echo "  [OLLAMA]"
-	@echo "  ollama-pull        Pull / mise à jour du modèle (progression visible)"
+	@echo "  [OLLAMA — DUAL-MODEL v8]"
+	@echo "  ollama-pull-all    Pull les deux modèles (1ère fois)"
+	@echo "  ollama-pull        Pull / mise à jour du modèle texte"
 	@echo ""
 	@echo "  [BUILD API]"
 	@echo "  build              Builder l'image NestJS"
@@ -137,33 +129,126 @@ help: ## Afficher l'aide
 	@echo "  [NETTOYAGE]"
 	@echo "  clean              Supprimer volumes + données"
 	@echo "  clean-logs         Vider les logs"
-	@echo "  clean-ollama-partial  Supprimer fichiers pull partiels (libère espace)"
+	@echo "  clean-ollama-partial  Supprimer fichiers pull partiels"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## OLLAMA — Pull robuste (sans flag -t, avec fallback HTTP API)
-##
-## STRATÉGIE DE PULL (ordre de priorité) :
-##   1. `docker exec` SANS -t (headless, Codespaces, CI)
-##   2. Fallback HTTP API si docker exec échoue
-##      → `POST /api/pull` avec stream:true
-##      → Si le JSON contient "error", exit 1 immédiatement
-##
-## VÉRIFICATION ESPACE DISQUE :
-##   gemma3:4b = 3.3 GB → 4 GB libres requis minimum.
-##   Un pull interrompu (no space left) laisse un fichier *-partial.
-##   Utiliser `make clean-ollama-partial` pour libérer cet espace.
-##   Si disque trop plein : `docker system prune -f` libère les images inutilisées.
-##
-## PRÉREQUIS MODÈLE :
-##   gemma3:4b nécessite Ollama >= v0.6
-##   `make start` force `docker compose pull ollama` → garantit la version
+## OLLAMA — Pull helpers internes
 ## ══════════════════════════════════════════════════════════════════════════════
 
-ollama-pull: ## Pull du modèle avec progression (sans TTY, compatible Codespaces)
+# Fonction interne : pull un modèle donné via docker exec ou HTTP API fallback
+# Usage : $(call _pull_model,model_name)
+define _pull_model
+	@echo "  📥 Pull : $(1)"
+	@_pull_ok=0; \
+	echo "  [Méthode 1/2] docker exec (sans TTY)..."; \
+	if docker exec khidmeti-ollama ollama pull $(1) 2>&1; then \
+	  _pull_ok=1; \
+	else \
+	  echo ""; \
+	  echo "  ⚠️  Méthode 1 échouée. Tentative via HTTP API..."; \
+	  echo "  [Méthode 2/2] POST /api/pull (stream JSON)..."; \
+	  echo ""; \
+	  if curl -sf -X POST http://localhost:11434/api/pull \
+	      -H "Content-Type: application/json" \
+	      -d "{\"model\":\"$(1)\",\"stream\":true}" \
+	      --no-buffer --max-time 900 \
+	      | while IFS= read -r line; do \
+	          STATUS=$$(echo "$$line" | python3 -c \
+	            "import sys,json; \
+	             d=json.loads(sys.stdin.read().strip()); \
+	             s=d.get('status',''); \
+	             c=d.get('completed',0); \
+	             t=d.get('total',0); \
+	             err=d.get('error',''); \
+	             print('[ERROR] '+err if err else (s+' '+str(c)+'/'+str(t) if t else s))" \
+	            2>/dev/null || echo "$$line"); \
+	          echo "  $$STATUS"; \
+	          if echo "$$STATUS" | grep -q "^\[ERROR\]"; then exit 1; fi; \
+	        done; then \
+	    _pull_ok=1; \
+	  fi; \
+	fi; \
+	if [ "$$_pull_ok" -eq 0 ]; then \
+	  echo ""; \
+	  echo "  ❌ Pull de $(1) échoué."; \
+	  echo "  → make clean-ollama-partial  (si disque plein)"; \
+	  echo "  → docker system prune -f     (libère images inutilisées)"; \
+	  echo "  → make ai-status             (pour diagnostiquer)"; \
+	  exit 1; \
+	fi; \
+	echo "  ✅ $(1) prêt."
+endef
+
+## ══════════════════════════════════════════════════════════════════════════════
+## OLLAMA — Pull dual-model (v8)
+##
+## À exécuter UNE SEULE FOIS après make start.
+## Les modèles sont conservés dans le volume khidmeti-ollama-data.
+##
+##   make ollama-pull-all    → pull gemma3:1b + moondream
+##   make ai-status          → vérifier que les deux modèles sont présents
+##
+## STRATÉGIE SWAP :
+##   OLLAMA_MAX_LOADED_MODELS=1 → un seul modèle en RAM à la fois.
+##   Ollama swap automatiquement gemma3:1b ↔ moondream selon le type de requête.
+##   Swap time ≈ 5-10s (acceptable pour CPU-only).
+## ══════════════════════════════════════════════════════════════════════════════
+
+ollama-pull-all: ## Pull les deux modèles : gemma3:1b (texte) + moondream (vision)
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Pull modèle Ollama"
+	@echo "  Pull modèles Ollama — Dual-model v8"
+	@echo "  Texte  : $(_OLLAMA_MODEL)"
+	@echo "  Vision : $(_OLLAMA_VISION_MODEL)"
+	@echo "══════════════════════════════════════════════"
+	@echo ""
+	@echo "  ⏳ Attente que Ollama soit prêt..."
+	@READY=0; \
+	for i in $$(seq 1 30); do \
+	  if curl -sf http://localhost:11434/ > /dev/null 2>&1; then \
+	    READY=1; break; \
+	  fi; \
+	  printf "."; sleep 3; \
+	done; \
+	echo ""; \
+	if [ "$$READY" -eq 0 ]; then \
+	  echo "  ❌ Ollama ne répond pas après 90s."; \
+	  echo "  → Vérifiez : docker logs khidmeti-ollama"; \
+	  exit 1; \
+	fi
+	@echo "  ✅ Ollama prêt."
+	@echo ""
+	@echo "  💾 Vérification espace disque..."
+	@_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
+	_free_gb=$$(( $$_free_kb / 1024 / 1024 )); \
+	echo "     Espace libre : ~$${_free_gb} GB (besoin : ~3 GB pour les deux modèles)"; \
+	if [ "$$_free_kb" -lt 3145728 ]; then \
+	  echo "  ❌ Espace disque insuffisant ($${_free_gb} GB libres, 3 GB requis)."; \
+	  echo "  → make clean-ollama-partial  (supprime fichiers partiels)"; \
+	  echo "  → docker system prune -f     (libère images inutilisées)"; \
+	  exit 1; \
+	fi
+	@echo "  ✅ Espace disque suffisant."
+	@echo ""
+	$(call _pull_model,$(_OLLAMA_MODEL))
+	@echo ""
+	$(call _pull_model,$(_OLLAMA_VISION_MODEL))
+	@echo ""
+	@echo "══════════════════════════════════════════════"
+	@echo "  ✅ Les deux modèles sont prêts."
+	@echo "  → make ai-status  pour vérifier"
+	@echo "══════════════════════════════════════════════"
+	@echo ""
+
+## ══════════════════════════════════════════════════════════════════════════════
+## OLLAMA — Pull modèle texte seul (OLLAMA_MODEL)
+## ══════════════════════════════════════════════════════════════════════════════
+
+ollama-pull: ## Pull / mise à jour du modèle texte (sans TTY, compatible Codespaces)
+	@echo ""
+	@echo "══════════════════════════════════════════════"
+	@echo "  Pull modèle texte Ollama"
 	@echo "  Modèle : $(_OLLAMA_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
@@ -183,94 +268,30 @@ ollama-pull: ## Pull du modèle avec progression (sans TTY, compatible Codespace
 	fi
 	@echo "  ✅ Ollama est prêt."
 	@echo ""
-	@echo "  🔍 Vérification de la connectivité vers registry.ollama.ai..."
-	@if docker exec khidmeti-ollama sh -c \
-	    'curl -sf --max-time 5 https://registry.ollama.ai > /dev/null 2>&1 || \
-	     curl -sf --max-time 5 https://ollama.com > /dev/null 2>&1'; then \
-	  echo "  ✅ Connexion au registre Ollama : OK"; \
-	else \
-	  echo "  ⚠️  Connexion au registre Ollama : LIMITÉE"; \
-	  echo "  → DNS 8.8.8.8/1.1.1.1 configurés dans docker-compose.yml"; \
-	  echo "  → Le pull va quand même être tenté (Ollama gère les retry)"; \
-	fi
-	@echo ""
 	@echo "  💾 Vérification de l'espace disque..."
 	@_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
 	_free_gb=$$(( $$_free_kb / 1024 / 1024 )); \
 	echo "     Espace libre : ~$${_free_gb} GB"; \
-	if [ "$$_free_kb" -lt 4194304 ]; then \
-	  echo ""; \
-	  echo "  ❌ Espace disque insuffisant ($${_free_gb} GB libres, 4 GB requis)."; \
-	  echo ""; \
-	  echo "  Solutions :"; \
-	  echo "    make clean-ollama-partial   → supprime les fichiers partiels (~3 GB)"; \
-	  echo "    docker system prune -f      → nettoie images/conteneurs inutilisés"; \
-	  echo "    df -h                       → diagnostic complet"; \
+	if [ "$$_free_kb" -lt 2097152 ]; then \
+	  echo "  ❌ Espace disque insuffisant ($${_free_gb} GB libres, 2 GB requis)."; \
+	  echo "  → make clean-ollama-partial puis réessayez"; \
 	  exit 1; \
 	fi
 	@echo "  ✅ Espace disque suffisant."
 	@echo ""
-	@echo "  📥 Téléchargement en cours..."
-	@echo "  (la progression s'affiche ligne par ligne en mode headless)"
+	$(call _pull_model,$(_OLLAMA_MODEL))
 	@echo ""
-	@_pull_ok=0; \
-	echo "  [Méthode 1/2] docker exec (sans TTY)..."; \
-	if docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL) 2>&1; then \
-	  _pull_ok=1; \
-	else \
-	  echo ""; \
-	  echo "  ⚠️  Méthode 1 échouée. Tentative via HTTP API..."; \
-	  echo "  [Méthode 2/2] POST /api/pull (stream JSON)..."; \
-	  echo ""; \
-	  if curl -sf -X POST http://localhost:11434/api/pull \
-	      -H "Content-Type: application/json" \
-	      -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"stream\":true}" \
-	      --no-buffer --max-time 900 \
-	      | while IFS= read -r line; do \
-	          STATUS=$$(echo "$$line" | python3 -c \
-	            "import sys,json; \
-	             d=json.loads(sys.stdin.read().strip()); \
-	             s=d.get('status',''); \
-	             c=d.get('completed',0); \
-	             t=d.get('total',0); \
-	             err=d.get('error',''); \
-	             print('[ERROR] '+err if err else (s+' '+str(c)+'/'+str(t) if t else s))" \
-	            2>/dev/null || echo "$$line"); \
-	          echo "  $$STATUS"; \
-	          if echo "$$STATUS" | grep -q "^\[ERROR\]"; then exit 1; fi; \
-	        done; then \
-	    _pull_ok=1; \
-	  else \
-	    echo ""; \
-	    echo "  ❌ Les deux méthodes ont échoué."; \
-	    echo ""; \
-	    echo "  Causes possibles :"; \
-	    echo "  1. Disque plein → make clean-ollama-partial puis réessayez"; \
-	    echo "     docker system prune -f  (libère images Docker inutilisées)"; \
-	    echo "  2. Image Ollama trop ancienne → lancez d'abord : make start"; \
-	    echo "     (make start force docker compose pull ollama)"; \
-	    echo "  3. Réseau : vérifiez que le VPN ne bloque pas registry.ollama.ai"; \
-	    echo "  4. RAM insuffisante : gemma3:4b nécessite ~4 GB libres"; \
-	    echo ""; \
-	    echo "  Diagnostic : make ai-status"; \
-	    exit 1; \
-	  fi; \
-	fi; \
-	if [ "$$_pull_ok" -eq 1 ]; then \
-	  echo ""; \
-	  echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."; \
-	  echo ""; \
-	fi
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## GESTION DES SERVICES
 ## ══════════════════════════════════════════════════════════════════════════════
 
-start: ## Démarrer tous les services + pull modèle Ollama si absent
+start: ## Démarrer tous les services (modèles Ollama via make ollama-pull-all)
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Démarrage de Khidmeti"
-	@echo "  Modèle IA : $(_OLLAMA_MODEL)"
+	@echo "  Modèle texte  : $(_OLLAMA_MODEL)"
+	@echo "  Modèle vision : $(_OLLAMA_VISION_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@mkdir -p logs backups/mongodb data/mongodb data/redis data/qdrant data/minio
@@ -278,8 +299,7 @@ start: ## Démarrer tous les services + pull modèle Ollama si absent
 		cp .env.example .env 2>/dev/null || true; \
 		echo "  ⚠️  .env créé — configurez FIREBASE_* avant de continuer"; echo ""; \
 	fi
-	@echo "  🔄 Mise à jour de l'image Ollama (requis pour $(_OLLAMA_MODEL))..."
-	@echo "  → Ollama >= v0.6 nécessaire. Pull en cours..."
+	@echo "  🔄 Mise à jour de l'image Ollama..."
 	@docker compose pull ollama 2>&1 | grep -E "(Pull|Pulling|already|latest)" || true
 	@echo "  ✅ Image Ollama à jour."
 	@echo ""
@@ -298,60 +318,28 @@ start: ## Démarrer tous les services + pull modèle Ollama si absent
 	done; \
 	echo ""; \
 	if [ "$$READY" -eq 0 ]; then \
-	  echo "  ⚠️  Ollama n'est pas encore prêt — il démarre peut-être encore."; \
-	  echo "  → Pour vérifier : make logs-ollama"; \
-	  echo "  → Pour puller le modèle plus tard : make ollama-pull"; \
+	  echo "  ⚠️  Ollama n'est pas encore prêt."; \
+	  echo "  → make logs-ollama"; \
+	  echo "  → make ollama-pull-all  (pour les modèles)"; \
 	  echo ""; \
 	  $(MAKE) health; \
 	  $(MAKE) dns; \
 	  exit 0; \
 	fi
 	@echo ""
-	@echo "  🔍 Vérification du modèle $(_OLLAMA_MODEL)..."
-	@if docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)"; then \
-	  echo "  ✅ Modèle $(_OLLAMA_MODEL) déjà présent — démarrage instantané."; \
-	  echo ""; \
-	else \
-	  echo "  ℹ️  Modèle absent du volume — téléchargement en cours..."; \
-	  echo "  📥 Progression (affichage ligne par ligne) :"; \
-	  echo ""; \
-	  _pull_ok=0; \
-	  if docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL) 2>&1; then \
-	    _pull_ok=1; \
-	  else \
-	    echo ""; \
-	    echo "  ⚠️  docker exec a échoué, tentative via HTTP API..."; \
-	    if curl -sf -X POST http://localhost:11434/api/pull \
-	        -H "Content-Type: application/json" \
-	        -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"stream\":true}" \
-	        --no-buffer --max-time 900 \
-	        | while IFS= read -r line; do \
-	            STATUS=$$(echo "$$line" | python3 -c \
-	              "import sys,json; \
-	               d=json.loads(sys.stdin.read().strip()); \
-	               s=d.get('status',''); \
-	               c=d.get('completed',0); \
-	               t=d.get('total',0); \
-	               err=d.get('error',''); \
-	               print('[ERROR] '+err if err else (s+' '+str(c)+'/'+str(t) if t else s))" \
-	              2>/dev/null || echo "$$line"); \
-	            echo "  $$STATUS"; \
-	            if echo "$$STATUS" | grep -q "^\[ERROR\]"; then exit 1; fi; \
-	          done; then \
-	      _pull_ok=1; \
-	    else \
-	      echo "  ❌ Pull impossible."; \
-	      echo "  → make clean-ollama-partial  (si disque plein)"; \
-	      echo "  → docker system prune -f     (libère images inutilisées)"; \
-	      echo "  → make ollama-pull           (pour diagnostiquer)"; \
-	    fi; \
-	  fi; \
-	  if [ "$$_pull_ok" -eq 1 ]; then \
-	    echo ""; \
-	    echo "  ✅ Modèle $(_OLLAMA_MODEL) prêt."; \
-	    echo ""; \
-	  fi; \
+	@echo "  🔍 Vérification des modèles..."
+	@TEXT_OK=0; VISION_OK=0; \
+	docker exec khidmeti-ollama ollama list 2>/dev/null \
+	  | grep -q "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)" && TEXT_OK=1; \
+	docker exec khidmeti-ollama ollama list 2>/dev/null \
+	  | grep -q "$(shell echo $(_OLLAMA_VISION_MODEL) | cut -d: -f1)" && VISION_OK=1; \
+	if [ "$$TEXT_OK" -eq 1 ] && [ "$$VISION_OK" -eq 1 ]; then \
+	  echo "  ✅ Les deux modèles sont présents — démarrage instantané."; \
+	elif [ "$$TEXT_OK" -eq 0 ] || [ "$$VISION_OK" -eq 0 ]; then \
+	  echo "  ℹ️  Modèle(s) absent(s) du volume."; \
+	  echo "  → Lancez : make ollama-pull-all"; \
 	fi
+	@echo ""
 	@$(MAKE) health
 	@$(MAKE) dns
 
@@ -359,7 +347,8 @@ start-gpu: ## Démarrer avec GPU NVIDIA
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Démarrage Khidmeti — GPU NVIDIA"
-	@echo "  Modèle : $(_OLLAMA_MODEL)"
+	@echo "  Modèle texte  : $(_OLLAMA_MODEL)"
+	@echo "  Modèle vision : $(_OLLAMA_VISION_MODEL)"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo "  🔄 Mise à jour image Ollama..."
@@ -369,17 +358,13 @@ start-gpu: ## Démarrer avec GPU NVIDIA
 	@echo "  ⏳ Attente Ollama..."
 	@until curl -sf http://localhost:11434/ > /dev/null 2>&1; do printf "."; sleep 2; done
 	@echo ""
-	@if ! docker exec khidmeti-ollama ollama list 2>/dev/null | grep -q "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)"; then \
-	  echo "  📥 Pull modèle GPU..."; \
-	  docker exec khidmeti-ollama ollama pull $(_OLLAMA_MODEL); \
-	fi
 	@$(MAKE) health
 
-stop: ## Arrêter tous les services (volumes conservés — modèle intact)
+stop: ## Arrêter tous les services (volumes conservés — modèles intacts)
 	@docker compose down
 	@echo ""
 	@echo "  ✅ Services arrêtés."
-	@echo "  ℹ️  Le modèle Ollama est conservé dans le volume khidmeti-ollama-data."
+	@echo "  ℹ️  Les modèles Ollama sont conservés dans le volume khidmeti-ollama-data."
 	@echo ""
 
 stop-gpu: ## Arrêter les services GPU
@@ -482,7 +467,7 @@ status: ## Statut + consommation mémoire des conteneurs
 ai-status: ## Statut IA + modèles disponibles dans Ollama
 	@echo ""
 	@echo "══════════════════════════════════════════════"
-	@echo "  Statut IA locale"
+	@echo "  Statut IA locale — Dual-model v8"
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@echo -n "  Ollama  (11434) : "; \
@@ -495,6 +480,16 @@ ai-status: ## Statut IA + modèles disponibles dans Ollama
 	@echo "  Modèles installés :"
 	@docker exec khidmeti-ollama ollama list 2>/dev/null || echo "   (Ollama non démarré)"
 	@echo ""
+	@echo "  ── Vérification dual-model ──"
+	@TEXT_OK=$$(docker exec khidmeti-ollama ollama list 2>/dev/null \
+	  | grep -c "$(shell echo $(_OLLAMA_MODEL) | cut -d: -f1)" || echo 0); \
+	VISION_OK=$$(docker exec khidmeti-ollama ollama list 2>/dev/null \
+	  | grep -c "$(shell echo $(_OLLAMA_VISION_MODEL) | cut -d: -f1)" || echo 0); \
+	echo -n "  Texte ($(_OLLAMA_MODEL))   : "; \
+	[ "$$TEXT_OK" -gt 0 ] && echo "✅ présent" || echo "❌ absent → make ollama-pull-all"; \
+	echo -n "  Vision ($(_OLLAMA_VISION_MODEL)) : "; \
+	[ "$$VISION_OK" -gt 0 ] && echo "✅ présent" || echo "❌ absent → make ollama-pull-all"
+	@echo ""
 	@echo "  Version Ollama :"
 	@docker exec khidmeti-ollama ollama --version 2>/dev/null || echo "   (non disponible)"
 	@echo ""
@@ -505,12 +500,6 @@ ai-status: ## Statut IA + modèles disponibles dans Ollama
 	@echo "  Espace disque volume Ollama :"
 	@docker exec khidmeti-ollama df -h /root/.ollama 2>/dev/null \
 	  || echo "   (container non démarré)"
-	@echo ""
-	@echo "  Fichiers partiels (pull interrompu) :"
-	@docker exec khidmeti-ollama sh -c \
-	  'find /root/.ollama/models/blobs -name "*-partial" 2>/dev/null | \
-	   while read f; do du -sh "$$f" 2>/dev/null; done | head -5 || echo "   aucun"' \
-	  2>/dev/null || echo "   (container non démarré)"
 	@echo ""
 	@echo "  RAM disponible sur l'hôte :"
 	@free -h 2>/dev/null | awk '/^Mem:/{print "   Total: " $$2 "  |  Utilisée: " $$3 "  |  Libre: " $$4}' || \
@@ -752,14 +741,25 @@ test-api: ## Tester les endpoints principaux
 	@echo "  [2] Swagger :"; curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/docs
 	@echo ""
 
-test-ai: ## Tester l'extraction d'intention Darija avec gemma3:4b
+test-ai: ## Tester l'extraction d'intention Darija avec gemma3:1b
 	@echo ""
 	@echo "  Test Ollama — extraction Darija ($(_OLLAMA_MODEL))..."
-	@echo "  Modèle : $(_OLLAMA_MODEL)"
+	@echo "  Modèle texte : $(_OLLAMA_MODEL)"
 	@echo ""
 	@curl -s http://localhost:11434/v1/chat/completions \
 	  -H "Content-Type: application/json" \
-	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":4096},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
+	  -d "{\"model\":\"$(_OLLAMA_MODEL)\",\"messages\":[{\"role\":\"system\",\"content\":\"Réponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":1024},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}" \
+	  | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible"
+	@echo ""
+
+test-ai-vision: ## Tester l'analyse d'image avec moondream
+	@echo ""
+	@echo "  Test Ollama — analyse image ($(_OLLAMA_VISION_MODEL))..."
+	@echo "  Modèle vision : $(_OLLAMA_VISION_MODEL)"
+	@echo ""
+	@curl -s http://localhost:11434/api/generate \
+	  -H "Content-Type: application/json" \
+	  -d "{\"model\":\"$(_OLLAMA_VISION_MODEL)\",\"prompt\":\"Describe what you see in one sentence.\",\"stream\":false}" \
 	  | python3 -m json.tool 2>/dev/null || echo "  ❌ Ollama non disponible"
 	@echo ""
 
@@ -841,7 +841,7 @@ clean-logs: ## Vider les logs
 	@find logs/ -name "*.log" -delete 2>/dev/null || true
 	@echo "✅ Logs nettoyés."
 
-clean-ollama-partial: ## Supprimer les fichiers de téléchargement partiels d'Ollama (libère espace)
+clean-ollama-partial: ## Supprimer les fichiers de téléchargement partiels d'Ollama
 	@echo ""
 	@echo "══════════════════════════════════════════════"
 	@echo "  Nettoyage fichiers partiels Ollama"
@@ -867,10 +867,10 @@ clean-ollama-partial: ## Supprimer les fichiers de téléchargement partiels d'O
 	@df -h . | awk 'NR==2{print "   Utilisé: " $$3 "  |  Libre: " $$4 "  |  Total: " $$2}'
 	@echo ""
 
-clean: ## Supprimer volumes + données (y compris le modèle Ollama)
+clean: ## Supprimer volumes + données (y compris les modèles Ollama)
 	@echo ""
-	@echo "  ⚠️  Supprime : MongoDB, Redis, Qdrant, MinIO ET le modèle Ollama."
-	@echo "  Le modèle sera re-téléchargé au prochain : make start"
+	@echo "  ⚠️  Supprime : MongoDB, Redis, Qdrant, MinIO ET les modèles Ollama."
+	@echo "  Les modèles seront re-téléchargés avec : make ollama-pull-all"
 	@echo ""
 	@read -p "  Confirmer ? [y/N] " CONFIRM; \
 	if [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ]; then \

@@ -3,10 +3,11 @@
 :: KHIDMETI BACKEND — Windows CMD Script
 :: Usage: khidmeti.bat [command] [args]
 ::
-:: WORKFLOW :
-::   khidmeti.bat start       → 1ère fois : pull modèle + démarrage
-::   khidmeti.bat start       → fois suivantes : démarrage instantané (volume)
-::   khidmeti.bat ollama-pull → forcer re-pull avec progression visible
+:: WORKFLOW v8 — DUAL-MODEL :
+::   khidmeti.bat start            → démarrer les services
+::   khidmeti.bat ollama-pull-all  → pull gemma3:1b + moondream (1ère fois)
+::   khidmeti.bat start            → fois suivantes : démarrage instantané
+::   khidmeti.bat ollama-pull      → forcer re-pull modèle texte seul
 :: ══════════════════════════════════════════════════════════════════════════════
 setlocal enabledelayedexpansion
 
@@ -25,45 +26,54 @@ set LOCAL_IP=127.0.0.1
 :ip_found
 
 :: ── Lire OLLAMA_MODEL depuis .env ─────────────────────────────────────────────
-set OLLAMA_MODEL_VAL=gemma4:e2b
+set OLLAMA_MODEL_VAL=gemma3:1b
 for /f "tokens=2 delims==" %%a in ('findstr "^OLLAMA_MODEL=" .env 2^>nul') do (
   set OLLAMA_MODEL_VAL=%%a
   set OLLAMA_MODEL_VAL=!OLLAMA_MODEL_VAL: =!
 )
 
+:: ── Lire OLLAMA_VISION_MODEL depuis .env ──────────────────────────────────────
+set OLLAMA_VISION_MODEL_VAL=moondream
+for /f "tokens=2 delims==" %%a in ('findstr "^OLLAMA_VISION_MODEL=" .env 2^>nul') do (
+  set OLLAMA_VISION_MODEL_VAL=%%a
+  set OLLAMA_VISION_MODEL_VAL=!OLLAMA_VISION_MODEL_VAL: =!
+)
+
 :: ── Router la commande ────────────────────────────────────────────────────────
 set CMD=%1
 set ARGS=%2
-if "%CMD%"==""                  goto :help
-if /i "%CMD%"=="help"           goto :help
-if /i "%CMD%"=="start"          goto :start
-if /i "%CMD%"=="start-gpu"      goto :start_gpu
-if /i "%CMD%"=="stop"           goto :stop
-if /i "%CMD%"=="restart"        goto :restart
-if /i "%CMD%"=="build"          goto :build
-if /i "%CMD%"=="rebuild"        goto :rebuild
-if /i "%CMD%"=="ollama-pull"    goto :ollama_pull
-if /i "%CMD%"=="health"         goto :health
-if /i "%CMD%"=="ai-status"      goto :ai_status
-if /i "%CMD%"=="status"         goto :status
-if /i "%CMD%"=="logs"           goto :logs
-if /i "%CMD%"=="logs-api"       goto :logs_api
-if /i "%CMD%"=="logs-ollama"    goto :logs_ollama
-if /i "%CMD%"=="logs-whisper"   goto :logs_whisper
-if /i "%CMD%"=="dns"            goto :dns
-if /i "%CMD%"=="tunnel"         goto :tunnel
-if /i "%CMD%"=="ngrok"          goto :ngrok
-if /i "%CMD%"=="ngrok-install"  goto :ngrok_install
-if /i "%CMD%"=="ngrok-reset"    goto :ngrok_reset
-if /i "%CMD%"=="flutter-run"    goto :flutter_run
-if /i "%CMD%"=="clean"          goto :clean
-if /i "%CMD%"=="shell-api"      goto :shell_api
-if /i "%CMD%"=="shell-mongo"    goto :shell_mongo
-if /i "%CMD%"=="test-api"       goto :test_api
-if /i "%CMD%"=="test-ai"        goto :test_ai
-if /i "%CMD%"=="scripts"        goto :scripts
-if /i "%CMD%"=="scripts-migrations" goto :scripts_migrations
-if /i "%CMD%"=="scripts-seeds"  goto :scripts_seeds
+if "%CMD%"==""                       goto :help
+if /i "%CMD%"=="help"                goto :help
+if /i "%CMD%"=="start"               goto :start
+if /i "%CMD%"=="start-gpu"           goto :start_gpu
+if /i "%CMD%"=="stop"                goto :stop
+if /i "%CMD%"=="restart"             goto :restart
+if /i "%CMD%"=="build"               goto :build
+if /i "%CMD%"=="rebuild"             goto :rebuild
+if /i "%CMD%"=="ollama-pull-all"     goto :ollama_pull_all
+if /i "%CMD%"=="ollama-pull"         goto :ollama_pull
+if /i "%CMD%"=="health"              goto :health
+if /i "%CMD%"=="ai-status"           goto :ai_status
+if /i "%CMD%"=="status"              goto :status
+if /i "%CMD%"=="logs"                goto :logs
+if /i "%CMD%"=="logs-api"            goto :logs_api
+if /i "%CMD%"=="logs-ollama"         goto :logs_ollama
+if /i "%CMD%"=="logs-whisper"        goto :logs_whisper
+if /i "%CMD%"=="dns"                 goto :dns
+if /i "%CMD%"=="tunnel"              goto :tunnel
+if /i "%CMD%"=="ngrok"               goto :ngrok
+if /i "%CMD%"=="ngrok-install"       goto :ngrok_install
+if /i "%CMD%"=="ngrok-reset"         goto :ngrok_reset
+if /i "%CMD%"=="flutter-run"         goto :flutter_run
+if /i "%CMD%"=="clean"               goto :clean
+if /i "%CMD%"=="shell-api"           goto :shell_api
+if /i "%CMD%"=="shell-mongo"         goto :shell_mongo
+if /i "%CMD%"=="test-api"            goto :test_api
+if /i "%CMD%"=="test-ai"             goto :test_ai
+if /i "%CMD%"=="test-ai-vision"      goto :test_ai_vision
+if /i "%CMD%"=="scripts"             goto :scripts
+if /i "%CMD%"=="scripts-migrations"  goto :scripts_migrations
+if /i "%CMD%"=="scripts-seeds"       goto :scripts_seeds
 
 set PREFIX=%CMD:~0,8%
 if /i "%PREFIX%"=="scripts-" (
@@ -82,18 +92,20 @@ exit /b 1
 echo.
 echo ══════════════════════════════════════════════════════
 echo   KHIDMETI — Commandes Windows CMD
-echo   IP locale : %LOCAL_IP%
-echo   Modele    : %OLLAMA_MODEL_VAL%
+echo   IP locale      : %LOCAL_IP%
+echo   Modele texte   : %OLLAMA_MODEL_VAL%
+echo   Modele vision  : %OLLAMA_VISION_MODEL_VAL%
 echo ══════════════════════════════════════════════════════
 echo.
 echo   [DEMARRAGE]
-echo   khidmeti.bat start              Demarrer + pull modele si absent
+echo   khidmeti.bat start              Demarrer les services
 echo   khidmeti.bat start-gpu          Demarrer avec GPU NVIDIA
 echo   khidmeti.bat stop               Arreter (volumes conserves)
 echo   khidmeti.bat restart            Redemarrer
 echo.
-echo   [OLLAMA]
-echo   khidmeti.bat ollama-pull        Pull modele avec progression (X GB / Y GB)
+echo   [OLLAMA — DUAL-MODEL v8]
+echo   khidmeti.bat ollama-pull-all    Pull gemma3:1b + moondream (1ere fois)
+echo   khidmeti.bat ollama-pull        Pull modele texte seul
 echo.
 echo   [BUILD API]
 echo   khidmeti.bat build              Builder l'image NestJS
@@ -124,20 +136,68 @@ echo.
 echo   [DEBUG]
 echo   khidmeti.bat shell-api          Shell NestJS
 echo   khidmeti.bat shell-mongo        mongosh
-echo   khidmeti.bat test-ai            Tester extraction Darija
+echo   khidmeti.bat test-ai            Tester extraction Darija (gemma3:1b)
+echo   khidmeti.bat test-ai-vision     Tester analyse image (moondream)
 echo.
 echo   [NETTOYAGE]
-echo   khidmeti.bat clean              Supprimer volumes (modele inclus)
+echo   khidmeti.bat clean              Supprimer volumes (modeles inclus)
 echo.
 goto :eof
 
 :: ═══════════════════════════════════════════════════════════════════════════════
-:: OLLAMA PULL — progression visible
+:: OLLAMA PULL ALL — pull des deux modeles (texte + vision)
+:: ═══════════════════════════════════════════════════════════════════════════════
+:ollama_pull_all
+echo.
+echo ══════════════════════════════════════════════
+echo   Pull modeles Ollama — Dual-model v8
+echo   Texte  : %OLLAMA_MODEL_VAL%
+echo   Vision : %OLLAMA_VISION_MODEL_VAL%
+echo ══════════════════════════════════════════════
+echo.
+echo   Attente que Ollama soit pret...
+:ollama_pull_all_wait
+curl -sf http://localhost:11434/ >nul 2>&1
+if !errorlevel! neq 0 (
+  timeout /t 2 /nobreak >nul
+  goto :ollama_pull_all_wait
+)
+echo   OK Ollama pret.
+echo.
+echo   Telechargement modele texte : %OLLAMA_MODEL_VAL%
+echo.
+docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
+if !errorlevel! neq 0 (
+  echo   ERREUR : pull texte echoue.
+  exit /b 1
+)
+echo.
+echo   OK Modele texte %OLLAMA_MODEL_VAL% pret.
+echo.
+echo   Telechargement modele vision : %OLLAMA_VISION_MODEL_VAL%
+echo.
+docker exec -it khidmeti-ollama ollama pull %OLLAMA_VISION_MODEL_VAL%
+if !errorlevel! neq 0 (
+  echo   ERREUR : pull vision echoue.
+  exit /b 1
+)
+echo.
+echo   OK Modele vision %OLLAMA_VISION_MODEL_VAL% pret.
+echo.
+echo ══════════════════════════════════════════════
+echo   Les deux modeles sont prets.
+echo   Verifier : khidmeti.bat ai-status
+echo ══════════════════════════════════════════════
+echo.
+goto :eof
+
+:: ═══════════════════════════════════════════════════════════════════════════════
+:: OLLAMA PULL — modele texte seul
 :: ═══════════════════════════════════════════════════════════════════════════════
 :ollama_pull
 echo.
 echo ══════════════════════════════════════════════
-echo   Pull modele Ollama
+echo   Pull modele texte Ollama
 echo   Modele : %OLLAMA_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
@@ -149,9 +209,6 @@ if !errorlevel! neq 0 (
   goto :ollama_pull_wait
 )
 echo   OK Ollama pret.
-echo.
-echo   Telechargement en cours (progression ci-dessous) :
-echo   ex: pulling abc123... 2.1 GB / 7.2 GB  32 MB/s
 echo.
 docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
 if !errorlevel! neq 0 (
@@ -170,7 +227,8 @@ goto :eof
 echo.
 echo ══════════════════════════════════════════════
 echo   Demarrage de Khidmeti
-echo   Modele IA : %OLLAMA_MODEL_VAL%
+echo   Modele texte   : %OLLAMA_MODEL_VAL%
+echo   Modele vision  : %OLLAMA_VISION_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
 
@@ -206,22 +264,20 @@ if !errorlevel! neq 0 (
 echo   OK Ollama pret.
 echo.
 
-:: Vérifier si le modèle est déjà présent
-docker exec khidmeti-ollama ollama list 2>nul | findstr /i "%OLLAMA_MODEL_VAL%" >nul 2>&1
-if !errorlevel! equ 0 (
-  echo   OK Modele %OLLAMA_MODEL_VAL% deja present — demarrage instantane.
+:: Vérifier les deux modèles
+set TEXT_PRESENT=0
+set VISION_PRESENT=0
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "gemma3" >nul 2>&1
+if !errorlevel! equ 0 set TEXT_PRESENT=1
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "moondream" >nul 2>&1
+if !errorlevel! equ 0 set VISION_PRESENT=1
+
+if !TEXT_PRESENT! equ 1 if !VISION_PRESENT! equ 1 (
+  echo   OK Les deux modeles sont presents — demarrage instantane.
   echo.
 ) else (
-  echo   Modele absent du volume — telechargement en cours...
-  echo   Progression (X GB / Y GB) :
-  echo.
-  docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
-  if !errorlevel! neq 0 (
-    echo   ERREUR : pull du modele echoue.
-    exit /b 1
-  )
-  echo.
-  echo   OK Modele %OLLAMA_MODEL_VAL% pret.
+  echo   INFO : Modele(s) absent(s). Lancez :
+  echo   khidmeti.bat ollama-pull-all
   echo.
 )
 
@@ -233,7 +289,8 @@ goto :eof
 echo.
 echo ══════════════════════════════════════════════
 echo   Demarrage Khidmeti — GPU NVIDIA
-echo   Modele : %OLLAMA_MODEL_VAL%
+echo   Modele texte  : %OLLAMA_MODEL_VAL%
+echo   Modele vision : %OLLAMA_VISION_MODEL_VAL%
 echo ══════════════════════════════════════════════
 echo.
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
@@ -243,12 +300,6 @@ echo   Attente Ollama...
 curl -sf http://localhost:11434/ >nul 2>&1
 if !errorlevel! neq 0 ( timeout /t 2 /nobreak >nul & goto :start_gpu_wait )
 echo   OK.
-echo.
-docker exec khidmeti-ollama ollama list 2>nul | findstr /i "%OLLAMA_MODEL_VAL%" >nul 2>&1
-if !errorlevel! neq 0 (
-  echo   Pull modele GPU...
-  docker exec -it khidmeti-ollama ollama pull %OLLAMA_MODEL_VAL%
-)
 call :health
 goto :eof
 
@@ -258,7 +309,7 @@ goto :eof
 :stop
 docker compose down
 echo.
-echo   OK Services arretes. Volumes conserves (modele Ollama intact).
+echo   OK Services arretes. Volumes conserves (modeles Ollama intacts).
 echo.
 goto :eof
 
@@ -299,7 +350,7 @@ goto :eof
 :ai_status
 echo.
 echo ══════════════════════════════════════════════
-echo   Statut IA locale
+echo   Statut IA locale — Dual-model v8
 echo ══════════════════════════════════════════════
 echo.
 curl -s -o nul -w "  Ollama  (11434) : HTTP %%{http_code}\n" http://localhost:11434/ 2>nul
@@ -308,6 +359,18 @@ echo.
 echo   Modeles installes :
 docker exec khidmeti-ollama ollama list 2>nul || echo   (Ollama non demarre)
 echo.
+echo   Verification dual-model :
+set TEXT_OK=absent
+set VISION_OK=absent
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "gemma3" >nul 2>&1
+if !errorlevel! equ 0 set TEXT_OK=OK
+docker exec khidmeti-ollama ollama list 2>nul | findstr /i "moondream" >nul 2>&1
+if !errorlevel! equ 0 set VISION_OK=OK
+echo   Texte  (%OLLAMA_MODEL_VAL%)   : !TEXT_OK!
+echo   Vision (%OLLAMA_VISION_MODEL_VAL%) : !VISION_OK!
+echo.
+if "!TEXT_OK!"=="absent" echo   Pour installer : khidmeti.bat ollama-pull-all
+if "!VISION_OK!"=="absent" echo   Pour installer : khidmeti.bat ollama-pull-all
 goto :eof
 
 :status
@@ -497,11 +560,21 @@ goto :eof
 
 :test_ai
 echo.
-echo   Test Ollama — extraction Darija...
+echo   Test Ollama — extraction Darija (%OLLAMA_MODEL_VAL%)...
 echo.
 curl -s http://localhost:11434/v1/chat/completions ^
   -H "Content-Type: application/json" ^
-  -d "{\"model\":\"%OLLAMA_MODEL_VAL%\",\"messages\":[{\"role\":\"system\",\"content\":\"Reponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":2048,\"think\":false},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}"
+  -d "{\"model\":\"%OLLAMA_MODEL_VAL%\",\"messages\":[{\"role\":\"system\",\"content\":\"Reponds UNIQUEMENT en JSON: {\\\"profession\\\":null,\\\"is_urgent\\\":false,\\\"problem_description\\\":\\\"\\\",\\\"confidence\\\":0}\"},{\"role\":\"user\",\"content\":\"عندي ماء ساقط من السقف\"}],\"options\":{\"num_ctx\":1024},\"temperature\":0.05,\"max_tokens\":200,\"stream\":false}"
+echo.
+goto :eof
+
+:test_ai_vision
+echo.
+echo   Test Ollama — analyse image (%OLLAMA_VISION_MODEL_VAL%)...
+echo.
+curl -s http://localhost:11434/api/generate ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"%OLLAMA_VISION_MODEL_VAL%\",\"prompt\":\"Describe what you see in one sentence.\",\"stream\":false}"
 echo.
 goto :eof
 
@@ -606,7 +679,7 @@ exit /b 1
 :clean
 echo.
 echo   ATTENTION : suppression de tous les volumes (MongoDB, Redis, Qdrant, MinIO, Ollama).
-echo   Le modele Ollama sera re-telecharge au prochain : khidmeti.bat start
+echo   Les modeles seront re-telecharges avec : khidmeti.bat ollama-pull-all
 set /p CONFIRM="  Taper YES pour confirmer : "
 if /i "%CONFIRM%"=="YES" (
   docker compose down -v --remove-orphans

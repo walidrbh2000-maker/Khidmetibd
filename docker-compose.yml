@@ -24,49 +24,43 @@ name: khidmeti
 #   ✅ OLLAMA_NUM_CTX : 4096 → 2048
 #
 # FIXES v7 (OOM kill + runner crash + whisper 137) :
-#
 #   ✅ Ollama mem_limit : 6g → 8g
-#      CAUSE RÉELLE : le runner subprocess a besoin de 4.9 GiB base
-#      + pic d'inférence (context allocation, activation buffers, génération
-#      token-par-token). Sur un appel vision/texte long, le total dépasse 6g.
-#      Mesures réelles Codespace :
-#        model weights   : 3.6 GiB
-#        kv cache (2048) : 254 MiB
-#        compute graph   : 1.1 GiB
-#        inference spike : ~0.8–1.5 GiB  ← non-comptabilisé dans les logs init
-#        ─────────────────────────────────
-#        TOTAL pic        : ~5.8–6.5 GiB  → OOM avec mem_limit=6g
-#      Avec 8g : pic max ~6.5 GiB → marge 1.5 GiB ✅
-#
 #   ✅ Ollama mem_reservation : 2g → 5g
-#      Aligne la réservation sur l'usage réel (modèle chargé en permanence).
-#
 #   ✅ Whisper mem_limit : 700m → 1200m
-#      Exit code 137 = SIGKILL kernel OOM.
-#      faster-whisper-small + Python runtime + buffer audio = ~900 MB réels.
-#      700m était insuffisant. 1200m laisse 300 MB de marge ✅
-#
 #   ✅ Whisper mem_reservation : 100m → 300m
 #
-# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) — v7 :
-#   Ollama + gemma3:4b     ~7.0 GB  (pic inférence inclus)
-#   faster-whisper-small   ~0.9 GB
-#   NestJS API             ~0.8 GB
-#   MongoDB                ~0.4 GB
-#   Redis                  ~0.2 GB
-#   Qdrant                 ~0.2 GB
-#   MinIO                  ~0.5 GB
-#   nginx + mongo-express  ~0.3 GB
+# FIXES v8 — DUAL-MODEL (gemma3:1b + moondream) :
+#
+#   PROBLÈME : gemma3:4b = ~6.5 GB RAM au pic d'inférence → OOM kill systématique.
+#
+#   SOLUTION : deux modèles spécialisés ultra-légers :
+#     gemma3:1b  → JSON extraction Darija/Arabe/Français → ~1.2 GB
+#     moondream  → analyse d'images sinistres (edge vision) → ~1.5 GB
+#   OLLAMA_MAX_LOADED_MODELS=1 → swap automatique, un seul modèle en RAM.
+#
+#   ✅ Ollama mem_limit : 8g → 3g   (pic réel 1.5 GB + marge 1.5 GB)
+#   ✅ Ollama mem_reservation : 5g → 1g
+#   ✅ OLLAMA_KEEP_ALIVE : -1 → 5m  (libère RAM après 5 min d'inactivité)
+#   ✅ OLLAMA_NUM_CTX : 2048 → 1024 (gemma3:1b — texte seul, 1024 suffisant)
+#
+# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) — v8 :
+#   Ollama + modèle actif (max)  ~2.0 GB  (moondream ~1.5 GB)
+#   faster-whisper-small         ~0.9 GB
+#   NestJS API                   ~0.8 GB
+#   MongoDB                      ~0.4 GB
+#   Redis                        ~0.2 GB
+#   Qdrant                       ~0.2 GB
+#   MinIO                        ~0.5 GB
+#   nginx + mongo-express        ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total       ~10.3 GB
-#   OS + Docker daemon     ~1.5 GB
+#   Conteneurs total             ~5.3 GB
+#   OS + Docker daemon           ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                  ~11.8 GB  ✅ (marge 4.2 GB sur 16 GB)
+#   TOTAL                        ~6.8 GB  ✅ (marge 9.2 GB sur 16 GB)
 #
 # WORKFLOW :
-#   1ère fois      → make start  (pull image Ollama latest + modèle gemma3:4b)
-#   Fois suivantes → make start  (modèle en volume → secondes)
-#   Changer modèle → modifier OLLAMA_MODEL dans .env + make ollama-pull
+#   1ère fois      → make start && make ollama-pull-all
+#   Fois suivantes → make start  (modèles en volume → secondes)
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -119,16 +113,21 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Ollama — LLM local (gemma3:4b) ──────────────────────────────────────────
+  # ── Ollama — Dual-model local (gemma3:1b + moondream) ────────────────────────
   #
-  # FIX v7 — mem_limit 6g → 8g :
-  #   Le runner subprocess (llama.cpp) s'alloue 4.9 GiB à l'init,
-  #   puis subit un pic de +0.8–1.5 GiB pendant l'inférence réelle
-  #   (activation buffers, génération token-par-token, batch workspace).
-  #   Ce pic n'apparaît PAS dans les logs "total memory size" qui ne montrent
-  #   que les allocations statiques initiales — d'où la confusion.
-  #   Avec mem_limit=6g, le cgroup Docker tuait le runner (exit 137).
-  #   8g = 6.5 GiB pic réel + 1.5 GiB marge de sécurité ✅
+  # FIX v8 — mem_limit 8g → 3g :
+  #   Stratégie dual-model : un seul modèle chargé à la fois via
+  #   OLLAMA_MAX_LOADED_MODELS=1. Pic réel max = 1.5 GB (moondream).
+  #   3g = 1.5 GB pic + 1.5 GB marge (swap buffer, OS overhead).
+  #
+  # FIX v8 — OLLAMA_KEEP_ALIVE 5m :
+  #   Libère la RAM du modèle après 5 minutes d'inactivité.
+  #   Permet à l'OS de récupérer la mémoire entre les requêtes.
+  #
+  # FIX v8 — OLLAMA_NUM_CTX 1024 :
+  #   gemma3:1b n'a besoin que de 1024 tokens pour l'extraction JSON.
+  #   KV cache ~64 MiB (vs 254 MiB pour 2048). moondream utilise
+  #   OLLAMA_VISION_NUM_CTX=2048 passé par l'API par requête.
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -137,14 +136,14 @@ services:
     volumes:
       - ollama-data:/root/.ollama
     environment:
-      OLLAMA_NUM_PARALLEL:      "1"          # CPU : 1 seule inférence à la fois
-      OLLAMA_MAX_LOADED_MODELS: "1"          # 1 modèle en RAM
-      OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
-      OLLAMA_NUM_THREAD:        "4"          # Threads CPU (4-core Codespace)
-      OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU
-      OLLAMA_NUM_CTX:           "2048"       # KV cache ~254 MiB — aligné sur local.strategy.ts
-      OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée
-      OLLAMA_ORIGINS:           "*"          # Connexions Docker inter-services
+      OLLAMA_NUM_PARALLEL:      "1"    # CPU : 1 seule inférence à la fois
+      OLLAMA_MAX_LOADED_MODELS: "1"    # FIX v8 : swap entre gemma3:1b et moondream
+      OLLAMA_KEEP_ALIVE:        "5m"   # FIX v8 : libère RAM après 5 min d'inactivité
+      OLLAMA_NUM_THREAD:        "4"    # Threads CPU (4-core Codespace)
+      OLLAMA_FLASH_ATTENTION:   "0"    # Désactivé sur CPU
+      OLLAMA_NUM_CTX:           "1024" # FIX v8 : gemma3:1b — KV cache ~64 MiB
+      OLLAMA_MAX_QUEUE:         "2"    # File d'attente limitée
+      OLLAMA_ORIGINS:           "*"    # Connexions Docker inter-services
     ports:
       - '11434:11434'
     dns:
@@ -152,8 +151,8 @@ services:
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       8g                      # FIX v7 : 6g→8g — pic inférence ~6.5 GiB réel
-    mem_reservation: 5g                      # FIX v7 : 2g→5g — usage réel modèle chargé
+    mem_limit:       3g              # FIX v8 : 8g→3g — dual-model pic max 1.5 GB
+    mem_reservation: 1g              # FIX v8 : 5g→1g — usage réel modèle actif
     logging:
       driver: json-file
       options:
@@ -168,18 +167,8 @@ services:
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #
-  # FIX v7 — mem_limit 700m → 1200m :
-  #   Exit code 137 = SIGKILL kernel OOM. Le container était tué systématiquement.
-  #   Mesures réelles :
-  #     faster-whisper-small model : ~466 MB
-  #     Python runtime + librairies : ~200 MB
-  #     Buffer traitement audio (int8) : ~100–200 MB selon durée
-  #     ─────────────────────────────────────
-  #     TOTAL réel                : ~800–900 MB > 700m ❌
-  #   1200m = 900 MB usage réel + 300 MB marge ✅
-  #
-  # NOTE — WHISPER__LANGUAGE supprimé (v6) :
-  #   "auto" n'est pas un code ISO 639-1 valide → erreur 422.
+  # mem_limit 1200m maintenu depuis v7 (exit code 137 = OOM kill).
+  # NOTE — WHISPER__LANGUAGE absent : "auto" cause HTTP 422 (pas ISO 639-1).
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
@@ -197,8 +186,8 @@ services:
       - '8000:8000'
     networks:
       - khidmeti-network
-    mem_limit:       1200m                   # FIX v7 : 700m→1200m — prévient exit code 137 (OOM kill)
-    mem_reservation: 300m                    # FIX v7 : 100m→300m
+    mem_limit:       1200m
+    mem_reservation: 300m
     logging:
       driver: json-file
       options:

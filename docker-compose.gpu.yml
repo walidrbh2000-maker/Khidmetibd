@@ -16,51 +16,54 @@ name: khidmeti
 #     sudo apt install nvidia-container-toolkit
 #     sudo systemctl restart docker
 #
+# ── Stratégie dual-model sur GPU ─────────────────────────────────────────────
+#   Sur GPU, la VRAM est gérée par le driver NVIDIA.
+#   OLLAMA_MAX_LOADED_MODELS=2 → les deux modèles peuvent coexister en VRAM.
+#   OLLAMA_KEEP_ALIVE=-1       → modèles permanents en VRAM (zéro cold start).
+#   OLLAMA_FLASH_ATTENTION=1   → activé sur GPU (réduit VRAM, améliore vitesse).
+#
 # ── Modèles recommandés selon le GPU ─────────────────────────────────────────
-#    8 GB VRAM  (RTX 3070, 4060 Ti) → gemma4:e2b  (défaut)
-#    8 GB VRAM                      → gemma4:e4b  (meilleure qualité)
-#   12 GB VRAM  (RTX 3060, 4070)    → gemma4:26b
-#   16 GB VRAM+ (RTX 4080, 3090)    → gemma4:31b
+#    8 GB VRAM  (RTX 3070, 4060 Ti) → gemma3:1b + moondream  ← dual-model v8
+#    8 GB VRAM                      → gemma3:4b (si besoin de meilleure qualité)
+#   12 GB VRAM  (RTX 3060, 4070)    → gemma3:4b + moondream
+#   16 GB VRAM+ (RTX 4080, 3090)    → gemma3:12b + moondream
 #
 # ── Changer de modèle GPU ────────────────────────────────────────────────────
-#   1. Modifier OLLAMA_MODEL dans .env
-#   2. make ollama-pull   (pull avec progression visible)
+#   1. Modifier OLLAMA_MODEL et OLLAMA_VISION_MODEL dans .env
+#   2. make ollama-pull-all   (pull avec progression visible)
 #   3. make start-gpu
 #
 # ── Versions ─────────────────────────────────────────────────────────────────
-#   Ce fichier override les images CPU par leurs variantes CUDA.
-#   Les versions CUDA DOIVENT correspondre aux versions CPU du docker-compose.yml.
-#   Ollama CPU  : ollama/ollama:0.6.5
-#   Ollama GPU  : ollama/ollama:0.6.5  (même image, supporte CUDA nativement)
-#   Whisper CPU : fedirz/faster-whisper-server:0.2.1-cpu
-#   Whisper GPU : fedirz/faster-whisper-server:0.2.1-cuda
+#   Ollama CPU  : ollama/ollama:latest
+#   Ollama GPU  : ollama/ollama:latest  (même image, supporte CUDA nativement)
+#   Whisper CPU : fedirz/faster-whisper-server:latest-cpu
+#   Whisper GPU : fedirz/faster-whisper-server:latest-cuda
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
 
   # ── Ollama GPU ───────────────────────────────────────────────────────────────
   #
-  #  MÊME image que la version CPU — ollama/ollama:0.6.5 supporte nativement
-  #  CUDA via le Container Toolkit NVIDIA. Pas besoin d'une image séparée.
+  #  MÊME image que la version CPU — ollama/ollama:latest supporte nativement
+  #  CUDA via le Container Toolkit NVIDIA.
   #
-  #  Le modèle réside dans le même volume khidmeti-ollama-data.
-  #  Aucun re-téléchargement si le modèle est déjà dans le volume.
-  #
-  #  OLLAMA_NUM_PARALLEL=4   → GPU gère le parallélisme natif (vs 1 sur CPU)
-  #  OLLAMA_KEEP_ALIVE=-1    → modèle permanent en VRAM (zéro cold start)
-  #  OLLAMA_FLASH_ATTENTION=1 → activé sur GPU (réduit VRAM, améliore vitesse)
+  #  OLLAMA_MAX_LOADED_MODELS=2  → dual-model : gemma3:1b + moondream en VRAM
+  #  OLLAMA_KEEP_ALIVE=-1        → modèles permanents (zéro cold start GPU)
+  #  OLLAMA_FLASH_ATTENTION=1    → activé sur GPU
+  #  OLLAMA_NUM_CTX=2048         → contexte plus large possible sur GPU
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:0.6.5
+    image: ollama/ollama:latest
     environment:
-      OLLAMA_NUM_PARALLEL:        "4"
-      OLLAMA_MAX_LOADED_MODELS:   "1"
-      OLLAMA_KEEP_ALIVE:          "-1"
-      OLLAMA_NUM_THREAD:          "0"
-      OLLAMA_FLASH_ATTENTION:     "1"
+      OLLAMA_NUM_PARALLEL:        "2"
+      OLLAMA_MAX_LOADED_MODELS:   "2"    # GPU : deux modèles en VRAM simultanément
+      OLLAMA_KEEP_ALIVE:          "-1"   # Modèles permanents en VRAM
+      OLLAMA_NUM_THREAD:          "0"    # Laisser Ollama choisir
+      OLLAMA_FLASH_ATTENTION:     "1"    # Activé sur GPU
+      OLLAMA_NUM_CTX:             "2048" # Contexte plus large sur GPU
       NVIDIA_VISIBLE_DEVICES:     "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-    # Lever la limite CPU (le GPU gère la mémoire du modèle)
+    # Lever les limites CPU (GPU gère sa propre mémoire)
     mem_limit: null
     mem_reservation: null
     deploy:
@@ -73,17 +76,17 @@ services:
 
   # ── faster-whisper CUDA ───────────────────────────────────────────────────
   #
-  #  Variante CUDA — même version (0.2.1) que le CPU pour cohérence.
-  #  float16 sur GPU : qualité maximale, latence réduite de ~4x vs int8 CPU.
+  #  float16 sur GPU : qualité maximale, latence ~4x inférieure au CPU int8.
   #  WHISPER__BEAM_SIZE=5 → qualité maximale (vs 1 sur CPU pour la vitesse).
+  #  WHISPER__LANGUAGE absent : "auto" cause HTTP 422 (pas ISO 639-1).
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
-    image: fedirz/faster-whisper-server:0.2.1-cuda
+    image: fedirz/faster-whisper-server:latest-cuda
     environment:
       WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
       WHISPER__INFERENCE_DEVICE: "cuda"
       WHISPER__COMPUTE_TYPE:     "float16"
-      WHISPER__LANGUAGE:         "auto"
+      # WHISPER__LANGUAGE absent intentionnellement — "auto" cause HTTP 422
       WHISPER__BEAM_SIZE:        "5"
     mem_limit: null
     mem_reservation: null
@@ -96,18 +99,14 @@ services:
               capabilities: [gpu]
 
   # ── Limites mémoire levées sur machine GPU ────────────────────────────────
-  #
   #  Sur machine GPU, la RAM système est généralement >= 16 GB.
-  #  On lève les limites strictes pour laisser les services respirer.
-  #  Les limites VRAM sont gérées par le driver NVIDIA, pas par Docker.
+  #  Les limites strictes sont levées ; VRAM gérée par le driver NVIDIA.
   # ─────────────────────────────────────────────────────────────────────────────
   api:
     mem_limit: null
     mem_reservation: null
     environment:
       NODE_ENV: development
-      # FIX v5 : 512 → 768 MB — cohérence avec docker-compose.yml CPU
-      # Sur machine GPU la RAM est abondante, mais 768 reste raisonnable.
       NODE_OPTIONS: "--max-old-space-size=768"
 
   mongo:

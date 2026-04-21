@@ -3,10 +3,11 @@
 # Usage:  .\khidmeti.ps1 [command] [args]
 # Alias:  Set-Alias kh .\khidmeti.ps1
 #
-# WORKFLOW :
-#   .\khidmeti.ps1 start        → 1ère fois : pull modèle + démarrage
-#   .\khidmeti.ps1 start        → fois suivantes : démarrage instantané (volume)
-#   .\khidmeti.ps1 ollama-pull  → forcer re-pull avec progression visible
+# WORKFLOW v8 — DUAL-MODEL :
+#   .\khidmeti.ps1 start            → démarrer les services
+#   .\khidmeti.ps1 ollama-pull-all  → pull gemma3:1b + moondream (1ère fois)
+#   .\khidmeti.ps1 start            → fois suivantes : démarrage instantané
+#   .\khidmeti.ps1 ollama-pull      → forcer re-pull modèle texte seul
 # ══════════════════════════════════════════════════════════════════════════════
 param(
   [Parameter(Position=0)]
@@ -66,9 +67,12 @@ function Remove-EnvValue([string]$key) {
   $content | Set-Content ".env" -Encoding UTF8
 }
 
-# ── Modèle Ollama ─────────────────────────────────────────────────────────────
+# ── Modèles Ollama ─────────────────────────────────────────────────────────────
 $OllamaModel = Get-EnvValue "OLLAMA_MODEL"
-if ($OllamaModel -eq "") { $OllamaModel = "gemma4:e2b" }
+if ($OllamaModel -eq "") { $OllamaModel = "gemma3:1b" }
+
+$OllamaVisionModel = Get-EnvValue "OLLAMA_VISION_MODEL"
+if ($OllamaVisionModel -eq "") { $OllamaVisionModel = "moondream" }
 
 # ── Attendre Ollama ───────────────────────────────────────────────────────────
 function Wait-Ollama {
@@ -83,22 +87,22 @@ function Wait-Ollama {
   Write-Ok "Ollama prêt."
 }
 
-# ── Vérifier si modèle présent ────────────────────────────────────────────────
+# ── Vérifier si un modèle est présent ─────────────────────────────────────────
 function Test-ModelPresent([string]$model) {
+  $baseName = $model.Split(":")[0]
   $result = docker exec khidmeti-ollama ollama list 2>$null
-  return ($result -match [regex]::Escape($model.Split(":")[0]))
+  return ($result -match [regex]::Escape($baseName))
 }
 
-# ── Pull avec progression visible ─────────────────────────────────────────────
+# ── Pull un modèle avec progression ───────────────────────────────────────────
 function Invoke-OllamaPull([string]$model) {
   Write-Host ""
-  Write-Host "  📥 Téléchargement en cours (progression ci-dessous) :" -ForegroundColor Yellow
-  Write-Host "  ex: pulling abc123... ████████░░ 4.1 GB / 7.2 GB  32 MB/s  1m58s" -ForegroundColor Gray
+  Write-Host "  📥 Pull : $model" -ForegroundColor Yellow
+  Write-Host "  (progression affichée ci-dessous)" -ForegroundColor Gray
   Write-Host ""
-  # docker exec -it pour avoir le TTY et voir la barre de progression native d'Ollama
   docker exec -it khidmeti-ollama ollama pull $model
   if ($LASTEXITCODE -ne 0) {
-    Write-Err "Pull échoué."
+    Write-Err "Pull de $model échoué."
     exit 1
   }
   Write-Host ""
@@ -178,18 +182,20 @@ switch ($Command.ToLower()) {
   # ── help ────────────────────────────────────────────────────────────────────
   "help" {
     Write-Header "KHIDMETI — Commandes PowerShell"
-    Write-Host "  IP locale : $LOCAL_IP" -ForegroundColor Yellow
-    Write-Host "  Modèle    : $OllamaModel" -ForegroundColor Yellow
+    Write-Host "  IP locale      : $LOCAL_IP"      -ForegroundColor Yellow
+    Write-Host "  Modèle texte   : $OllamaModel"   -ForegroundColor Yellow
+    Write-Host "  Modèle vision  : $OllamaVisionModel" -ForegroundColor Yellow
     Write-Host ""
     @(
       @("[DÉMARRAGE]",            ""),
-      @("start",                  "Démarrer + pull modèle si absent (progression visible)"),
+      @("start",                  "Démarrer les services"),
       @("start-gpu",              "Démarrer avec GPU NVIDIA"),
-      @("stop",                   "Arrêter (volumes conservés — modèle intact)"),
+      @("stop",                   "Arrêter (volumes conservés — modèles intacts)"),
       @("restart",                "Redémarrer"),
       @("",                       ""),
-      @("[OLLAMA]",               ""),
-      @("ollama-pull",            "Pull / mise à jour du modèle (X GB / Y GB visible)"),
+      @("[OLLAMA — DUAL-MODEL v8]",""),
+      @("ollama-pull-all",        "Pull gemma3:1b + moondream (1ère fois)"),
+      @("ollama-pull",            "Pull / mise à jour du modèle texte"),
       @("",                       ""),
       @("[BUILD API]",            ""),
       @("build",                  "Builder l'image NestJS"),
@@ -221,10 +227,11 @@ switch ($Command.ToLower()) {
       @("shell-api",              "Shell NestJS"),
       @("shell-mongo",            "mongosh"),
       @("test-api",               "Tester les endpoints"),
-      @("test-ai",                "Tester extraction Darija"),
+      @("test-ai",                "Tester extraction Darija (gemma3:1b)"),
+      @("test-ai-vision",         "Tester analyse image (moondream)"),
       @("",                       ""),
       @("[NETTOYAGE]",            ""),
-      @("clean",                  "Supprimer tous les volumes (modèle inclus)")
+      @("clean",                  "Supprimer tous les volumes (modèles inclus)")
     ) | ForEach-Object {
       if ($_[1] -eq "" -and $_[0] -ne "") {
         Write-Host "`n  $($_[0])" -ForegroundColor Cyan
@@ -235,9 +242,23 @@ switch ($Command.ToLower()) {
     Write-Host ""
   }
 
+  # ── ollama-pull-all ──────────────────────────────────────────────────────────
+  "ollama-pull-all" {
+    Write-Header "Pull modèles Ollama — Dual-model v8"
+    Write-Host "  Texte  : $OllamaModel"      -ForegroundColor Yellow
+    Write-Host "  Vision : $OllamaVisionModel" -ForegroundColor Yellow
+    Wait-Ollama
+    Invoke-OllamaPull $OllamaModel
+    Invoke-OllamaPull $OllamaVisionModel
+    Write-Host ""
+    Write-Header "Les deux modèles sont prêts"
+    Write-Host "  → .\khidmeti.ps1 ai-status  pour vérifier" -ForegroundColor Gray
+    Write-Host ""
+  }
+
   # ── ollama-pull ──────────────────────────────────────────────────────────────
   "ollama-pull" {
-    Write-Header "Pull modèle Ollama"
+    Write-Header "Pull modèle texte Ollama"
     Write-Host "  Modèle : $OllamaModel" -ForegroundColor Yellow
     Wait-Ollama
     Invoke-OllamaPull $OllamaModel
@@ -246,7 +267,8 @@ switch ($Command.ToLower()) {
   # ── start ────────────────────────────────────────────────────────────────────
   "start" {
     Write-Header "Démarrage de Khidmeti"
-    Write-Host "  Modèle IA : $OllamaModel" -ForegroundColor Yellow
+    Write-Host "  Modèle texte   : $OllamaModel"      -ForegroundColor Yellow
+    Write-Host "  Modèle vision  : $OllamaVisionModel" -ForegroundColor Yellow
     Write-Host ""
 
     @("logs","backups\mongodb","data\mongodb","data\redis","data\qdrant","data\minio") |
@@ -270,12 +292,16 @@ switch ($Command.ToLower()) {
     Wait-Ollama
     Write-Host ""
 
-    if (Test-ModelPresent $OllamaModel) {
-      Write-Ok "Modèle $OllamaModel déjà présent — démarrage instantané."
+    $textOk   = Test-ModelPresent $OllamaModel
+    $visionOk = Test-ModelPresent $OllamaVisionModel
+
+    if ($textOk -and $visionOk) {
+      Write-Ok "Les deux modèles sont présents — démarrage instantané."
       Write-Host ""
     } else {
-      Write-Warn "Modèle absent du volume — téléchargement en cours..."
-      Invoke-OllamaPull $OllamaModel
+      Write-Warn "Modèle(s) absent(s) du volume."
+      Write-Host "  → Lancez : .\khidmeti.ps1 ollama-pull-all" -ForegroundColor Yellow
+      Write-Host ""
     }
 
     & $PSCommandPath health
@@ -285,16 +311,12 @@ switch ($Command.ToLower()) {
   # ── start-gpu ────────────────────────────────────────────────────────────────
   "start-gpu" {
     Write-Header "Démarrage Khidmeti — GPU NVIDIA"
-    Write-Host "  Modèle : $OllamaModel" -ForegroundColor Yellow
+    Write-Host "  Modèle texte   : $OllamaModel"      -ForegroundColor Yellow
+    Write-Host "  Modèle vision  : $OllamaVisionModel" -ForegroundColor Yellow
     Write-Host ""
     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
     Write-Host ""
     Wait-Ollama
-    if (-not (Test-ModelPresent $OllamaModel)) {
-      Invoke-OllamaPull $OllamaModel
-    } else {
-      Write-Ok "Modèle $OllamaModel déjà présent."
-    }
     & $PSCommandPath health
   }
 
@@ -303,7 +325,7 @@ switch ($Command.ToLower()) {
     docker compose down
     Write-Host ""
     Write-Ok "Services arrêtés."
-    Write-Info "Le modèle Ollama est conservé dans le volume khidmeti-ollama-data."
+    Write-Info "Les modèles Ollama sont conservés dans le volume khidmeti-ollama-data."
     Write-Host ""
   }
 
@@ -346,7 +368,7 @@ switch ($Command.ToLower()) {
 
   # ── ai-status ────────────────────────────────────────────────────────────────
   "ai-status" {
-    Write-Header "Statut IA locale"
+    Write-Header "Statut IA locale — Dual-model v8"
     Test-Endpoint "Ollama  (11434)" "http://localhost:11434/"
     Test-Endpoint "Whisper (8000) " "http://localhost:8000/health"
     Write-Host ""
@@ -355,9 +377,26 @@ switch ($Command.ToLower()) {
       Write-Host "   $_" -ForegroundColor Green
     }
     Write-Host ""
-    Write-Host "  Volume :" -ForegroundColor Gray
-    docker volume inspect khidmeti-ollama-data `
-      --format "   Chemin : {{.Mountpoint}}" 2>$null
+    Write-Host "  ── Vérification dual-model ──" -ForegroundColor Gray
+    $textOk   = Test-ModelPresent $OllamaModel
+    $visionOk = Test-ModelPresent $OllamaVisionModel
+    if ($textOk)   { Write-Ok "Texte ($OllamaModel) : présent" }
+    else           { Write-Err "Texte ($OllamaModel) : absent → .\khidmeti.ps1 ollama-pull-all" }
+    if ($visionOk) { Write-Ok "Vision ($OllamaVisionModel) : présent" }
+    else           { Write-Err "Vision ($OllamaVisionModel) : absent → .\khidmeti.ps1 ollama-pull-all" }
+    Write-Host ""
+    Write-Host "  Version Ollama :" -ForegroundColor Gray
+    docker exec khidmeti-ollama ollama --version 2>$null | ForEach-Object {
+      Write-Host "   $_" -ForegroundColor Green
+    }
+    Write-Host ""
+    Write-Host "  RAM disponible :" -ForegroundColor Gray
+    try {
+      $mem = Get-CimInstance Win32_OperatingSystem
+      $freeGB = [math]::Round($mem.FreePhysicalMemory / 1MB, 1)
+      $totalGB = [math]::Round($mem.TotalVisibleMemorySize / 1MB, 1)
+      Write-Host "   Total: $($totalGB) GB  |  Libre: $($freeGB) GB" -ForegroundColor Green
+    } catch { Write-Host "   (non disponible)" -ForegroundColor Gray }
     Write-Host ""
   }
 
@@ -500,14 +539,14 @@ switch ($Command.ToLower()) {
   }
 
   "test-ai" {
-    Write-Header "Test Ollama — extraction Darija"
+    Write-Header "Test Ollama — extraction Darija ($OllamaModel)"
     $body = @{
       model    = $OllamaModel
       messages = @(
         @{ role="system"; content='Réponds UNIQUEMENT en JSON: {"profession":null,"is_urgent":false,"problem_description":"","confidence":0}' },
         @{ role="user";   content="عندي ماء ساقط من السقف" }
       )
-      options     = @{ num_ctx=2048; think=$false }
+      options     = @{ num_ctx=1024 }
       temperature = 0.05
       max_tokens  = 200
       stream      = $false
@@ -515,6 +554,21 @@ switch ($Command.ToLower()) {
     try {
       $resp = Invoke-RestMethod -Uri "http://localhost:11434/v1/chat/completions" `
         -Method Post -Body $body -ContentType "application/json" -TimeoutSec 60
+      Write-Host ($resp | ConvertTo-Json -Depth 5) -ForegroundColor Green
+    } catch { Write-Err "Ollama non disponible : $_" }
+    Write-Host ""
+  }
+
+  "test-ai-vision" {
+    Write-Header "Test Ollama — analyse image ($OllamaVisionModel)"
+    $body = @{
+      model   = $OllamaVisionModel
+      prompt  = "Describe what you see in one sentence."
+      stream  = $false
+    } | ConvertTo-Json -Depth 3
+    try {
+      $resp = Invoke-RestMethod -Uri "http://localhost:11434/api/generate" `
+        -Method Post -Body $body -ContentType "application/json" -TimeoutSec 30
       Write-Host ($resp | ConvertTo-Json -Depth 5) -ForegroundColor Green
     } catch { Write-Err "Ollama non disponible : $_" }
     Write-Host ""
@@ -558,7 +612,7 @@ switch ($Command.ToLower()) {
   "clean" {
     Write-Host ""
     Write-Warn "Supprime TOUS les volumes : MongoDB, Redis, Qdrant, MinIO, Ollama."
-    Write-Host "  Le modèle sera re-téléchargé au prochain : .\khidmeti.ps1 start" -ForegroundColor Gray
+    Write-Host "  Les modèles seront re-téléchargés avec : .\khidmeti.ps1 ollama-pull-all" -ForegroundColor Gray
     $confirm = Read-Host "  Taper YES pour confirmer"
     if ($confirm -eq "YES") {
       docker compose down -v --remove-orphans
