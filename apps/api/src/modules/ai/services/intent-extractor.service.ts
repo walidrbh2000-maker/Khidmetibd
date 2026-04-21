@@ -36,22 +36,17 @@ const FALLBACK: SearchIntent = {
 
 // ── Error classification ───────────────────────────────────────────────────────
 //
-// Two distinct failure modes require two distinct HTTP responses:
+// QUOTA    (HTTP 429) — hard rate-limit.
+// OVERLOAD (HTTP 503) — transient; the caller should retry after back-off.
 //
-//   QUOTA    (HTTP 429) — hard rate-limit; the caller must wait or upgrade quota.
-//   OVERLOAD (HTTP 503) — transient model demand spike; the caller should retry
-//                         automatically after a short back-off.
-//
-// Conflating them into a single 429 caused the Flutter client to display a
-// permanent "quota exceeded" message for temporary overloads that would have
-// resolved in seconds.
-//
-// Root cause of the original bug: Gemini 503 errors arrive as:
-//   { "error": { "code": 503, "status": "UNAVAILABLE", "message": "This model
-//     is currently experiencing high demand..." } }
-// None of the original QUOTA_PATTERNS matched "503" or "UNAVAILABLE".
+// FIX v6 : ajout des patterns Ollama OOM dans OVERLOAD_PATTERNS.
+//   AVANT : l'erreur "requires more system memory (4.9 GiB)" tombait dans
+//           le bloc catch générique → return { ...FALLBACK } silencieux →
+//           confidence=0 affiché dans l'UI sans aucun message d'erreur.
+//   APRÈS : classifiée comme 503 SERVICE_UNAVAILABLE → Flutter reçoit un
+//           message clair et peut proposer une nouvelle tentative.
 
-/** Patterns indicating a hard quota / rate-limit exhaustion → HTTP 429 */
+/** Patterns indicating a hard quota / rate-limit → HTTP 429 */
 const QUOTA_PATTERNS: RegExp[] = [
   /quota/i,
   /resource.?exhausted/i,
@@ -61,8 +56,13 @@ const QUOTA_PATTERNS: RegExp[] = [
 ];
 
 /**
- * Patterns indicating a transient model overload / service unavailability
- * → HTTP 503.  Gemini wraps these as { "status": "UNAVAILABLE", "code": 503 }.
+ * Patterns indicating a transient overload / unavailability → HTTP 503.
+ *
+ * FIX v6 — ajout des patterns Ollama OOM :
+ *   - "message requires more system memory" : Ollama ne peut pas charger le modèle
+ *   - "not enough.*memory" : formulation générique mémoire insuffisante
+ *   Ces erreurs sont transitoires : elles se résolvent seules une fois que
+ *   Ollama récupère de la mémoire (ex: après garbage collection ou redémarrage).
  */
 const OVERLOAD_PATTERNS: RegExp[] = [
   /503/,
@@ -71,6 +71,8 @@ const OVERLOAD_PATTERNS: RegExp[] = [
   /model.*overload/i,
   /temporarily.*unavailable/i,
   /please try again later/i,
+  /requires more system memory/i,  // FIX v6 : Ollama OOM — "requires more system memory (4.9 GiB)"
+  /not enough.*memory/i,           // FIX v6 : formulation générique mémoire insuffisante
 ];
 
 function isQuotaError(err: unknown): boolean {
@@ -80,29 +82,13 @@ function isQuotaError(err: unknown): boolean {
 
 function isOverloadError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  // Never double-classify: a quota error takes precedence.
   return !isQuotaError(err) && OVERLOAD_PATTERNS.some((p) => p.test(msg));
 }
 
 // ── Garbage transcript detection ───────────────────────────────────────────────
-//
-// When Gemini receives silent or near-silent audio it produces a sequence of
-// SRT-style timestamps instead of transcribed speech:
-//   "00:00 00:01 00:02 00:03 00:00 00:01 00:02 00:03 00:01 00"
-//
-// Passing this through intent extraction yields a 0-confidence FALLBACK, but
-// only after a full LLM round-trip (~1–2 s + cost).  Detecting it here is an
-// O(n) string check that saves a wasted API call and latency.
 
 const TIMESTAMP_ONLY_RE = /^(?:\d{1,2}:\d{2}\s*)+$/;
 
-/**
- * Returns true when the transcription text carries no semantic content.
- * Covers:
- *   • Gemini timestamp artifacts from silent audio  ("00:00 00:01 ...")
- *   • Strings that are exclusively digits, colons, and whitespace
- *   • Strings shorter than 3 characters (cannot express any profession)
- */
 function isGarbageTranscript(text: string): boolean {
   const t = text.trim();
   if (t.length < 3)              return true;
@@ -111,7 +97,7 @@ function isGarbageTranscript(text: string): boolean {
   return false;
 }
 
-// ── System prompt (unchanged — already well-tuned) ────────────────────────────
+// ── System prompt ──────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `\
 Tu es l'extracteur d'intention de Khidmeti, application algérienne de services à domicile.
@@ -169,11 +155,10 @@ Requête: "my toilet is overflowing"
 export class IntentExtractorService {
   private readonly logger = new Logger(IntentExtractorService.name);
 
-  // LRU cache: cacheKey → SearchIntent
   private readonly cache       = new Map<string, SearchIntent>();
   private readonly MAX_CACHE   = 100;
   private readonly RATE_LIMIT_MAX    = 20;
-  private readonly RATE_LIMIT_WINDOW = 3_600_000; // 1 hour
+  private readonly RATE_LIMIT_WINDOW = 3_600_000;
 
   constructor(
     @Inject(AI_PROVIDER_TOKEN)
@@ -242,11 +227,6 @@ export class IntentExtractorService {
 
     const { text, language } = transcription;
 
-    // ── Garbage transcript guard ─────────────────────────────────────────────
-    // Gemini produces SRT-style timestamps ("00:00 00:01 00:02 ...") when the
-    // audio buffer is silent or too short.  Propagating garbage to the intent
-    // extractor wastes a second LLM call and yields a 0-confidence FALLBACK
-    // anyway — skip the round-trip entirely.
     if (!text.trim() || isGarbageTranscript(text)) {
       this.logger.debug(
         `Audio produced unusable transcript (language=${language}): ` +
