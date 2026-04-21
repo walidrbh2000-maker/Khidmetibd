@@ -48,20 +48,42 @@ name: khidmeti
 #              TypeScript est OOM-killed silencieusement → seed FAILED.
 #              768 MB laisse ~256 MB d'overhead V8 sous la mem_limit de 1g.
 #
-# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) :
-#   Ollama + gemma3:4b    ~4.0 GB  (modèle 3.3 GB + runtime 0.7 GB)
+# FIXES v6 :
+#
+#   ✅ Ollama mem_limit : 4g → 6g
+#              CAUSE RÉELLE confirmée par les logs de production :
+#                model weights  = 3.6 GiB
+#                model kv cache = 254 MiB  (pour OLLAMA_NUM_CTX=4096)
+#                system CPU     = 1.1 GiB  (overhead runtime Ollama)
+#                ─────────────────────────
+#                TOTAL          = 4.9 GiB  > mem_limit 4g → OOM crash
+#              Les commentaires v3 sous-estimaient l'overhead système.
+#              6g = 5 GiB utilisés + 1 GiB marge de sécurité ✅
+#
+#   ✅ Ollama mem_reservation : 500m → 2g
+#              Aligne la réservation sur l'utilisation réelle minimale
+#              (modèle chargé en mémoire).
+#
+#   ✅ OLLAMA_NUM_CTX : 4096 → 2048
+#              local.strategy.ts utilise déjà NUM_CTX=2048 dans toutes
+#              les requêtes. La valeur serveur était incohérente et
+#              forçait un KV cache 2× plus grand (254 MB vs 127 MB).
+#              2048 → KV cache ~127 MB → total ~4.8 GiB ≤ 6g ✅
+#
+# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) — v6 :
+#   Ollama + gemma3:4b    ~5.0 GB  (modèle 3.6 GB + kv 0.13 GB + sys 1.1 GB)
 #   faster-whisper-small  ~0.7 GB
-#   NestJS API            ~0.8 GB  (↑ depuis 0.5 GB)
+#   NestJS API            ~0.8 GB
 #   MongoDB               ~0.4 GB
 #   Redis                 ~0.2 GB
 #   Qdrant                ~0.2 GB
 #   MinIO                 ~0.5 GB
 #   nginx + mongo-express ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total      ~7.1 GB
+#   Conteneurs total      ~8.1 GB
 #   OS + Docker daemon    ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                 ~8.6 GB  ✅ (marge 7.4 GB sur 16 GB)
+#   TOTAL                 ~9.6 GB  ✅ (marge 6.4 GB sur 16 GB)
 #
 # WORKFLOW :
 #   1ère fois      → make start  (pull image Ollama latest + modèle gemma3:4b)
@@ -85,23 +107,6 @@ volumes:
 services:
 
   # ── NestJS API ──────────────────────────────────────────────────────────────
-  #
-  # FIX v5 :
-  #   mem_limit : 512m → 1g
-  #   NODE_OPTIONS : --max-old-space-size=400 → --max-old-space-size=768
-  #
-  #   POURQUOI 768 MB pour V8 :
-  #     V8 réserve de l'espace heap au-delà du old-space (code space, map space,
-  #     large object space, etc.). Une règle empirique : laisser ~25% d'overhead
-  #     entre max-old-space-size et mem_limit.
-  #     1024 MB * 0.75 = 768 MB → overhead 256 MB → pas d'OOM container.
-  #
-  #   POURQUOI ts-node seeds échouaient :
-  #     `docker exec khidmeti-api npx ts-node ...` crée un nouveau processus Node
-  #     dans le même container. Il hérite de NODE_OPTIONS du container.
-  #     À 400 MB, le compilateur TypeScript (tsc en mémoire) dépasse la limite
-  #     et est tué silencieusement → exit code 1 → "seed FAILED".
-  # ─────────────────────────────────────────────────────────────────────────────
   api:
     build:
       context:    ./apps/api
@@ -138,20 +143,15 @@ services:
 
   # ── Ollama — LLM local (gemma3:4b) ──────────────────────────────────────────
   #
-  # IMAGE : ollama/ollama:latest
-  #   `make start` force `docker compose pull ollama` → garantit Ollama >= 0.6
-  #   requis pour gemma3:4b (multimodal engine).
-  #
-  # MODÈLE : gemma3:4b (3.3 GB disque, ~3.5 GB RAM)
-  #   Texte + Image, 128K context, 140+ langues incluant arabe/darija/français.
-  #   Analyse de photos de sinistres (fuite, désordre, prise brûlée, etc.).
-  #   Audio : géré par faster-whisper séparément → pas besoin dans Ollama.
-  #
-  # DNS : 8.8.8.8 / 1.1.1.1
-  #   Corrige les échecs de résolution DNS vers registry.ollama.ai sur Codespaces.
-  #
-  # OLLAMA_NUM_CTX=4096
-  #   KV cache ~200 MB → total ~6.2 GB sur 16 GB ✅
+  # FIX v6 — mem_limit 4g → 6g :
+  #   Mesures réelles en production (logs 2026-04-20) :
+  #     model weights  : 3.6 GiB
+  #     model kv cache : 254 MiB (OLLAMA_NUM_CTX=4096)
+  #     system CPU     : 1.1 GiB (overhead runtime)
+  #     ─────────────────────────
+  #     TOTAL          : 4.9 GiB → crashait avec mem_limit=4g
+  #   Avec OLLAMA_NUM_CTX=2048 et mem_limit=6g :
+  #     total estimé   : ~4.8 GiB → marge 1.2 GiB ✅
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -165,7 +165,9 @@ services:
       OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
       OLLAMA_NUM_THREAD:        "4"          # Threads CPU (4-core Codespace)
       OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU (GPU seulement)
-      OLLAMA_NUM_CTX:           "4096"       # KV cache ~200 MB — suffisant pour Khidmeti
+      OLLAMA_NUM_CTX:           "2048"       # FIX v6 : 4096→2048 — aligne sur local.strategy.ts
+                                             # KV cache : ~127 MB (vs 254 MB avant)
+                                             # Total mémoire : ~4.8 GiB ≤ 6g ✅
       OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée (évite OOM si rafale)
       OLLAMA_ORIGINS:           "*"          # Accepte les connexions Docker inter-services
     ports:
@@ -175,8 +177,8 @@ services:
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       4g                      # gemma3:4b ~3.3 GB + runtime ~0.7 GB
-    mem_reservation: 500m
+    mem_limit:       6g                      # FIX v6 : 4g→6g (modèle nécessite 4.9 GiB réels)
+    mem_reservation: 2g                      # FIX v6 : 500m→2g (aligne sur usage réel)
     logging:
       driver: json-file
       options:
@@ -190,6 +192,12 @@ services:
       start_period: 90s
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
+  #
+  # NOTE v6 — WHISPER__LANGUAGE supprimé :
+  #   La valeur "auto" n'est pas un code ISO 639-1 valide et provoquait
+  #   une erreur 422 côté API request. Sans cette variable, le serveur
+  #   active la détection automatique de langue par défaut (comportement correct).
+  # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
     container_name: khidmeti-whisper
@@ -200,7 +208,8 @@ services:
       WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
       WHISPER__INFERENCE_DEVICE: "cpu"
       WHISPER__COMPUTE_TYPE:     "int8"
-      WHISPER__LANGUAGE:         "auto"
+      # WHISPER__LANGUAGE supprimé intentionnellement — "auto" cause des erreurs 422
+      # Le serveur détecte automatiquement la langue quand non spécifié (comportement correct)
       WHISPER__BEAM_SIZE:        "1"
     ports:
       - '8000:8000'
@@ -332,11 +341,6 @@ services:
       start_period: 30s
 
   # ── MinIO ───────────────────────────────────────────────────────────────────
-  #
-  # mem_limit=512m (FIX v4, était 192m)
-  #   MinIO RELEASE.2025+ requiert un minimum de 512 MB pour fonctionner.
-  #   192m et 256m provoquaient exit code 137 (OOM kill) au démarrage.
-  # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:RELEASE.2025-04-08T15-41-24Z
     container_name: khidmeti-minio
@@ -352,8 +356,8 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit:       512m   # FIX v4 : 192m → 512m (MinIO 2025 minimum confirmé)
-    mem_reservation: 128m   # FIX v4 : 64m → 128m
+    mem_limit:       512m
+    mem_reservation: 128m
     logging:
       driver: json-file
       options:
