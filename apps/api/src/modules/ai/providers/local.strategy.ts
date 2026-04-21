@@ -10,10 +10,12 @@
 // │ processAudio │ faster-whisper → small int8 CPU      │ ~500 MB fixe    │
 // └──────────────┴──────────────────────────────────────┴─────────────────┘
 //
-// Optimisations 8 GB RAM / CPU :
-//   num_ctx = 2048  → contexte minimal suffisant pour l'extraction d'intent
-//   think   = false → désactive le mode raisonnement (inutile + consommateur)
-//   OLLAMA_KEEP_ALIVE=3m → libère les ~3 GB après 3 min d'inactivité
+// FIX v6 — Suppression de language:'auto' dans processAudio() :
+//   CAUSE : 'auto' n'est pas un code ISO 639-1 valide.
+//   Le serveur faster-whisper-server utilise Pydantic pour valider le champ
+//   `language`. Tout code non reconnu provoque un HTTP 422 Unprocessable Entity.
+//   Sans ce paramètre, le serveur utilise sa configuration par défaut
+//   (détection automatique de langue), ce qui est le comportement voulu.
 
 import { Injectable, Logger } from '@nestjs/common';
 import type { IAiProvider, AudioResult } from '../interfaces/ai-provider.interface';
@@ -41,8 +43,6 @@ interface WhisperVerboseJson {
 }
 
 // ── Détection de transcriptions parasites ─────────────────────────────────────
-// Gemini (si activé) et Whisper produisent parfois des séquences de timestamps
-// SRT ("00:00 00:01 ...") sur audio silencieux.
 
 const TIMESTAMP_RE = /^(?:\d{1,2}:\d{2}\s*)+$/;
 
@@ -64,7 +64,7 @@ export class LocalStrategy implements IAiProvider {
   private readonly whisperModel: string;
 
   // Contexte réduit = moins de RAM + inférence plus rapide.
-  // L'extraction d'intent n'a besoin que de ~600 tokens max.
+  // Aligné sur OLLAMA_NUM_CTX=2048 dans docker-compose.yml (FIX v6).
   private static readonly NUM_CTX = 2048;
 
   constructor() {
@@ -113,7 +113,12 @@ export class LocalStrategy implements IAiProvider {
   }
 
   // ── Audio (faster-whisper, API compatible OpenAI) ──────────────────────────
-
+  //
+  // FIX v6 — Suppression du champ language='auto' :
+  //   'auto' n'est pas un code BCP-47/ISO 639-1 valide.
+  //   Le serveur faster-whisper-server rejette cette valeur avec HTTP 422.
+  //   Sans ce champ, le serveur utilise la détection automatique par défaut.
+  //
   async processAudio(
     buffer: Buffer,
     mime:   string,
@@ -126,9 +131,8 @@ export class LocalStrategy implements IAiProvider {
     form.append('file',            new Blob([new Uint8Array(buffer)], { type: normalizedMime }), `audio.${ext}`);
     form.append('model',           this.whisperModel);
     form.append('response_format', 'verbose_json');
-    form.append('language',        'auto');
-    // beam_size=1 → 2x plus rapide sur CPU, qualité légèrement réduite mais
-    // suffisante pour des messages vocaux courts de 5-20 secondes.
+    // NOTE : 'language' intentionnellement absent — 'auto' cause HTTP 422.
+    // La détection automatique est configurée côté serveur.
     form.append('beam_size',       '1');
 
     const ctrl  = new AbortController();
@@ -186,8 +190,6 @@ export class LocalStrategy implements IAiProvider {
           stream:   false,
           options: {
             num_ctx: LocalStrategy.NUM_CTX,
-            // Désactive le mode "thinking" — inutile pour JSON structuré
-            // et multiplie les tokens consommés
             think:   false,
             seed:    42,
           },
