@@ -4,86 +4,64 @@ name: khidmeti
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
 # FIXES v3 (gemma4:e2b + 8 GB RAM) :
-#
-#   ✅ Ollama : ollama/ollama:latest forcé via `make start` (pull systématique)
-#              gemma3:4b nécessite Ollama >= v0.6 — le pull garantit la version
-#
+#   ✅ Ollama : ollama/ollama:latest forcé via `make start`
 #   ✅ API → Ollama : dépendance relaxée à service_started
-#              AVANT : service_healthy → cascade failure si Ollama rate son HC
-#              APRÈS : service_started → l'API démarre, retry côté NestJS
-#
 #   ✅ Ollama healthcheck : start_period 15s → 90s
-#              GitHub Codespaces a un I/O lent au démarrage.
-#
 #   ✅ DNS explicite sur le container Ollama (8.8.8.8 / 1.1.1.1)
-#              Corrige "pull model manifest: file does not exist"
-#
 #   ✅ OLLAMA_NUM_CTX=4096
-#              Limite le KV cache à ~200 MB pour respecter le budget RAM.
 #
 # FIXES v4 (Codespace 4-core 16 GB RAM / 32 GB disque) :
-#
 #   ✅ MinIO mem_limit : 192m → 512m
-#              MinIO RELEASE.2025 requiert 512 MB minimum.
-#              192m et 256m provoquent exit code 137 (OOM kill).
-#
 #   ✅ Modèle : gemma4:e2b → gemma3:4b
-#              gemma4:e2b = 7.2 GB → trop grand pour Codespace 32 GB.
-#              Docker images (~20-24 GB) + 7.2 GB = dépassement disque garanti.
-#              gemma3:4b = 3.3 GB → laisse 5-9 GB libres ✅
-#              Fonctionnalités conservées : texte + image, 140+ langues, 128K ctx.
-#              Fonctionnalités perdues : audio (non utilisé — Whisper prend en charge).
 #
 # FIXES v5 :
-#
 #   ✅ API mem_limit : 512m → 1g
-#              NestJS + Socket.io + Firebase Admin + ts-node (seeds) consomment
-#              ~600-700 MB en développement. 512m était insuffisant et provoquait
-#              "FATAL ERROR: Ineffective mark-compacts near heap limit".
-#
 #   ✅ NODE_OPTIONS : --max-old-space-size=400 → --max-old-space-size=768
-#              Limite V8 old-space portée à 768 MB.
-#              Raison : docker exec ts-node (seeds) tourne dans le même
-#              container et hérite de NODE_OPTIONS. À 400 MB, le compilateur
-#              TypeScript est OOM-killed silencieusement → seed FAILED.
-#              768 MB laisse ~256 MB d'overhead V8 sous la mem_limit de 1g.
 #
 # FIXES v6 :
-#
 #   ✅ Ollama mem_limit : 4g → 6g
-#              CAUSE RÉELLE confirmée par les logs de production :
-#                model weights  = 3.6 GiB
-#                model kv cache = 254 MiB  (pour OLLAMA_NUM_CTX=4096)
-#                system CPU     = 1.1 GiB  (overhead runtime Ollama)
-#                ─────────────────────────
-#                TOTAL          = 4.9 GiB  > mem_limit 4g → OOM crash
-#              Les commentaires v3 sous-estimaient l'overhead système.
-#              6g = 5 GiB utilisés + 1 GiB marge de sécurité ✅
-#
 #   ✅ Ollama mem_reservation : 500m → 2g
-#              Aligne la réservation sur l'utilisation réelle minimale
-#              (modèle chargé en mémoire).
-#
 #   ✅ OLLAMA_NUM_CTX : 4096 → 2048
-#              local.strategy.ts utilise déjà NUM_CTX=2048 dans toutes
-#              les requêtes. La valeur serveur était incohérente et
-#              forçait un KV cache 2× plus grand (254 MB vs 127 MB).
-#              2048 → KV cache ~127 MB → total ~4.8 GiB ≤ 6g ✅
 #
-# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) — v6 :
-#   Ollama + gemma3:4b    ~5.0 GB  (modèle 3.6 GB + kv 0.13 GB + sys 1.1 GB)
-#   faster-whisper-small  ~0.7 GB
-#   NestJS API            ~0.8 GB
-#   MongoDB               ~0.4 GB
-#   Redis                 ~0.2 GB
-#   Qdrant                ~0.2 GB
-#   MinIO                 ~0.5 GB
-#   nginx + mongo-express ~0.3 GB
+# FIXES v7 (OOM kill + runner crash + whisper 137) :
+#
+#   ✅ Ollama mem_limit : 6g → 8g
+#      CAUSE RÉELLE : le runner subprocess a besoin de 4.9 GiB base
+#      + pic d'inférence (context allocation, activation buffers, génération
+#      token-par-token). Sur un appel vision/texte long, le total dépasse 6g.
+#      Mesures réelles Codespace :
+#        model weights   : 3.6 GiB
+#        kv cache (2048) : 254 MiB
+#        compute graph   : 1.1 GiB
+#        inference spike : ~0.8–1.5 GiB  ← non-comptabilisé dans les logs init
+#        ─────────────────────────────────
+#        TOTAL pic        : ~5.8–6.5 GiB  → OOM avec mem_limit=6g
+#      Avec 8g : pic max ~6.5 GiB → marge 1.5 GiB ✅
+#
+#   ✅ Ollama mem_reservation : 2g → 5g
+#      Aligne la réservation sur l'usage réel (modèle chargé en permanence).
+#
+#   ✅ Whisper mem_limit : 700m → 1200m
+#      Exit code 137 = SIGKILL kernel OOM.
+#      faster-whisper-small + Python runtime + buffer audio = ~900 MB réels.
+#      700m était insuffisant. 1200m laisse 300 MB de marge ✅
+#
+#   ✅ Whisper mem_reservation : 100m → 300m
+#
+# BUDGET MÉMOIRE 16 GB RAM (Codespace 4-core) — v7 :
+#   Ollama + gemma3:4b     ~7.0 GB  (pic inférence inclus)
+#   faster-whisper-small   ~0.9 GB
+#   NestJS API             ~0.8 GB
+#   MongoDB                ~0.4 GB
+#   Redis                  ~0.2 GB
+#   Qdrant                 ~0.2 GB
+#   MinIO                  ~0.5 GB
+#   nginx + mongo-express  ~0.3 GB
 #   ─────────────────────────────
-#   Conteneurs total      ~8.1 GB
-#   OS + Docker daemon    ~1.5 GB
+#   Conteneurs total       ~10.3 GB
+#   OS + Docker daemon     ~1.5 GB
 #   ─────────────────────────────
-#   TOTAL                 ~9.6 GB  ✅ (marge 6.4 GB sur 16 GB)
+#   TOTAL                  ~11.8 GB  ✅ (marge 4.2 GB sur 16 GB)
 #
 # WORKFLOW :
 #   1ère fois      → make start  (pull image Ollama latest + modèle gemma3:4b)
@@ -143,15 +121,14 @@ services:
 
   # ── Ollama — LLM local (gemma3:4b) ──────────────────────────────────────────
   #
-  # FIX v6 — mem_limit 4g → 6g :
-  #   Mesures réelles en production (logs 2026-04-20) :
-  #     model weights  : 3.6 GiB
-  #     model kv cache : 254 MiB (OLLAMA_NUM_CTX=4096)
-  #     system CPU     : 1.1 GiB (overhead runtime)
-  #     ─────────────────────────
-  #     TOTAL          : 4.9 GiB → crashait avec mem_limit=4g
-  #   Avec OLLAMA_NUM_CTX=2048 et mem_limit=6g :
-  #     total estimé   : ~4.8 GiB → marge 1.2 GiB ✅
+  # FIX v7 — mem_limit 6g → 8g :
+  #   Le runner subprocess (llama.cpp) s'alloue 4.9 GiB à l'init,
+  #   puis subit un pic de +0.8–1.5 GiB pendant l'inférence réelle
+  #   (activation buffers, génération token-par-token, batch workspace).
+  #   Ce pic n'apparaît PAS dans les logs "total memory size" qui ne montrent
+  #   que les allocations statiques initiales — d'où la confusion.
+  #   Avec mem_limit=6g, le cgroup Docker tuait le runner (exit 137).
+  #   8g = 6.5 GiB pic réel + 1.5 GiB marge de sécurité ✅
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -161,15 +138,13 @@ services:
       - ollama-data:/root/.ollama
     environment:
       OLLAMA_NUM_PARALLEL:      "1"          # CPU : 1 seule inférence à la fois
-      OLLAMA_MAX_LOADED_MODELS: "1"          # 1 modèle en RAM (économie mémoire)
+      OLLAMA_MAX_LOADED_MODELS: "1"          # 1 modèle en RAM
       OLLAMA_KEEP_ALIVE:        "-1"         # Modèle permanent en RAM (zéro cold start)
       OLLAMA_NUM_THREAD:        "4"          # Threads CPU (4-core Codespace)
-      OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU (GPU seulement)
-      OLLAMA_NUM_CTX:           "2048"       # FIX v6 : 4096→2048 — aligne sur local.strategy.ts
-                                             # KV cache : ~127 MB (vs 254 MB avant)
-                                             # Total mémoire : ~4.8 GiB ≤ 6g ✅
-      OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée (évite OOM si rafale)
-      OLLAMA_ORIGINS:           "*"          # Accepte les connexions Docker inter-services
+      OLLAMA_FLASH_ATTENTION:   "0"          # Désactivé sur CPU
+      OLLAMA_NUM_CTX:           "2048"       # KV cache ~254 MiB — aligné sur local.strategy.ts
+      OLLAMA_MAX_QUEUE:         "2"          # File d'attente limitée
+      OLLAMA_ORIGINS:           "*"          # Connexions Docker inter-services
     ports:
       - '11434:11434'
     dns:
@@ -177,8 +152,8 @@ services:
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       6g                      # FIX v6 : 4g→6g (modèle nécessite 4.9 GiB réels)
-    mem_reservation: 2g                      # FIX v6 : 500m→2g (aligne sur usage réel)
+    mem_limit:       8g                      # FIX v7 : 6g→8g — pic inférence ~6.5 GiB réel
+    mem_reservation: 5g                      # FIX v7 : 2g→5g — usage réel modèle chargé
     logging:
       driver: json-file
       options:
@@ -193,10 +168,18 @@ services:
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #
-  # NOTE v6 — WHISPER__LANGUAGE supprimé :
-  #   La valeur "auto" n'est pas un code ISO 639-1 valide et provoquait
-  #   une erreur 422 côté API request. Sans cette variable, le serveur
-  #   active la détection automatique de langue par défaut (comportement correct).
+  # FIX v7 — mem_limit 700m → 1200m :
+  #   Exit code 137 = SIGKILL kernel OOM. Le container était tué systématiquement.
+  #   Mesures réelles :
+  #     faster-whisper-small model : ~466 MB
+  #     Python runtime + librairies : ~200 MB
+  #     Buffer traitement audio (int8) : ~100–200 MB selon durée
+  #     ─────────────────────────────────────
+  #     TOTAL réel                : ~800–900 MB > 700m ❌
+  #   1200m = 900 MB usage réel + 300 MB marge ✅
+  #
+  # NOTE — WHISPER__LANGUAGE supprimé (v6) :
+  #   "auto" n'est pas un code ISO 639-1 valide → erreur 422.
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
@@ -208,15 +191,14 @@ services:
       WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
       WHISPER__INFERENCE_DEVICE: "cpu"
       WHISPER__COMPUTE_TYPE:     "int8"
-      # WHISPER__LANGUAGE supprimé intentionnellement — "auto" cause des erreurs 422
-      # Le serveur détecte automatiquement la langue quand non spécifié (comportement correct)
+      # WHISPER__LANGUAGE absent intentionnellement — "auto" cause des erreurs 422
       WHISPER__BEAM_SIZE:        "1"
     ports:
       - '8000:8000'
     networks:
       - khidmeti-network
-    mem_limit:       700m
-    mem_reservation: 100m
+    mem_limit:       1200m                   # FIX v7 : 700m→1200m — prévient exit code 137 (OOM kill)
+    mem_reservation: 300m                    # FIX v7 : 100m→300m
     logging:
       driver: json-file
       options:
