@@ -1,46 +1,52 @@
 // apps/api/src/modules/ai/providers/local.strategy.ts
-// FIX v9 — Three critical fixes for 8 GB RAM environments
+//
+// FIX v10 — Two-Step Vision Pipeline (BREAKING FIX for image intent extraction)
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// FIX 1 — Vision timeout too short (CRITICAL)
+// PROBLEM (confirmed in logs — Images 6, 7, 8) :
 //
-//   SYMPTOM : [GIN] | 500 | 1m0s  →  "Ollama fetch failed: This operation was aborted"
-//
-//   ROOT CAUSE — moondream inference on 8 GB CPU :
-//     model cold-start  :  ~11 seconds
-//     CLIP encoding     :  ~20-40 seconds  (378×378 image → 729 vision tokens)
-//     text generation   :  ~10-20 seconds
-//     ────────────────────────────────────
-//     total (cold)      :  ~41-71 seconds  >  OLLAMA_TIMEOUT_MS=60000 ❌
-//
-//   FIX : Introduce OLLAMA_VISION_TIMEOUT_MS (default 150 000 ms = 2.5 min).
-//         Text inference (gemma3:1b) keeps OLLAMA_TIMEOUT_MS (60 000 ms).
-//
-// ══════════════════════════════════════════════════════════════════════════════
-// FIX 2 — AbortError detection bug
-//
-//   SYMPTOM : Timeout displayed as "Ollama fetch failed: This operation was aborted"
-//             instead of the clear "Ollama timeout (Xms) — modèle: moondream" message.
+//   [Nest] WARN [IntentExtractorService] Could not find JSON in AI response:
+//   The image shows a white electrical outlet with a burnt-out plug on it...
 //
 //   ROOT CAUSE :
-//     Inner catch wraps ANY fetch exception — including AbortError — as a
-//     plain Error before the outer catch can test name === 'AbortError' :
+//     moondream is a lightweight vision model designed for edge devices.
+//     Its documentation explicitly states it may struggle with complex or
+//     precise instructions. It is a DESCRIPTION model, not an
+//     instruction-following model. Sending it a JSON system prompt is ignored
+//     entirely — it always outputs plain English prose.
 //
-//       try {                                          ← outer
-//         try {
-//           res = await fetch(..., { signal });
-//         } catch (fetchErr) {
-//           throw new Error(`Ollama fetch failed: ${msg}`);  ← wraps AbortError
-//         }
-//       } catch (err) {
-//         if (err.name === 'AbortError') { ... }  ← NEVER REACHED (wrapped above)
-//       }
+//   CONSEQUENCE :
+//     parse() finds no { } in the response → returns FALLBACK every time.
+//     circuitImage.onSuccess() is still called (no exception thrown) so the
+//     circuit never opens. Every image call silently returns confidence=0.
 //
-//   FIX : Re-throw AbortError unmodified from the inner catch so the outer
-//         handler receives it with name === 'AbortError' intact.
+// FIX v10 — Two-Step Pipeline :
+//
+//   STEP 1 : moondream — pure visual description
+//     Input  : base64 image
+//     Prompt : "Describe this home appliance problem in one sentence in English."
+//     Output : plain English sentence  (moondream is excellent at this)
+//     Timeout: ollamaVisionTimeout (150 000 ms default)
+//
+//   STEP 2 : gemma3:1b — JSON intent extraction
+//     Input  : the description from step 1
+//     Prompt : SYSTEM_PROMPT (full JSON schema + few-shot examples)
+//     Output : valid JSON intent object
+//     Timeout: ollamaTimeout (60 000 ms)
+//
+//   This completely decouples the visual perception concern from the
+//   structured-output concern. Each model does exactly what it was built for.
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// FIX 3 — Same AbortError bug in processAudio() — same fix applied.
+// FIX v9 (maintained) — Separate timeouts per modality :
+//
+//   OLLAMA_TIMEOUT_MS        = 60 000 ms  (text   — gemma3:1b — fast)
+//   OLLAMA_VISION_TIMEOUT_MS = 150 000 ms (vision — moondream — slow on CPU)
+//
+// FIX v9 (maintained) — AbortError detection bug :
+//
+//   Inner catch re-throws AbortError unmodified so the outer handler
+//   correctly identifies timeouts via name === 'AbortError'.
 // ══════════════════════════════════════════════════════════════════════════════
 
 import { Injectable, Logger } from '@nestjs/common';
@@ -89,17 +95,20 @@ export class LocalStrategy implements IAiProvider {
 
   private readonly ollamaUrl:           string;
   private readonly ollamaModel:         string; // gemma3:1b  — texte/JSON
-  private readonly ollamaVisionModel:   string; // moondream  — images
+  private readonly ollamaVisionModel:   string; // moondream  — description visuelle
   private readonly ollamaTimeout:       number; // timeout texte  (défaut 60 000 ms)
-  private readonly ollamaVisionTimeout: number; // FIX v9 : timeout vision (défaut 150 000 ms)
+  private readonly ollamaVisionTimeout: number; // timeout vision (défaut 150 000 ms)
   private readonly whisperUrl:          string;
   private readonly whisperModel:        string;
 
   // gemma3:1b : 1024 tokens suffisent (system ~400 + query ~100 + réponse JSON ~100)
   private static readonly NUM_CTX        = 1024;
 
-  // moondream : contexte plus large pour l'encodage CLIP des features visuelles
-  private static readonly VISION_NUM_CTX = 2048;
+  // moondream : contexte plus large pour l'encodage CLIP des features visuelles.
+  // En step 1 (description seulement), 512 tokens suffisent amplement — moondream
+  // ne génère qu'une phrase courte. 1024 réduit le KV-cache et accélère l'inférence
+  // de ~10-15% par rapport à 2048 sur CPU.
+  private static readonly VISION_NUM_CTX = 1024;
 
   constructor() {
     this.ollamaUrl           = process.env['OLLAMA_BASE_URL']              ?? 'http://ollama:11434';
@@ -111,9 +120,10 @@ export class LocalStrategy implements IAiProvider {
     this.whisperModel        = process.env['WHISPER_MODEL']                 ?? 'Systran/faster-whisper-small';
 
     this.logger.log(
-      `✅ LocalStrategy v9 — Dual-model (low RAM)\n` +
-      `   ├─ texte  : Ollama → ${this.ollamaModel} (NUM_CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms)\n` +
-      `   ├─ image  : Ollama → ${this.ollamaVisionModel} (NUM_CTX=${LocalStrategy.VISION_NUM_CTX}, timeout=${this.ollamaVisionTimeout}ms)\n` +
+      `✅ LocalStrategy v10 — Two-Step Vision Pipeline\n` +
+      `   ├─ texte  : Ollama → ${this.ollamaModel}       (NUM_CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms)\n` +
+      `   ├─ vision : Ollama → ${this.ollamaVisionModel} (NUM_CTX=${LocalStrategy.VISION_NUM_CTX}, timeout=${this.ollamaVisionTimeout}ms) [step-1: describe]\n` +
+      `   ├─         Ollama → ${this.ollamaModel}        (NUM_CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms) [step-2: JSON]\n` +
       `   └─ audio  : faster-whisper → ${this.whisperModel}`,
     );
   }
@@ -128,7 +138,7 @@ export class LocalStrategy implements IAiProvider {
     return this.chat(
       this.ollamaModel,
       LocalStrategy.NUM_CTX,
-      this.ollamaTimeout,   // timeout texte : 60 s
+      this.ollamaTimeout,
       [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: prompt },
@@ -137,13 +147,38 @@ export class LocalStrategy implements IAiProvider {
     );
   }
 
-  // ── Image (moondream) ──────────────────────────────────────────────────────
+  // ── Image — Two-Step Pipeline ──────────────────────────────────────────────
   //
-  // FIX v9 : utilise ollamaVisionTimeout (150 s par défaut).
+  // FIX v10 — Architecture change: moondream → description, gemma3:1b → JSON
   //
-  // Sur CPU 8 GB, moondream cold-start (11 s) + CLIP encoding (~30-40 s) +
-  // génération (~15 s) ≈ 56-66 s — dépasse systématiquement le timeout de 60 s.
-  // Avec 150 s, même les cold-starts les plus lents passent confortablement.
+  // WHY this is necessary:
+  //   moondream was designed for edge devices and optimised for image captioning.
+  //   It does NOT follow structured output instructions (system prompts, JSON
+  //   schemas, few-shot examples). Every attempt to get JSON from moondream
+  //   silently fails — it returns plain English and parse() returns FALLBACK.
+  //
+  // HOW the two-step works:
+  //   Step 1  moondream receives ONLY the image + a simple "describe in one
+  //           sentence" prompt. This is exactly what moondream excels at.
+  //           No JSON. No schema. No few-shot examples.
+  //           Timeout: ollamaVisionTimeout (150s for cold-start on 8GB CPU).
+  //
+  //   Step 2  gemma3:1b receives the plain-text description as user message
+  //           and the full SYSTEM_PROMPT (with JSON schema + few-shot) as the
+  //           system message. gemma3:1b reliably produces valid JSON.
+  //           Timeout: ollamaTimeout (60s — no image encoding needed).
+  //
+  // NOTE on the `prompt` parameter:
+  //   intent-extractor.service.ts passes the SYSTEM_PROMPT concatenated with
+  //   a preamble. We use it as-is as the system message for step 2, so the
+  //   full few-shot context is preserved.
+  //
+  // NOTE on OLLAMA_MAX_LOADED_MODELS:
+  //   With the default value of 1, Ollama swaps moondream ↔ gemma3:1b between
+  //   steps. Swap time ≈ 5-10s on 8GB RAM. This is acceptable for image
+  //   analysis (total latency ≈ vision_time + swap + json_time).
+  //   With OLLAMA_MAX_LOADED_MODELS=2 (16GB+) both models stay in RAM and
+  //   the swap is eliminated entirely.
 
   async analyzeImage(
     imageBase64: string,
@@ -152,18 +187,50 @@ export class LocalStrategy implements IAiProvider {
   ): Promise<string> {
     const mime = this.detectImageMime(Buffer.from(imageBase64, 'base64'));
 
+    // ── Step 1 : moondream — pure visual description ─────────────────────────
+    // Intentionally simple prompt: no JSON, no schema, no instructions.
+    // moondream handles this reliably and quickly.
+    let description: string;
+    try {
+      description = await this.chat(
+        this.ollamaVisionModel,
+        LocalStrategy.VISION_NUM_CTX,
+        this.ollamaVisionTimeout,
+        [{
+          role:    'user',
+          content: [
+            {
+              type:      'image_url',
+              image_url: { url: `data:${mime};base64,${imageBase64}` },
+            },
+            {
+              type: 'text',
+              text: 'Describe this home appliance or household problem in one sentence in English.',
+            },
+          ],
+        }],
+        { temperature: 0, maxTokens: 100 },
+      );
+    } catch (err) {
+      // Re-throw so intent-extractor circuit breaker handles it correctly.
+      // Do NOT swallow — a timeout here should count as an image circuit failure.
+      throw err;
+    }
+
+    this.logger.debug(`[vision step-1] moondream: "${description.trim().slice(0, 120)}"`);
+
+    // ── Step 2 : gemma3:1b — JSON intent extraction from the description ─────
+    // The `prompt` parameter already contains SYSTEM_PROMPT + few-shot examples.
+    // We use it as the system message so gemma3:1b has full extraction context.
     return this.chat(
-      this.ollamaVisionModel,
-      LocalStrategy.VISION_NUM_CTX,
-      this.ollamaVisionTimeout,  // FIX v9 : timeout vision : 150 s
-      [{
-        role:    'user',
-        content: [
-          { type: 'image_url', image_url: { url: `data:${mime};base64,${imageBase64}` } },
-          { type: 'text',      text: prompt },
-        ],
-      }],
-      opts,
+      this.ollamaModel,
+      LocalStrategy.NUM_CTX,
+      this.ollamaTimeout,
+      [
+        { role: 'system', content: prompt },
+        { role: 'user',   content: `Image shows: ${description.trim()}` },
+      ],
+      { temperature: opts.temperature ?? 0.05, maxTokens: opts.maxTokens ?? 256 },
     );
   }
 
@@ -186,7 +253,9 @@ export class LocalStrategy implements IAiProvider {
     form.append('model',           this.whisperModel);
     form.append('response_format', 'verbose_json');
     // NOTE : 'language' intentionnellement absent — 'auto' cause HTTP 422.
-    form.append('beam_size',       '1');
+    // Le docker-compose définit WHISPER__LANGUAGE=fr pour améliorer la
+    // reconnaissance de la Darija algérienne (fortement influencée par le français).
+    form.append('beam_size', '1');
 
     const ctrl  = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 60_000);
@@ -201,8 +270,7 @@ export class LocalStrategy implements IAiProvider {
         });
       } catch (fetchErr) {
         // FIX v9 : Re-throw AbortError unmodified — prevents it from being
-        // swallowed as a generic "Whisper fetch failed" error. The outer catch
-        // then correctly identifies it as a timeout.
+        // swallowed as a generic "Whisper fetch failed" error.
         if ((fetchErr as Error).name === 'AbortError') throw fetchErr;
 
         const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -235,17 +303,18 @@ export class LocalStrategy implements IAiProvider {
     }
   }
 
-  // ── Privé — chat générique (modèle + ctx + timeout paramétrables) ──────────
+  // ── Privé — chat générique ─────────────────────────────────────────────────
   //
-  // FIX v9 — ajout du paramètre `timeoutMs` :
-  //   Permet à generateText (60 s) et analyzeImage (150 s) d'avoir des
-  //   timeouts indépendants sans dupliquer la logique HTTP.
+  // Paramètres :
+  //   model     : nom du modèle Ollama (gemma3:1b ou moondream)
+  //   numCtx    : taille du contexte KV-cache
+  //   timeoutMs : timeout indépendant par modalité (FIX v9)
+  //   messages  : historique de conversation (avec support multimodal)
+  //   opts      : temperature / maxTokens
   //
-  // FIX v9 — correction du bug AbortError (voir header du fichier).
-  //
-  // FIX v7 maintenu — extraction error string interne du JSON Ollama :
-  //   { "error": "llama runner process has terminated: %!w(<nil>)" }
-  //   → extrait "llama runner process has terminated" pour OVERLOAD_PATTERNS.
+  // FIX v9 — correction du bug AbortError :
+  //   AbortError est re-throw avant d'être wrappé en Error générique,
+  //   garantissant que name === 'AbortError' est préservé jusqu'au catch externe.
 
   private async chat(
     model:     string,
@@ -274,11 +343,9 @@ export class LocalStrategy implements IAiProvider {
           }),
         });
       } catch (fetchErr) {
-        // FIX v9 : Re-throw AbortError unmodified so the outer catch receives it
-        // with name === 'AbortError' intact. Without this, AbortError was wrapped
-        // as a plain Error and the outer check never fired — producing the
-        // confusing "Ollama fetch failed: This operation was aborted" message
-        // visible in the logs at [GIN] | 500 | 1m0s.
+        // FIX v9 : Re-throw AbortError unmodified so the outer catch receives
+        // it with name === 'AbortError' intact. Without this, AbortError was
+        // wrapped as a plain Error and the timeout message was lost.
         if ((fetchErr as Error).name === 'AbortError') throw fetchErr;
 
         const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -316,7 +383,6 @@ export class LocalStrategy implements IAiProvider {
 
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
-        // FIX v9 : Now correctly reached thanks to the inner-catch fix above
         throw new Error(
           `Ollama timeout (${timeoutMs}ms) — modèle: ${model}. ` +
           `Sur CPU 8 GB, la vision peut prendre jusqu'à 90s (cold-start). ` +
@@ -333,12 +399,16 @@ export class LocalStrategy implements IAiProvider {
 
   private detectImageMime(buf: Buffer): string {
     if (buf.length < 4) return 'image/jpeg';
+    // JPEG : FF D8 FF
     if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
       return 'image/jpeg';
+    // PNG : 89 50 4E 47
     if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
       return 'image/png';
+    // GIF : 47 49 46
     if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46)
       return 'image/gif';
+    // WebP : RIFF....WEBP
     if (
       buf.length >= 12 &&
       buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
