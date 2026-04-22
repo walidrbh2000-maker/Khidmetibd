@@ -1,52 +1,56 @@
 // apps/api/src/modules/ai/providers/local.strategy.ts
 //
-// FIX v10 — Two-Step Vision Pipeline (BREAKING FIX for image intent extraction)
+// v11 — Architecture directe llama.cpp:server (sans Ollama)
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// PROBLEM (confirmed in logs — Images 6, 7, 8) :
+// MIGRATION depuis Ollama :
 //
-//   [Nest] WARN [IntentExtractorService] Could not find JSON in AI response:
-//   The image shows a white electrical outlet with a burnt-out plug on it...
+//   AVANT (v10) :
+//     Ollama (Go wrapper) → llama.cpp runner
+//     PROBLÈME : "llama runner process has terminated: %w(<nil>)"
+//     → Le wrapper Go d'Ollama est instable sur CPU limité
+//     → Crash silencieux sans possibilité de redémarrage partiel
+//     → 100+ MB RAM overhead pour le wrapper Go inutile
 //
-//   ROOT CAUSE :
-//     moondream is a lightweight vision model designed for edge devices.
-//     Its documentation explicitly states it may struggle with complex or
-//     precise instructions. It is a DESCRIPTION model, not an
-//     instruction-following model. Sending it a JSON system prompt is ignored
-//     entirely — it always outputs plain English prose.
+//   APRÈS (v11) :
+//     llama.cpp:server (binaire C++ pur) via Docker
+//     → Même engine, SANS le wrapper instable
+//     → Démarrage ~3s (modèle déjà sur disque bind-mount)
+//     → API OpenAI-compatible identique → zéro changement d'interface
+//     → Mémoire exactement prévisible (pas de Go runtime)
 //
-//   CONSEQUENCE :
-//     parse() finds no { } in the response → returns FALLBACK every time.
-//     circuitImage.onSuccess() is still called (no exception thrown) so the
-//     circuit never opens. Every image call silently returns confidence=0.
+// CHANGEMENTS v11 :
 //
-// FIX v10 — Two-Step Pipeline :
+//   1. ollamaUrl       → http://ai-text:8011  (llama.cpp:server Qwen3-0.6B)
+//      ollamaVisionUrl → http://ai-vision:8012 (llama.cpp:server moondream2)
+//      whisperUrl      → http://ai-audio:8000  (faster-whisper large-v3-turbo)
 //
-//   STEP 1 : moondream — pure visual description
-//     Input  : base64 image
-//     Prompt : "Describe this home appliance problem in one sentence in English."
-//     Output : plain English sentence  (moondream is excellent at this)
-//     Timeout: ollamaVisionTimeout (150 000 ms default)
+//   2. chat() accepte baseUrl comme 1er paramètre (URL explicite par service)
+//      → generateText() utilise ollamaUrl   (ai-text)
+//      → analyzeImage() step-1 utilise ollamaVisionUrl (ai-vision)
+//      → analyzeImage() step-2 utilise ollamaUrl (ai-text)
 //
-//   STEP 2 : gemma3:1b — JSON intent extraction
-//     Input  : the description from step 1
-//     Prompt : SYSTEM_PROMPT (full JSON schema + few-shot examples)
-//     Output : valid JSON intent object
-//     Timeout: ollamaTimeout (60 000 ms)
+//   3. Qwen3 non-thinking mode :
+//      → chat_template_kwargs: { thinking_budget: 0 }
+//      → Strip automatique des balises <think>...</think> en post-processing
+//      → Garantit JSON immédiat sans chain-of-thought
 //
-//   This completely decouples the visual perception concern from the
-//   structured-output concern. Each model does exactly what it was built for.
+//   4. Timeouts réduits (plus de Go overhead) :
+//      ollamaTimeout       : 60 000ms → 15 000ms  (Qwen3-0.6B rapide)
+//      ollamaVisionTimeout : 150 000ms → 60 000ms (moondream direct)
 //
-// ══════════════════════════════════════════════════════════════════════════════
-// FIX v9 (maintained) — Separate timeouts per modality :
+// PIPELINE TWO-STEP (conservé depuis v10, maintenant plus stable) :
 //
-//   OLLAMA_TIMEOUT_MS        = 60 000 ms  (text   — gemma3:1b — fast)
-//   OLLAMA_VISION_TIMEOUT_MS = 150 000 ms (vision — moondream — slow on CPU)
+//   Step 1 : moondream2 via ai-vision:8012
+//            → "Describe this home appliance problem in one sentence in English."
+//            → Output : description en anglais (moondream excelle à ça)
+//            → Pas de JSON, pas de schema, pas d'instructions complexes
 //
-// FIX v9 (maintained) — AbortError detection bug :
+//   Step 2 : Qwen3-0.6B via ai-text:8011
+//            → Input : description de step-1
+//            → Output : JSON intent structuré (Qwen3 suit les instructions)
+//            → Mode non-thinking activé = JSON immédiat
 //
-//   Inner catch re-throws AbortError unmodified so the outer handler
-//   correctly identifies timeouts via name === 'AbortError'.
 // ══════════════════════════════════════════════════════════════════════════════
 
 import { Injectable, Logger } from '@nestjs/common';
@@ -87,48 +91,85 @@ function isGarbage(text: string): boolean {
   return t.length < 3 || TIMESTAMP_RE.test(t) || /^[\d\s:.,\-]+$/.test(t);
 }
 
+// ── Nettoyage des réponses IA ─────────────────────────────────────────────────
+
+/**
+ * Supprime les blocs de "thinking" des modèles qui les génèrent :
+ *  - Qwen3 : <think>...</think>
+ *  - Anciens Ollama : <|channel>thought...<channel|>
+ *  - Markdown code blocks : ```json...```
+ */
+function cleanAiResponse(raw: string): string {
+  return raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')            // Qwen3 thinking
+    .replace(/<\|channel>thought[\s\S]*?<channel\|>/g, '') // Ollama thought
+    .replace(/```(?:json)?\s*/g, '')                       // markdown code
+    .replace(/```/g, '')
+    .trim();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Injectable()
 export class LocalStrategy implements IAiProvider {
   private readonly logger = new Logger(LocalStrategy.name);
 
+  // ── Endpoints ────────────────────────────────────────────────────────────────
+
+  /** URL du service texte/JSON : llama.cpp:server + Qwen3-0.6B */
   private readonly ollamaUrl:           string;
-  private readonly ollamaModel:         string; // gemma3:1b  — texte/JSON
-  private readonly ollamaVisionModel:   string; // moondream  — description visuelle
-  private readonly ollamaTimeout:       number; // timeout texte  (défaut 60 000 ms)
-  private readonly ollamaVisionTimeout: number; // timeout vision (défaut 150 000 ms)
+
+  /**
+   * URL du service vision : llama.cpp:server + moondream2
+   * Séparé de ollamaUrl pour l'isolation des pannes :
+   * un crash vision n'affecte PAS les requêtes texte/audio.
+   */
+  private readonly ollamaVisionUrl:     string;
+
+  private readonly ollamaModel:         string; // Qwen3-0.6B — texte/JSON
+  private readonly ollamaVisionModel:   string; // moondream2  — description image
+
+  /** Timeout pour les requêtes texte (Qwen3-0.6B rapide sur CPU) */
+  private readonly ollamaTimeout:       number;
+
+  /** Timeout pour les requêtes vision (moondream2 + CLIP encode) */
+  private readonly ollamaVisionTimeout: number;
+
   private readonly whisperUrl:          string;
   private readonly whisperModel:        string;
 
-  // gemma3:1b : 1024 tokens suffisent (system ~400 + query ~100 + réponse JSON ~100)
-  private static readonly NUM_CTX        = 1024;
+  // ── Contextes KV-cache ────────────────────────────────────────────────────
+  // Qwen3-0.6B : 512 tokens suffisent (system ~300 + query ~100 + JSON ~100)
+  private static readonly NUM_CTX        = 512;
 
-  // moondream : contexte plus large pour l'encodage CLIP des features visuelles.
-  // En step 1 (description seulement), 512 tokens suffisent amplement — moondream
-  // ne génère qu'une phrase courte. 1024 réduit le KV-cache et accélère l'inférence
-  // de ~10-15% par rapport à 2048 sur CPU.
+  // moondream2 : 1024 tokens pour l'encodage CLIP + génération description
   private static readonly VISION_NUM_CTX = 1024;
 
   constructor() {
-    this.ollamaUrl           = process.env['OLLAMA_BASE_URL']              ?? 'http://ollama:11434';
-    this.ollamaModel         = process.env['OLLAMA_MODEL']                  ?? 'gemma3:1b';
-    this.ollamaVisionModel   = process.env['OLLAMA_VISION_MODEL']           ?? 'moondream';
-    this.ollamaTimeout       = parseInt(process.env['OLLAMA_TIMEOUT_MS']         ?? '60000',  10);
-    this.ollamaVisionTimeout = parseInt(process.env['OLLAMA_VISION_TIMEOUT_MS']  ?? '150000', 10);
-    this.whisperUrl          = process.env['WHISPER_BASE_URL']             ?? 'http://whisper:8000';
-    this.whisperModel        = process.env['WHISPER_MODEL']                 ?? 'Systran/faster-whisper-small';
+    // ── v11 : URLs directes llama.cpp:server (plus Ollama) ──────────────────
+    this.ollamaUrl           = process.env['OLLAMA_BASE_URL']              ?? 'http://ai-text:8011';
+    this.ollamaVisionUrl     = process.env['OLLAMA_BASE_URL_VISION']       ?? 'http://ai-vision:8012';
+    this.ollamaModel         = process.env['OLLAMA_MODEL']                  ?? 'qwen3-0.6b-q4_k_m';
+    this.ollamaVisionModel   = process.env['OLLAMA_VISION_MODEL']           ?? 'moondream2';
+
+    // v11 : timeouts réduits — plus de Go wrapper overhead
+    this.ollamaTimeout       = parseInt(process.env['OLLAMA_TIMEOUT_MS']         ?? '15000', 10);
+    this.ollamaVisionTimeout = parseInt(process.env['OLLAMA_VISION_TIMEOUT_MS']  ?? '60000', 10);
+
+    this.whisperUrl          = process.env['WHISPER_BASE_URL']             ?? 'http://ai-audio:8000';
+    this.whisperModel        = process.env['WHISPER_MODEL']                 ?? 'Systran/faster-whisper-large-v3-turbo';
 
     this.logger.log(
-      `✅ LocalStrategy v10 — Two-Step Vision Pipeline\n` +
-      `   ├─ texte  : Ollama → ${this.ollamaModel}       (NUM_CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms)\n` +
-      `   ├─ vision : Ollama → ${this.ollamaVisionModel} (NUM_CTX=${LocalStrategy.VISION_NUM_CTX}, timeout=${this.ollamaVisionTimeout}ms) [step-1: describe]\n` +
-      `   ├─         Ollama → ${this.ollamaModel}        (NUM_CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms) [step-2: JSON]\n` +
-      `   └─ audio  : faster-whisper → ${this.whisperModel}`,
+      `✅ LocalStrategy v11 — llama.cpp:server direct (sans Ollama)\n` +
+      `   ├─ texte  : ${this.ollamaUrl} → ${this.ollamaModel}` +
+      `       (CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms)\n` +
+      `   ├─ vision : ${this.ollamaVisionUrl} → ${this.ollamaVisionModel}` +
+      `  (CTX=${LocalStrategy.VISION_NUM_CTX}, timeout=${this.ollamaVisionTimeout}ms)\n` +
+      `   └─ audio  : ${this.whisperUrl} → ${this.whisperModel}`,
     );
   }
 
-  // ── Texte (gemma3:1b) ──────────────────────────────────────────────────────
+  // ── Texte / JSON (Qwen3-0.6B via ai-text:8011) ────────────────────────────
 
   async generateText(
     prompt:       string,
@@ -136,6 +177,7 @@ export class LocalStrategy implements IAiProvider {
     opts: { temperature?: number; maxTokens?: number } = {},
   ): Promise<string> {
     return this.chat(
+      this.ollamaUrl,
       this.ollamaModel,
       LocalStrategy.NUM_CTX,
       this.ollamaTimeout,
@@ -147,38 +189,21 @@ export class LocalStrategy implements IAiProvider {
     );
   }
 
-  // ── Image — Two-Step Pipeline ──────────────────────────────────────────────
+  // ── Vision — Two-Step Pipeline ─────────────────────────────────────────────
   //
-  // FIX v10 — Architecture change: moondream → description, gemma3:1b → JSON
+  // v11 : même pipeline two-step qu'en v10, mais maintenant chaque step
+  // cible un service llama.cpp:server indépendant et stable.
   //
-  // WHY this is necessary:
-  //   moondream was designed for edge devices and optimised for image captioning.
-  //   It does NOT follow structured output instructions (system prompts, JSON
-  //   schemas, few-shot examples). Every attempt to get JSON from moondream
-  //   silently fails — it returns plain English and parse() returns FALLBACK.
+  // POURQUOI le two-step est toujours nécessaire avec moondream2 ?
+  //   moondream2 excelle à décrire des images en anglais (c'est son job).
+  //   Il ne suit PAS les instructions JSON/structured output — jamais.
+  //   → Step 1 : moondream2 décrit  (ce qu'il sait faire)
+  //   → Step 2 : Qwen3 extrait JSON (ce qu'il sait faire)
   //
-  // HOW the two-step works:
-  //   Step 1  moondream receives ONLY the image + a simple "describe in one
-  //           sentence" prompt. This is exactly what moondream excels at.
-  //           No JSON. No schema. No few-shot examples.
-  //           Timeout: ollamaVisionTimeout (150s for cold-start on 8GB CPU).
-  //
-  //   Step 2  gemma3:1b receives the plain-text description as user message
-  //           and the full SYSTEM_PROMPT (with JSON schema + few-shot) as the
-  //           system message. gemma3:1b reliably produces valid JSON.
-  //           Timeout: ollamaTimeout (60s — no image encoding needed).
-  //
-  // NOTE on the `prompt` parameter:
-  //   intent-extractor.service.ts passes the SYSTEM_PROMPT concatenated with
-  //   a preamble. We use it as-is as the system message for step 2, so the
-  //   full few-shot context is preserved.
-  //
-  // NOTE on OLLAMA_MAX_LOADED_MODELS:
-  //   With the default value of 1, Ollama swaps moondream ↔ gemma3:1b between
-  //   steps. Swap time ≈ 5-10s on 8GB RAM. This is acceptable for image
-  //   analysis (total latency ≈ vision_time + swap + json_time).
-  //   With OLLAMA_MAX_LOADED_MODELS=2 (16GB+) both models stay in RAM and
-  //   the swap is eliminated entirely.
+  // NOTE sur `prompt` (paramètre IAiProvider.analyzeImage) :
+  //   intent-extractor.service.ts passe SYSTEM_PROMPT + preamble.
+  //   On l'utilise comme system message pour step-2 (Qwen3).
+  //   Step-1 (moondream) reçoit uniquement l'image + instruction simple.
 
   async analyzeImage(
     imageBase64: string,
@@ -187,12 +212,14 @@ export class LocalStrategy implements IAiProvider {
   ): Promise<string> {
     const mime = this.detectImageMime(Buffer.from(imageBase64, 'base64'));
 
-    // ── Step 1 : moondream — pure visual description ─────────────────────────
-    // Intentionally simple prompt: no JSON, no schema, no instructions.
-    // moondream handles this reliably and quickly.
+    // ── Step 1 : moondream2 — description visuelle pure ──────────────────────
+    // Instruction volontairement simple : pas de JSON, pas de schema.
+    // moondream2 est optimisé pour la description d'objets/scènes, pas pour
+    // suivre des instructions complexes.
     let description: string;
     try {
       description = await this.chat(
+        this.ollamaVisionUrl,
         this.ollamaVisionModel,
         LocalStrategy.VISION_NUM_CTX,
         this.ollamaVisionTimeout,
@@ -212,17 +239,18 @@ export class LocalStrategy implements IAiProvider {
         { temperature: 0, maxTokens: 100 },
       );
     } catch (err) {
-      // Re-throw so intent-extractor circuit breaker handles it correctly.
-      // Do NOT swallow — a timeout here should count as an image circuit failure.
+      // Re-throw pour que le circuit breaker 'image' dans intent-extractor
+      // enregistre correctement l'échec. Ne pas avaler l'erreur.
       throw err;
     }
 
-    this.logger.debug(`[vision step-1] moondream: "${description.trim().slice(0, 120)}"`);
+    this.logger.debug(`[vision step-1] moondream2: "${description.trim().slice(0, 120)}"`);
 
-    // ── Step 2 : gemma3:1b — JSON intent extraction from the description ─────
-    // The `prompt` parameter already contains SYSTEM_PROMPT + few-shot examples.
-    // We use it as the system message so gemma3:1b has full extraction context.
+    // ── Step 2 : Qwen3 — extraction JSON d'intent ────────────────────────────
+    // `prompt` contient SYSTEM_PROMPT avec few-shot examples.
+    // Qwen3 mode non-thinking → JSON immédiat (pas de chain-of-thought).
     return this.chat(
+      this.ollamaUrl,
       this.ollamaModel,
       LocalStrategy.NUM_CTX,
       this.ollamaTimeout,
@@ -230,15 +258,11 @@ export class LocalStrategy implements IAiProvider {
         { role: 'system', content: prompt },
         { role: 'user',   content: `Image shows: ${description.trim()}` },
       ],
-      { temperature: opts.temperature ?? 0.05, maxTokens: opts.maxTokens ?? 256 },
+      { temperature: opts.temperature ?? 0.05, maxTokens: opts.maxTokens ?? 200 },
     );
   }
 
-  // ── Audio (faster-whisper) ─────────────────────────────────────────────────
-  //
-  // FIX v6 : language='auto' supprimé (HTTP 422 — code non ISO 639-1).
-  // FIX v7 : wrap des erreurs réseau pour OVERLOAD_PATTERNS.
-  // FIX v9 : correction du bug AbortError → re-throw avant wrapping.
+  // ── Audio (faster-whisper-large-v3-turbo via ai-audio:8000) ───────────────
 
   async processAudio(
     buffer: Buffer,
@@ -252,9 +276,8 @@ export class LocalStrategy implements IAiProvider {
     form.append('file',            new Blob([new Uint8Array(buffer)], { type: normalizedMime }), `audio.${ext}`);
     form.append('model',           this.whisperModel);
     form.append('response_format', 'verbose_json');
-    // NOTE : 'language' intentionnellement absent — 'auto' cause HTTP 422.
-    // Le docker-compose définit WHISPER__LANGUAGE=fr pour améliorer la
-    // reconnaissance de la Darija algérienne (fortement influencée par le français).
+    // WHISPER__LANGUAGE=fr est configuré côté serveur (docker-compose.yml)
+    // → améliore la Darija algérienne (~40% vocabulaire français partagé)
     form.append('beam_size', '1');
 
     const ctrl  = new AbortController();
@@ -269,10 +292,7 @@ export class LocalStrategy implements IAiProvider {
           signal: ctrl.signal,
         });
       } catch (fetchErr) {
-        // FIX v9 : Re-throw AbortError unmodified — prevents it from being
-        // swallowed as a generic "Whisper fetch failed" error.
         if ((fetchErr as Error).name === 'AbortError') throw fetchErr;
-
         const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
         throw new Error(`Whisper fetch failed: ${msg}`);
       }
@@ -286,7 +306,7 @@ export class LocalStrategy implements IAiProvider {
       const text = (data.text ?? '').trim();
 
       if (isGarbage(text)) {
-        this.logger.debug(`Whisper: audio silencieux ou parasite — retourne vide`);
+        this.logger.debug(`Whisper: audio silencieux ou parasite → retourne vide`);
         return { text: '', language: data.language ?? 'auto' };
       }
 
@@ -295,7 +315,7 @@ export class LocalStrategy implements IAiProvider {
 
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
-        throw new Error(`Whisper timeout (60s) — le service est-il démarré ?`);
+        throw new Error(`Whisper timeout (60s) — le service ai-audio est-il démarré ?`);
       }
       throw err;
     } finally {
@@ -305,18 +325,26 @@ export class LocalStrategy implements IAiProvider {
 
   // ── Privé — chat générique ─────────────────────────────────────────────────
   //
-  // Paramètres :
-  //   model     : nom du modèle Ollama (gemma3:1b ou moondream)
-  //   numCtx    : taille du contexte KV-cache
-  //   timeoutMs : timeout indépendant par modalité (FIX v9)
-  //   messages  : historique de conversation (avec support multimodal)
-  //   opts      : temperature / maxTokens
+  // v11 : baseUrl est le 1er paramètre (URL explicite)
+  //   → generateText() passe ollamaUrl    (ai-text:8011)
+  //   → analyzeImage() step-1 passe ollamaVisionUrl (ai-vision:8012)
+  //   → analyzeImage() step-2 passe ollamaUrl    (ai-text:8011)
   //
-  // FIX v9 — correction du bug AbortError :
-  //   AbortError est re-throw avant d'être wrappé en Error générique,
-  //   garantissant que name === 'AbortError' est préservé jusqu'au catch externe.
+  // QWEN3 NON-THINKING MODE :
+  //   Qwen3 a un mode "thinking" (chain-of-thought) qui produit des blocs
+  //   <think>...</think> avant la réponse JSON. Sur un modèle 0.6B, cela
+  //   peut représenter 200-500 tokens inutiles qui ralentissent l'inférence
+  //   et consomment le context window.
+  //   Désactivation via :
+  //     1. chat_template_kwargs: { thinking_budget: 0 } (llama.cpp >= b3900)
+  //     2. cleanAiResponse() supprime les balises <think> résiduelles
+  //
+  // llama.cpp vs Ollama — différences API :
+  //   llama.cpp ignore les clés inconnues (options.num_ctx, etc.) → safe
+  //   llama.cpp retourne exactement choices[0].message.content → identique
 
   private async chat(
+    baseUrl:   string,
     model:     string,
     numCtx:    number,
     timeoutMs: number,
@@ -326,30 +354,36 @@ export class LocalStrategy implements IAiProvider {
     const ctrl  = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
 
+    // Détection Qwen3 pour le mode non-thinking
+    const isQwen3 = model.toLowerCase().includes('qwen3') ||
+                    model.toLowerCase().includes('qwen-3');
+
     try {
       let res: Response;
       try {
-        res = await fetch(`${this.ollamaUrl}/v1/chat/completions`, {
+        res = await fetch(`${baseUrl}/v1/chat/completions`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           signal:  ctrl.signal,
           body: JSON.stringify({
             model,
             messages,
-            stream:  false,
-            options: { num_ctx: numCtx },
+            stream:      false,
             temperature: opts.temperature ?? 0.05,
             max_tokens:  opts.maxTokens   ?? 200,
+            // Paramètres llama.cpp (ignorés si non supportés)
+            cache_prompt: false,
+            // Qwen3 non-thinking mode : désactive chain-of-thought
+            // Supporté par llama.cpp >= b3900 avec le chat template Qwen3
+            ...(isQwen3 ? {
+              chat_template_kwargs: { thinking_budget: 0 },
+            } : {}),
           }),
         });
       } catch (fetchErr) {
-        // FIX v9 : Re-throw AbortError unmodified so the outer catch receives
-        // it with name === 'AbortError' intact. Without this, AbortError was
-        // wrapped as a plain Error and the timeout message was lost.
         if ((fetchErr as Error).name === 'AbortError') throw fetchErr;
-
         const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        throw new Error(`Ollama fetch failed: ${msg}`);
+        throw new Error(`llama.cpp fetch failed [${baseUrl}]: ${msg}`);
       }
 
       if (!res.ok) {
@@ -365,28 +399,32 @@ export class LocalStrategy implements IAiProvider {
 
         if (res.status === 404) {
           throw new Error(
-            `Modèle "${model}" introuvable. ` +
-            `Pull : docker exec khidmeti-ollama ollama pull ${model}`,
+            `Modèle "${model}" introuvable sur ${baseUrl}. ` +
+            `Vérifiez que le fichier GGUF est dans docker/models/ et que ` +
+            `le container est démarré.`,
           );
         }
-        throw new Error(`Ollama ${res.status}: ${internalError}`);
+        throw new Error(`llama.cpp ${res.status} [${baseUrl}]: ${internalError}`);
       }
 
       const data    = await res.json() as OllamaResponse;
       const content = data.choices?.[0]?.message?.content;
 
       if (!content || typeof content !== 'string') {
-        throw new Error(`Ollama returned empty or null content — runner may be unstable`);
+        throw new Error(`llama.cpp returned empty content [${baseUrl}] — vérifiez le modèle chargé`);
       }
 
-      return content;
+      // Nettoyage post-processing :
+      // - Supprime les balises <think>...</think> de Qwen3
+      // - Supprime les markdown code blocks
+      // - Supprime les balises Ollama résiduelles
+      return cleanAiResponse(content);
 
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
         throw new Error(
-          `Ollama timeout (${timeoutMs}ms) — modèle: ${model}. ` +
-          `Sur CPU 8 GB, la vision peut prendre jusqu'à 90s (cold-start). ` +
-          `Augmentez OLLAMA_VISION_TIMEOUT_MS si nécessaire.`,
+          `llama.cpp timeout (${timeoutMs}ms) [${baseUrl}] — modèle: ${model}. ` +
+          `Vérifiez que le container est démarré : docker ps | grep ai-`,
         );
       }
       throw err;
