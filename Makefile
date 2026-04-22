@@ -51,7 +51,7 @@ MODEL_MOON_TEXT_URL  := https://huggingface.co/vikhyatk/moondream2/resolve/main/
 MODEL_MOON_PROJ_URL  := https://huggingface.co/vikhyatk/moondream2/resolve/main/moondream2-mmproj-f16.gguf
 
 # Tailles minimales attendues (MB) — permet de détecter un téléchargement corrompu
-MODEL_QWEN3_MIN_MB      := 400
+MODEL_QWEN3_MIN_MB      := 350
 MODEL_MOON_TEXT_MIN_MB  := 1500
 MODEL_MOON_PROJ_MIN_MB  := 80
 
@@ -151,13 +151,13 @@ _ensure-env:
 # Usage : $(call _check_free_space,SIZE_MB,LABEL)
 # ──────────────────────────────────────────────────────────────────────────────
 define _check_free_space
-	@_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
+	_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
 	_needed_kb=$$(( $(1) * 1024 )); \
-	if [ "$$_free_kb" -lt "$$_needed_kb" ]; then \
-	  echo "  ❌ Espace insuffisant pour $(2) (besoin: $(1) MB, libre: $$(( $$_free_kb / 1024 )) MB)"; \
+	if [ "$${_free_kb:-0}" -lt "$$_needed_kb" ]; then \
+	  echo "  ❌ Espace insuffisant pour $(2) (besoin: $(1) MB, libre: $$(( $${_free_kb:-0} / 1024 )) MB)"; \
 	  echo "     Libérer de l'espace : docker system prune -f"; \
 	  exit 1; \
-	fi
+	fi;
 endef
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -171,12 +171,12 @@ endef
 #   4. Retry automatique (5 tentatives, délai croissant)
 # ──────────────────────────────────────────────────────────────────────────────
 define _dl_gguf
-	$(call _check_free_space,$(3),$(4))
-	@echo "  📥 $(4) → $(notdir $(2))"
-	@echo "     Source  : $(1)"
-	@echo "     Dest    : $(2)"
-	@echo ""
-	@if curl -L \
+	{ $(call _check_free_space,$(3),$(4)) true; }; \
+	echo "  📥 $(4) → $(notdir $(2))"; \
+	echo "     Source  : $(1)"; \
+	echo "     Dest    : $(2)"; \
+	echo ""; \
+	if curl -L \
 	    --retry 5 \
 	    --retry-delay 5 \
 	    --retry-max-time 600 \
