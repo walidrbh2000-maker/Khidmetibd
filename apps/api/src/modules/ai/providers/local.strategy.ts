@@ -1,6 +1,6 @@
 // apps/api/src/modules/ai/providers/local.strategy.ts
 //
-// v11 — Architecture directe llama.cpp:server (sans Ollama)
+// v11.1 — FIX : CTX 512 → 1024 (corrige "606 tokens exceeds 512")
 //
 // ══════════════════════════════════════════════════════════════════════════════
 // MIGRATION depuis Ollama :
@@ -19,36 +19,25 @@
 //     → API OpenAI-compatible identique → zéro changement d'interface
 //     → Mémoire exactement prévisible (pas de Go runtime)
 //
-// CHANGEMENTS v11 :
+// CHANGEMENTS v11.1 :
 //
-//   1. ollamaUrl       → http://ai-text:8011  (llama.cpp:server Qwen3-0.6B)
-//      ollamaVisionUrl → http://ai-vision:8012 (llama.cpp:server moondream2)
-//      whisperUrl      → http://ai-audio:8000  (faster-whisper large-v3-turbo)
-//
-//   2. chat() accepte baseUrl comme 1er paramètre (URL explicite par service)
-//      → generateText() utilise ollamaUrl   (ai-text)
-//      → analyzeImage() step-1 utilise ollamaVisionUrl (ai-vision)
-//      → analyzeImage() step-2 utilise ollamaUrl (ai-text)
-//
-//   3. Qwen3 non-thinking mode :
-//      → chat_template_kwargs: { thinking_budget: 0 }
-//      → Strip automatique des balises <think>...</think> en post-processing
-//      → Garantit JSON immédiat sans chain-of-thought
-//
-//   4. Timeouts réduits (plus de Go overhead) :
-//      ollamaTimeout       : 60 000ms → 15 000ms  (Qwen3-0.6B rapide)
-//      ollamaVisionTimeout : 150 000ms → 60 000ms (moondream direct)
+//   FIX NUM_CTX : 512 → 1024
+//   CAUSE  : Le system prompt few-shot fait ~500 tokens.
+//            Le message utilisateur fait ~100 tokens.
+//            Total ~606 tokens > CTX 512 → erreur systématique à chaque appel.
+//   IMPACT : +~50 MB KV cache (520 MB modèle + 100 MB KV ≈ 620 MB total)
+//            Le mem_limit de 900m reste confortable.
 //
 // PIPELINE TWO-STEP (conservé depuis v10, maintenant plus stable) :
 //
 //   Step 1 : moondream2 via ai-vision:8012
 //            → "Describe this home appliance problem in one sentence in English."
-//            → Output : description en anglais (moondream excelle à ça)
+//            → Output : description en anglais
 //            → Pas de JSON, pas de schema, pas d'instructions complexes
 //
 //   Step 2 : Qwen3-0.6B via ai-text:8011
 //            → Input : description de step-1
-//            → Output : JSON intent structuré (Qwen3 suit les instructions)
+//            → Output : JSON intent structuré
 //            → Mode non-thinking activé = JSON immédiat
 //
 // ══════════════════════════════════════════════════════════════════════════════
@@ -139,8 +128,14 @@ export class LocalStrategy implements IAiProvider {
   private readonly whisperModel:        string;
 
   // ── Contextes KV-cache ────────────────────────────────────────────────────
-  // Qwen3-0.6B : 512 tokens suffisent (system ~300 + query ~100 + JSON ~100)
-  private static readonly NUM_CTX        = 512;
+  //
+  // FIX v11.1 : 512 → 1024
+  //   CAUSE : system prompt few-shot (~500 tokens) + user (~100) = ~606 > 512
+  //   Le llama.cpp retournait "exceed_context_size_error" à chaque appel texte.
+  //   1024 tokens = headroom confortable :
+  //     system (~500) + user (~100) + JSON response (~256) = ~856 max
+  //
+  private static readonly NUM_CTX        = 1024;
 
   // moondream2 : 1024 tokens pour l'encodage CLIP + génération description
   private static readonly VISION_NUM_CTX = 1024;
@@ -160,7 +155,7 @@ export class LocalStrategy implements IAiProvider {
     this.whisperModel        = process.env['WHISPER_MODEL']                 ?? 'Systran/faster-whisper-large-v3-turbo';
 
     this.logger.log(
-      `✅ LocalStrategy v11 — llama.cpp:server direct (sans Ollama)\n` +
+      `✅ LocalStrategy v11.1 — llama.cpp:server direct (sans Ollama)\n` +
       `   ├─ texte  : ${this.ollamaUrl} → ${this.ollamaModel}` +
       `       (CTX=${LocalStrategy.NUM_CTX}, timeout=${this.ollamaTimeout}ms)\n` +
       `   ├─ vision : ${this.ollamaVisionUrl} → ${this.ollamaVisionModel}` +
@@ -258,7 +253,7 @@ export class LocalStrategy implements IAiProvider {
         { role: 'system', content: prompt },
         { role: 'user',   content: `Image shows: ${description.trim()}` },
       ],
-      { temperature: opts.temperature ?? 0.05, maxTokens: opts.maxTokens ?? 200 },
+      { temperature: opts.temperature ?? 0.05, maxTokens: opts.maxTokens ?? 256 },
     );
   }
 
@@ -370,7 +365,7 @@ export class LocalStrategy implements IAiProvider {
             messages,
             stream:      false,
             temperature: opts.temperature ?? 0.05,
-            max_tokens:  opts.maxTokens   ?? 200,
+            max_tokens:  opts.maxTokens   ?? 256,
             // Paramètres llama.cpp (ignorés si non supportés)
             cache_prompt: false,
             // Qwen3 non-thinking mode : désactive chain-of-thought
