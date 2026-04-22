@@ -1,32 +1,39 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose v12.0
+# KHIDMETI — Docker Compose v14.0
 #
-# FIX v11.1 :
-#   1. ai-text     CTX 512 → 1024     (corrige "606 tokens exceeds 512")
-#   2. ai-vision   OBLIGATOIRE        (décommenté + ajouté dans depends_on api)
-#   3. ai-audio    HF_HUB_OFFLINE=0   (force téléchargement HuggingFace)
-#   4. ai-text     N_PREDICT 200→256  (headroom pour JSON complexes)
+# MIGRATION v14 — Gemma4 audio natif : modèle unique pour tout
+#   SUPPRIMÉ : ai-audio (faster-whisper-server) — Gemma4 gère l'audio nativement
 #
-# FIX v12.0 :
-#   5. ai-text     LLAMA_ARG_MODEL → LLAMA_ARG_HF_REPO (téléchargement natif)
-#   6. ai-vision   LLAMA_ARG_MODEL/MMPROJ → LLAMA_ARG_HF_REPO (repo officiel)
-#   7. ai-text/vision  volumes :ro → :rw (llama.cpp écrit son cache)
-#   8. ai-text/vision  HF_TOKEN injecté via LLAMA_ARG_HF_TOKEN
-#   9. ai-text     start_period 10s → 300s  (téléchargement ~500 MB)
-#  10. ai-vision   start_period 15s → 600s  (téléchargement ~1.8 GB)
-#  11. ai-vision   repo vikhyatk → ggml-org/moondream2-20250414-GGUF (officiel)
+# BASE TECHNIQUE :
+#   llama.cpp PR#21421 "mtmd: add Gemma 4 audio conformer encoder support" (MERGÉ)
+#   Testé CPU + Vulkan sur E2B et E4B — mmproj f32 inclut l'encodeur audio
 #
-# BUDGET MÉMOIRE avec vision obligatoire (RAM 10+ GB recommandée) :
-#   ai-text  (Qwen3 Q4_K_M)   :  900 MB
-#   ai-vision (moondream2)    : 2200 MB
-#   ai-audio (whisper turbo)  : 2000 MB
-#   api + infra               : 3000 MB
-#   ─────────────────────────────────
-#   Total                     : ~8.1 GB → recommandé 10+ GB RAM
+# AVANTAGES v14 vs v13 :
+#   • ~2 GB RAM économisés (Whisper retiré)
+#   • 1 seul service IA (ai-gemma4 gère texte + images + audio)
+#   • Pipeline audio single-step (audio → JSON intent sans STT intermédiaire)
+#   • Pas de téléchargement Whisper au premier lancement
+#   • Darija algérienne mieux comprise (Gemma4 = 140+ langues natives)
 #
-# Si votre machine a 8 GB, commentez ai-vision et son depends_on dans api.
+# BUDGET MÉMOIRE v14 (6 GB RAM suffisant, 8 GB recommandé) :
+#   ai-gemma4  (Gemma4 E2B Q4_K_M) : ~4.5 GB (model 3.46G + mmproj 0.3G + KV)
+#   api + infra                     : ~1.5 GB
+#   ─────────────────────────────────────────
+#   Total (limits)                  : ~6.0 GB (mmap SSD pour overflow rare)
+#
+# FORMAT AUDIO (recommandations) :
+#   WAV 16kHz mono : optimal (décodage natif llama.cpp)
+#   MP3/M4A/OGG   : supportés si libsndfile compilé dans llama.cpp
+#   Limite Gemma4  : 30 secondes maximum
+#
+# SETUP INITIAL (obligatoire avant make start) :
+#   1. make download-gemma4   → télécharge model.gguf + mmproj.gguf (~3.8 GB)
+#   2. make start
+#
+# PASSAGE GPU (E4B) :
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -61,13 +68,12 @@ services:
     volumes:
       - ./apps/api/src:/app/src:ro
     depends_on:
-      mongo:      { condition: service_healthy }
-      redis:      { condition: service_healthy }
-      qdrant:     { condition: service_healthy }
-      minio:      { condition: service_healthy }
-      ai-text:    { condition: service_healthy }
-      ai-audio:   { condition: service_started }
-      ai-vision:  { condition: service_healthy }   # FIX v11.1 — vision obligatoire
+      mongo:     { condition: service_healthy }
+      redis:     { condition: service_healthy }
+      qdrant:    { condition: service_healthy }
+      minio:     { condition: service_healthy }
+      ai-gemma4: { condition: service_healthy }
+      # v14 : ai-audio (Whisper) supprimé — Gemma4 gère l'audio nativement
     networks:
       - khidmeti-network
     mem_limit:       1g
@@ -79,145 +85,58 @@ services:
         max-file: "3"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # AI-TEXT — llama.cpp:server + Qwen3-0.6B-Q4_K_M
+  # AI-GEMMA4 — llama.cpp:server + Gemma4 E2B Q4_K_M
   #
-  # FIX v12.0 :
-  #   LLAMA_ARG_HF_REPO    : llama.cpp télécharge et cache le modèle nativement
-  #   LLAMA_ARG_HF_TOKEN   : lève les rate-limits HuggingFace
-  #   LLAMA_CACHE          : répertoire de cache dans le volume
-  #   volume :rw           : nécessaire pour que llama.cpp écrive le cache
-  #   start_period 300s    : temps de téléchargement initial (~500 MB)
+  # v14 : gère désormais texte + images + AUDIO NATIF (PR#21421 mergé)
+  #
+  # PRÉREQUIS : make download-gemma4
+  #   → docker/models/gemma4/gemma-4-e2b-it-Q4_K_M.gguf    (~3.46 GB)
+  #   → docker/models/gemma4/mmproj-gemma-4-e2b-it-f32.gguf (~0.3 GB)
+  #                            ↑ f32 = optimal pour audio (conformer encoder)
+  #
+  # LLAMA_ARG_JINJA    : requis pour le chat template Gemma4 (roles system/user)
+  # LLAMA_ARG_CTX_SIZE : 4096 pour 8 GB RAM — augmenter si plus de RAM
+  # LLAMA_ARG_THREADS  : 4 = bon compromis sur CPU 4+ cœurs
+  # LLAMA_ARG_PARALLEL : 2 = 2 requêtes parallèles (texte + audio simultanés)
+  #
+  # AUDIO NATIF (v14) :
+  #   Format API : { type: "input_audio", input_audio: { data: "base64", format: "wav" } }
+  #   mmproj f32 : contient encodeur image ET encodeur audio (conformer USM-style)
+  #   Limite     : 30 secondes audio maximum par requête
+  #   Timeout    : GEMMA4_TIMEOUT_MS=45000 (audio = mel spectrogram sur CPU → plus long)
   # ════════════════════════════════════════════════════════════════════════════
-  ai-text:
+  ai-gemma4:
     image: ghcr.io/ggml-org/llama.cpp:server
-    container_name: khidmeti-ai-text
+    container_name: khidmeti-ai-gemma4
     restart: unless-stopped
     volumes:
-      - ./docker/models/text:/models:rw   # rw — llama.cpp écrit son cache ici
+      - ./docker/models/gemma4:/models:rw
     environment:
-      LLAMA_ARG_HF_REPO:       "unsloth/Qwen3-0.6B-GGUF:Q4_K_M"
+      LLAMA_ARG_MODEL:         "/models/${GEMMA4_MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
+      LLAMA_ARG_MMPROJ:        "/models/${GEMMA4_MMPROJ_FILE:-mmproj-gemma-4-e2b-it-f32.gguf}"
       LLAMA_ARG_HF_TOKEN:      "${HF_TOKEN}"
-      LLAMA_CACHE:             "/models"
       LLAMA_ARG_PORT:          "8011"
       LLAMA_ARG_HOST:          "0.0.0.0"
-      LLAMA_ARG_CTX_SIZE:      "1024"
-      LLAMA_ARG_N_PREDICT:     "256"
+      LLAMA_ARG_CTX_SIZE:      "${GEMMA4_CTX_SIZE:-4096}"
+      LLAMA_ARG_N_PREDICT:     "512"
       LLAMA_ARG_THREADS:       "4"
       LLAMA_ARG_PARALLEL:      "2"
       LLAMA_ARG_CONT_BATCHING: "true"
+      LLAMA_ARG_FLASH_ATTN:    "true"
+      # Requis pour le chat template Gemma4 (roles system/user/assistant)
+      LLAMA_ARG_JINJA:         "true"
     ports:
       - "8011:8011"
     networks:
       - khidmeti-network
-    mem_limit:       900m
-    mem_reservation: 600m
+    mem_limit:       5g
+    mem_reservation: 3500m
     healthcheck:
       test:         ["CMD", "curl", "-sf", "http://localhost:8011/health"]
       interval:     15s
       timeout:      5s
       retries:      5
-      start_period: 300s   # FIX v12.0 : 10s → 300s (téléchargement ~500 MB)
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # AI-AUDIO — faster-whisper-server + large-v3-turbo INT8
-  #
-  # FIX v11.1 :
-  #   HF_HUB_OFFLINE=0             : force le téléchargement même si variable
-  #                                   héritée forçait le mode offline
-  #   HUGGINGFACE_HUB_VERBOSITY=info : logs de progression du téléchargement
-  #
-  # Si le téléchargement échoue (restrictions réseau Codespaces) :
-  #   make download-whisper        → télécharge depuis l'hôte (toujours connecté)
-  #   make restart
-  # ════════════════════════════════════════════════════════════════════════════
-  ai-audio:
-    image: fedirz/faster-whisper-server:latest-cpu
-    container_name: khidmeti-ai-audio
-    restart: unless-stopped
-    volumes:
-      - ./docker/models/audio:/root/.cache/huggingface:rw
-    environment:
-      WHISPER__MODEL:                   "${WHISPER_MODEL:-Systran/faster-whisper-large-v3-turbo}"
-      WHISPER__INFERENCE_DEVICE:        "cpu"
-      WHISPER__COMPUTE_TYPE:            "int8"
-      WHISPER__LANGUAGE:                "fr"
-      WHISPER__BEAM_SIZE:               "1"
-      WHISPER__MAX_CONCURRENT_REQUESTS: "1"
-      HF_HUB_OFFLINE:                   "0"          # FIX v11.1
-      HUGGINGFACE_HUB_VERBOSITY:        "info"        # FIX v11.1
-    ports:
-      - "8000:8000"
-    networks:
-      - khidmeti-network
-    mem_limit:       2g
-    mem_reservation: 800m
-    healthcheck:
-      test:         ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval:     20s
-      timeout:      10s
-      retries:      5
-      start_period: 300s
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # AI-VISION — llama.cpp:server + moondream2 (OBLIGATOIRE depuis v11.1)
-  #
-  # FIX v12.0 :
-  #   LLAMA_ARG_HF_REPO    : ggml-org/moondream2-20250414-GGUF (repo officiel)
-  #     → vikhyatk/moondream2 ne contient PAS moondream2-text-Q8_0.gguf (404)
-  #     → ggml-org corrige aussi le chat_template manquant
-  #   LLAMA_ARG_HF_TOKEN   : lève les rate-limits HuggingFace
-  #   LLAMA_CACHE          : répertoire de cache dans le volume
-  #   volume :rw           : nécessaire pour que llama.cpp écrive le cache
-  #   mmproj               : téléchargé automatiquement par llama.cpp (pas de LLAMA_ARG_MMPROJ)
-  #   start_period 600s    : temps de téléchargement initial (~1.8 GB)
-  #
-  # Pipeline two-step (inchangé depuis v10) :
-  #   Step 1 : moondream2 décrit l'image → description anglais
-  #   Step 2 : Qwen3 (ai-text) extrait le JSON d'intent
-  #
-  # ⚠️  RAM : si votre machine a ≤ 8 GB, commentez ce service et
-  #     décommentez `ai-vision` dans depends_on du service api.
-  # ════════════════════════════════════════════════════════════════════════════
-  ai-vision:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    container_name: khidmeti-ai-vision
-    restart: unless-stopped
-    volumes:
-      - ./docker/models/vision:/models:rw   # rw — cache + mmproj auto-téléchargé
-    environment:
-      # ggml-org/moondream2-20250414-GGUF = repo officiel llama.cpp-compatible
-      # Le chat_template manquant dans vikhyatk/moondream2 est corrigé ici
-      # mmproj téléchargé automatiquement par llama.cpp (pas besoin de LLAMA_ARG_MMPROJ)
-      LLAMA_ARG_HF_REPO:   "ggml-org/moondream2-20250414-GGUF"
-      LLAMA_ARG_HF_TOKEN:  "${HF_TOKEN}"
-      LLAMA_CACHE:         "/models"
-      LLAMA_ARG_PORT:      "8012"
-      LLAMA_ARG_HOST:      "0.0.0.0"
-      LLAMA_ARG_CTX_SIZE:  "1024"
-      LLAMA_ARG_N_PREDICT: "100"
-      LLAMA_ARG_THREADS:   "4"
-    ports:
-      - "8012:8012"
-    networks:
-      - khidmeti-network
-    mem_limit:       2200m
-    mem_reservation: 1500m
-    healthcheck:
-      test:         ["CMD", "curl", "-sf", "http://localhost:8012/health"]
-      interval:     20s
-      timeout:      10s
-      retries:      3
-      start_period: 600s   # FIX v12.0 : 15s → 600s (téléchargement ~1.8 GB)
+      start_period: 60s
     logging:
       driver: json-file
       options:
@@ -351,7 +270,7 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit:       384m
+    mem_limit:       256m
     mem_reservation: 128m
     logging:
       driver: json-file

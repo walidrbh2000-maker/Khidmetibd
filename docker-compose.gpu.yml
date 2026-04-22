@@ -1,69 +1,63 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — docker-compose.gpu.yml
+# KHIDMETI — docker-compose.gpu.yml v14.0
 #
-# Override GPU NVIDIA — à utiliser EN PLUS du docker-compose.yml principal :
+# Override GPU NVIDIA pour Gemma4 E4B — à utiliser AVEC le compose principal :
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-#   make start-gpu
-#   khidmeti.bat start-gpu
-#   .\khidmeti.ps1 start-gpu
+#
+# ── v14 : Whisper supprimé — Gemma4 gère audio nativement ────────────────────
+#   Plus de section ai-audio dans cet override.
+#   E4B GPU audio : mêmes capacités que E2B, avec x5-10 rapidité sur GPU.
+#
+# ── Différences E2B (CPU) → E4B (GPU) ────────────────────────────────────────
+#   E2B Q4_K_M : 3.46 GB — CPU only — 4-8 tok/s   — 8 GB RAM minimum
+#   E4B Q4_K_M : 4.90 GB — GPU+CPU  — 20-60 tok/s — 8 GB VRAM minimum
 #
 # ── Prérequis ─────────────────────────────────────────────────────────────────
-#   NVIDIA drivers installés sur l'hôte
-#   NVIDIA Container Toolkit :
+#   NVIDIA drivers + Container Toolkit :
 #     sudo apt install nvidia-container-toolkit
 #     sudo systemctl restart docker
+#   Téléchargement E4B :
+#     GEMMA4_VARIANT=e4b make download-gemma4
 #
-# ── Stratégie dual-model sur GPU ─────────────────────────────────────────────
-#   Sur GPU, la VRAM est gérée par le driver NVIDIA.
-#   OLLAMA_MAX_LOADED_MODELS=2 → les deux modèles peuvent coexister en VRAM.
-#   OLLAMA_KEEP_ALIVE=-1       → modèles permanents en VRAM (zéro cold start).
-#   OLLAMA_FLASH_ATTENTION=1   → activé sur GPU (réduit VRAM, améliore vitesse).
+# ── Budget VRAM (RTX 3070/4060 Ti — 8 GB) ────────────────────────────────────
+#   E4B Q4_K_M model     : ~4.90 GB
+#   mmproj f32 (img+aud) : ~0.50 GB
+#   KV cache (ctx 8192)  : ~0.70 GB
+#   ─────────────────────────────────
+#   Total VRAM           : ~6.1 GB → OK pour 8 GB VRAM
 #
-# ── Modèles recommandés selon le GPU ─────────────────────────────────────────
-#    8 GB VRAM  (RTX 3070, 4060 Ti) → gemma3:1b + moondream  ← dual-model v8
-#    8 GB VRAM                      → gemma3:4b (si besoin de meilleure qualité)
-#   12 GB VRAM  (RTX 3060, 4070)    → gemma3:4b + moondream
-#   16 GB VRAM+ (RTX 4080, 3090)    → gemma3:12b + moondream
-#
-# ── Changer de modèle GPU ────────────────────────────────────────────────────
-#   1. Modifier OLLAMA_MODEL et OLLAMA_VISION_MODEL dans .env
-#   2. make ollama-pull-all   (pull avec progression visible)
-#   3. make start-gpu
-#
-# ── Versions ─────────────────────────────────────────────────────────────────
-#   Ollama CPU  : ollama/ollama:latest
-#   Ollama GPU  : ollama/ollama:latest  (même image, supporte CUDA nativement)
-#   Whisper CPU : fedirz/faster-whisper-server:latest-cpu
-#   Whisper GPU : fedirz/faster-whisper-server:latest-cuda
+# ── Modèles selon le GPU ──────────────────────────────────────────────────────
+#    8 GB VRAM (RTX 3070, 4060 Ti, 3060 12G) → E4B Q4_K_M  ← ce fichier
+#   16 GB VRAM (RTX 4080, 3090)              → E4B Q8_0
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
 
-  # ── Ollama GPU ───────────────────────────────────────────────────────────────
+  # ── Gemma4 E4B GPU ───────────────────────────────────────────────────────────
   #
-  #  MÊME image que la version CPU — ollama/ollama:latest supporte nativement
-  #  CUDA via le Container Toolkit NVIDIA.
+  # PRÉREQUIS : make download-gemma4 GEMMA4_VARIANT=e4b
+  #   → docker/models/gemma4/gemma-4-e4b-it-Q4_K_M.gguf    (~4.90 GB)
+  #   → docker/models/gemma4/mmproj-gemma-4-e4b-it-f32.gguf (~0.50 GB)
+  #                            ↑ f32 = optimal pour audio + image (conformer encoder)
   #
-  #  OLLAMA_MAX_LOADED_MODELS=2  → dual-model : gemma3:1b + moondream en VRAM
-  #  OLLAMA_KEEP_ALIVE=-1        → modèles permanents (zéro cold start GPU)
-  #  OLLAMA_FLASH_ATTENTION=1    → activé sur GPU
-  #  OLLAMA_NUM_CTX=2048         → contexte plus large possible sur GPU
+  # LLAMA_ARG_N_GPU_LAYERS: 999 = offloader tous les layers en VRAM
+  # LLAMA_ARG_FLASH_ATTN  : activé sur GPU pour KV cache réduit
+  # GEMMA4_TIMEOUT_MS     : réduit à 20s sur GPU (audio x5-10 plus rapide)
   # ─────────────────────────────────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
+  ai-gemma4:
     environment:
-      OLLAMA_NUM_PARALLEL:        "2"
-      OLLAMA_MAX_LOADED_MODELS:   "2"    # GPU : deux modèles en VRAM simultanément
-      OLLAMA_KEEP_ALIVE:          "-1"   # Modèles permanents en VRAM
-      OLLAMA_NUM_THREAD:          "0"    # Laisser Ollama choisir
-      OLLAMA_FLASH_ATTENTION:     "1"    # Activé sur GPU
-      OLLAMA_NUM_CTX:             "2048" # Contexte plus large sur GPU
+      LLAMA_ARG_MODEL:        "/models/gemma-4-e4b-it-Q4_K_M.gguf"
+      LLAMA_ARG_MMPROJ:       "/models/mmproj-gemma-4-e4b-it-f32.gguf"
+      LLAMA_ARG_CTX_SIZE:     "8192"           # Plus de VRAM → contexte plus grand
+      LLAMA_ARG_N_GPU_LAYERS: "999"            # Full GPU offload
+      LLAMA_ARG_THREADS:      "4"              # CPU threads pour layers non-GPU
+      LLAMA_ARG_FLASH_ATTN:   "true"           # Activé sur GPU
+      LLAMA_ARG_JINJA:        "true"
       NVIDIA_VISIBLE_DEVICES:     "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-    # Lever les limites CPU (GPU gère sa propre mémoire)
     mem_limit: null
     mem_reservation: null
     deploy:
@@ -74,40 +68,10 @@ services:
               count:        all
               capabilities: [gpu]
 
-  # ── faster-whisper CUDA ───────────────────────────────────────────────────
-  #
-  #  float16 sur GPU : qualité maximale, latence ~4x inférieure au CPU int8.
-  #  WHISPER__BEAM_SIZE=5 → qualité maximale (vs 1 sur CPU pour la vitesse).
-  #  WHISPER__LANGUAGE absent : "auto" cause HTTP 422 (pas ISO 639-1).
-  # ─────────────────────────────────────────────────────────────────────────────
-  whisper:
-    image: fedirz/faster-whisper-server:latest-cuda
-    environment:
-      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
-      WHISPER__INFERENCE_DEVICE: "cuda"
-      WHISPER__COMPUTE_TYPE:     "float16"
-      # WHISPER__LANGUAGE absent intentionnellement — "auto" cause HTTP 422
-      WHISPER__BEAM_SIZE:        "5"
-    mem_limit: null
-    mem_reservation: null
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver:       nvidia
-              count:        1
-              capabilities: [gpu]
-
-  # ── Limites mémoire levées sur machine GPU ────────────────────────────────
-  #  Sur machine GPU, la RAM système est généralement >= 16 GB.
-  #  Les limites strictes sont levées ; VRAM gérée par le driver NVIDIA.
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── Limites mémoire levées sur machine GPU (RAM >= 16 GB typique) ────────────
   api:
     mem_limit: null
     mem_reservation: null
-    environment:
-      NODE_ENV: development
-      NODE_OPTIONS: "--max-old-space-size=768"
 
   mongo:
     mem_limit: null

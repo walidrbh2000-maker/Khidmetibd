@@ -1,22 +1,24 @@
 ## ══════════════════════════════════════════════════════════════════════════════
-## KHIDMETI BACKEND — Makefile v12.0
+## KHIDMETI BACKEND — Makefile v14.0
 ##
-## FIX v12.0 :
-##   - _ensure-models : téléchargement délégué à llama.cpp:server (LLAMA_ARG_HF_REPO)
-##   - download-vision : nouveau repo ggml-org/moondream2-20250414-GGUF
-##   - ai-status / health : noms de fichiers mis à jour (Q4_K_M auto-sélectionné)
-##   - Makefile header : architecture modèles mise à jour
+## MIGRATION v14 :
+##   - ai-audio (Whisper) SUPPRIMÉ — Gemma4 gère audio nativement (PR#21421)
+##   - SUPPRIMÉ : download-whisper, logs-ai-audio, test-ai-audio (Whisper)
+##   - AJOUTÉ   : test-ai-audio (test audio natif Gemma4 directement)
+##   - MODIFIÉ  : health, ai-status → plus de check Whisper
 ##
-## Téléchargement automatique et intelligent de tous les modèles IA :
-##   make start          → vérifie dirs, démarre tout (modèles téléchargés par llama.cpp)
-##   make models         → vérifie l'état des répertoires modèles
-##   make download-whisper → télécharge Whisper depuis l'HÔTE (Codespaces)
-##   make download-vision  → télécharge moondream2 depuis l'HÔTE (Codespaces)
+## Setup initial (obligatoire avant make start) :
+##   make download-gemma4    → Gemma4 E2B Q4_K_M (~3.8 GB)
+##   make start              → Lance tout
 ##
-## Architecture modèles (v12) :
-##   docker/models/text/    [cache llama.cpp — Qwen3-0.6B-Q4_K_M via HF_REPO]
-##   docker/models/vision/  [cache llama.cpp — moondream2 via HF_REPO]
-##   docker/models/audio/   [cache HuggingFace Whisper]   (~800 MB)
+## GPU (E4B) :
+##   GEMMA4_VARIANT=e4b make download-gemma4
+##   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+##
+## Architecture modèles v14 :
+##   docker/models/gemma4/  [Gemma4 GGUF + mmproj f32]  (~3.8-5.4 GB)
+##   → mmproj f32 contient encodeur image + audio (PR#21421)
+##   docker/models/audio/   [OBSOLÈTE — peut être supprimé]
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
@@ -47,22 +49,21 @@ HOST     := $(shell hostname)
 DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
-# Modèle Whisper (lu depuis .env, avec fallback)
-WHISPER_MODEL_ID := $(shell \
-  grep '^WHISPER_MODEL=' .env 2>/dev/null | cut -d= -f2 | tr -d ' "' \
-  || echo "Systran/faster-whisper-large-v3-turbo")
+# Variante Gemma4 (e2b = CPU, e4b = GPU)
+GEMMA4_VARIANT ?= e2b
+GEMMA4_QUANT   ?= Q4_K_M
 
 .DEFAULT_GOAL := help
 
 .PHONY: help start stop restart models \
         _ensure-env _ensure-dirs _ensure-models \
-        download-whisper download-vision \
+        download-gemma4 \
         build rebuild logs logs-api logs-mongo logs-redis \
         logs-qdrant logs-minio logs-nginx logs-mongo-ui \
-        logs-ai-text logs-ai-audio logs-ai-vision \
+        logs-ai-gemma4 \
         health status ai-status dns \
         minio-buckets minio-console minio-list \
-        test-api test-ai test-ai-vision test-ai-audio \
+        test-api test-ai test-ai-audio test-ai-image \
         firewall backup restore \
         shell-api shell-mongo shell-redis shell-minio shell-qdrant \
         mongo-stats redis-info redis-flush clean-logs clean \
@@ -74,237 +75,138 @@ WHISPER_MODEL_ID := $(shell \
 help:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  KHIDMETI v12.0 — كل شيء بأمر واحد"
+	@echo "  KHIDMETI v14.0 — Gemma4 E2B/E4B (texte + image + audio)"
 	@echo "  OS : $(OS) | IP : $(LOCAL_IP)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
-	@echo "  make start          ← COMMANDE PRINCIPALE (tout automatique)"
-	@echo "  make models         ← Vérifier l'état des répertoires modèles"
+	@echo "  ⚠️  SETUP INITIAL (avant make start) :"
+	@echo "  make download-gemma4   ← Gemma4 E2B Q4_K_M (~3.8 GB)"
+	@echo "  make start             ← Lance tout"
+	@echo ""
+	@echo "  [GPU — E4B] :"
+	@echo "  GEMMA4_VARIANT=e4b make download-gemma4"
+	@echo "  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d"
 	@echo ""
 	@echo "  [Quotidien]"
-	@echo "  make stop           Arrêter"
-	@echo "  make restart        Redémarrer"
-	@echo "  make health         État des services"
-	@echo "  make ai-status      État IA + modèles sur disque"
-	@echo "  make logs           Tous les logs"
-	@echo "  make dns            URLs + Flutter config"
+	@echo "  make stop              Arrêter"
+	@echo "  make restart           Redémarrer"
+	@echo "  make health            État des services"
+	@echo "  make ai-status         État IA + modèles sur disque"
+	@echo "  make logs              Tous les logs"
+	@echo "  make dns               URLs + Flutter config"
 	@echo ""
-	@echo "  [Modèles IA]"
-	@echo "  make models              Vérifier l'état des répertoires modèles"
-	@echo "  make download-whisper    Télécharger Whisper depuis l'hôte (Codespaces)"
-	@echo "  make download-vision     Télécharger moondream2 depuis l'hôte (Codespaces)"
-	@echo ""
-	@echo "  [Suivi 1er démarrage — téléchargement en cours]"
-	@echo "  make logs-ai-text   Qwen3   (~500 MB, ~2-5 min)"
-	@echo "  make logs-ai-vision moondream2 (~1.8 GB, ~10-20 min)"
-	@echo "  make logs-ai-audio  Whisper (~800 MB, ~5-15 min)"
+	@echo "  [Logs]"
+	@echo "  make logs-ai-gemma4    Gemma4 (texte + image + audio natif)"
 	@echo ""
 	@echo "  [Tests IA]"
-	@echo "  make test-ai        Darija → JSON"
-	@echo "  make test-ai-audio  Santé Whisper"
-	@echo "  make test-ai-vision Santé moondream2"
+	@echo "  make test-ai           Darija → JSON (Gemma4 texte)"
+	@echo "  make test-ai-audio     Health Gemma4 audio (endpoint direct)"
+	@echo "  make test-ai-image     Health Gemma4 (requête vide)"
 	@echo ""
 	@echo "  [Tunnel]"
-	@echo "  make ngrok          Tunnel permanent (auto-installe si absent)"
-	@echo "  make tunnel-quick   Cloudflare Quick Tunnel"
+	@echo "  make ngrok             Tunnel permanent"
 	@echo ""
 	@echo "  [Scripts]"
-	@echo "  make scripts        Migrations + Seeds"
-	@echo "  make backup         Sauvegarder MongoDB"
+	@echo "  make scripts           Migrations + Seeds"
+	@echo "  make backup            Sauvegarder MongoDB"
 	@echo ""
 	@echo "  [Nettoyage]"
-	@echo "  make clean          Volumes Docker (modèles intacts)"
+	@echo "  make clean             Volumes Docker (modèles intacts)"
 	@echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-# _ensure-dirs : crée les dossiers de travail et les répertoires modèles
-# ──────────────────────────────────────────────────────────────────────────────
+# ── _ensure-dirs ──────────────────────────────────────────────────────────────
 _ensure-dirs:
 	@mkdir -p logs backups/mongodb
-	@mkdir -p docker/models/text docker/models/audio docker/models/vision
+	@mkdir -p docker/models/gemma4
+	@# docker/models/audio gardé pour compatibilité ascendante (peut être supprimé)
+	@mkdir -p docker/models/audio
 
-# ──────────────────────────────────────────────────────────────────────────────
-# _ensure-env : crée .env depuis .env.example si absent
-# ──────────────────────────────────────────────────────────────────────────────
+# ── _ensure-env ───────────────────────────────────────────────────────────────
 _ensure-env:
 	@if [ ! -f .env ]; then \
 	  if [ -f .env.example ]; then \
 	    cp .env.example .env; \
-	    echo "  ⚠️  .env créé depuis .env.example → remplissez FIREBASE_* dans .env"; \
-	    echo ""; \
+	    echo "  ⚠️  .env créé depuis .env.example → remplissez FIREBASE_* et HF_TOKEN dans .env"; \
 	  else \
 	    echo "  ⚠️  .env absent — créez-le manuellement"; \
 	  fi; \
 	fi
 
-# ──────────────────────────────────────────────────────────────────────────────
-# _ensure-models : crée les répertoires, les téléchargements sont gérés
-#                 nativement par llama.cpp:server via LLAMA_ARG_HF_REPO
-#
-# AVANT (v11.x) : curl → HuggingFace échouait dans Codespaces (HTML au lieu de GGUF)
-# APRÈS (v12)   : llama.cpp télécharge au démarrage avec HF_TOKEN → plus robuste
-#
-# Suivi du premier démarrage (téléchargement en cours) :
-#   make logs-ai-text    → Qwen3   (~500 MB, ~2-5 min)
-#   make logs-ai-vision  → moondream2 (~1.8 GB, ~10-20 min)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── _ensure-models ─────────────────────────────────────────────────────────────
+# v14 : seul Gemma4 model + mmproj sont requis (Whisper supprimé)
 _ensure-models: _ensure-dirs
 	@echo ""
-	@echo "  ✅ Répertoires modèles prêts"
-	@echo "     Téléchargement géré par llama.cpp:server au 1er démarrage"
-	@echo "     via LLAMA_ARG_HF_REPO + HF_TOKEN (.env)"
-	@echo ""
-	@_whisper_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
-	if [ "$${_whisper_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ [audio]  Whisper en cache ($$(du -sh docker/models/audio | cut -f1))"; \
+	@_model=$$(find docker/models/gemma4 -name "*.gguf" -size +100M 2>/dev/null | grep -v mmproj | head -1); \
+	_mmproj=$$(find docker/models/gemma4 -name "*mmproj*.gguf" -size +10M 2>/dev/null | head -1); \
+	if [ -n "$$_model" ] && [ -n "$$_mmproj" ]; then \
+	  echo "  ✅ [gemma4] Model + mmproj f32 en cache ($$(du -sh docker/models/gemma4 | cut -f1))"; \
+	  echo "             mmproj f32 = encodeur image + audio (PR#21421)"; \
 	else \
-	  echo "  ⏳ [audio]  Whisper → téléchargé au 1er démarrage ai-audio (~800 MB)"; \
-	  echo "             ou : make download-whisper  (si container sans internet)"; \
+	  echo "  ❌ [gemma4] Modèles ABSENTS → make download-gemma4"; \
+	  echo "             Sans les modèles, ai-gemma4 ne démarrera PAS."; \
+	  echo ""; \
+	  exit 1; \
 	fi
 	@echo ""
 
-# ── Alias public ──────────────────────────────────────────────────────────────
 models: _ensure-models
 
 # ══════════════════════════════════════════════════════════════════════════════
-# download-whisper : télécharge Whisper depuis l'HÔTE (contourne les
-#                   restrictions réseau des containers Codespaces)
+# download-gemma4 : télécharge Gemma4 E2B (CPU) ou E4B (GPU) depuis HuggingFace
 #
-# POURQUOI cela fonctionne :
-#   L'hôte Codespaces a toujours accès à internet, même quand le container
-#   Docker reçoit un 401 ou une restriction réseau sur huggingface.co.
+# Variables :
+#   GEMMA4_VARIANT=e2b|e4b    (défaut: e2b)
+#   GEMMA4_QUANT=Q4_K_M|Q8_0  (défaut: Q4_K_M)
 #
-# STRATÉGIE :
-#   On utilise huggingface_hub Python avec HF_HOME pointant vers
-#   docker/models/audio/, qui est monté en volume dans le container ai-audio :
-#     ./docker/models/audio → /root/.cache/huggingface
-#   Le container trouve donc les fichiers au prochain démarrage.
+# Fichiers téléchargés dans docker/models/gemma4/ :
+#   gemma-4-{e2b|e4b}-it-{QUANT}.gguf         — modèle (~3.5-4.9 GB)
+#   mmproj-gemma-4-{e2b|e4b}-it-f32.gguf      — mmproj f32 (image + audio encoder)
 # ══════════════════════════════════════════════════════════════════════════════
-download-whisper: _ensure-dirs
+download-gemma4: _ensure-dirs
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Téléchargement Whisper depuis l'hôte"
-	@echo "  Modèle : $(WHISPER_MODEL_ID)"
+	@echo "  Téléchargement Gemma4 $(GEMMA4_VARIANT) $(GEMMA4_QUANT)"
+	@echo "  Depuis : bartowski/google_gemma-4-*-it-GGUF"
+	@echo "  Note   : mmproj f32 inclut encodeur image + audio (PR#21421)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
-	@_dir_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
-	_cached=$$(find docker/models/audio -name "*.bin" -o -name "model.safetensors" \
-	  2>/dev/null | head -1); \
-	if [ -n "$$_cached" ] || [ "$${_dir_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ Whisper déjà en cache ($$(du -sh docker/models/audio | cut -f1))"; \
-	  echo "  → make restart  pour relancer le container avec le modèle"; \
-	  echo ""; \
-	  exit 0; \
-	fi
 	@if ! command -v python3 &>/dev/null; then \
-	  echo "  ❌ python3 requis (sudo apt install python3)"; \
-	  exit 1; \
-	fi
-	@echo "  🐍 Python : $$(python3 --version)"
-	@echo "  📦 Vérification huggingface_hub..."
+	  echo "  ❌ python3 requis (sudo apt install python3)"; exit 1; fi
 	@python3 -c "import huggingface_hub" 2>/dev/null \
 	  || pip3 install -q huggingface_hub --break-system-packages 2>/dev/null \
 	  || pip3 install -q huggingface_hub 2>/dev/null \
-	  || python3 -m pip install -q huggingface_hub 2>/dev/null \
 	  || { echo "  ❌ Impossible d'installer huggingface_hub"; exit 1; }
-	@echo "  ✅ huggingface_hub disponible"
-	@echo ""
-	@echo "  📥 Téléchargement $(WHISPER_MODEL_ID)..."
-	@echo "     Taille : ~800 MB — durée : 5-15 min selon connexion"
-	@echo "     Destination : docker/models/audio/ (cache HuggingFace)"
-	@echo ""
-	@_WHISPER_MODEL="$(WHISPER_MODEL_ID)" HF_HOME="$(PWD)/docker/models/audio" \
-	  python3 scripts/download_whisper.py
-	@echo ""
-	@echo "  ✅ Whisper en cache → $$(du -sh docker/models/audio | cut -f1)"
-	@echo ""
-	@echo "  Prochaine étape : make restart"
-	@echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# download-vision : télécharge moondream2 depuis l'HÔTE (contourne les
-#                  restrictions réseau des containers Codespaces)
-#
-# FIX v12.0 :
-#   Repo mis à jour : ggml-org/moondream2-20250414-GGUF
-#   → vikhyatk/moondream2 ne contient PAS moondream2-text-Q8_0.gguf (404)
-#   → ggml-org est le repo officiel llama.cpp-compatible avec chat_template
-#   → HF_TOKEN injecté automatiquement depuis .env
-#
-# FICHIERS (sélectionnés automatiquement par le script) :
-#   moondream2-*-Q4_K_M.gguf  (~1.4 GB)  — modèle texte
-#   mmproj-*-f16.gguf         (~100 MB)  — projecteur multimodal
-# ══════════════════════════════════════════════════════════════════════════════
-download-vision: _ensure-dirs
-	@echo ""
-	@echo "══════════════════════════════════════════════════════"
-	@echo "  Téléchargement moondream2 depuis l'hôte"
-	@echo "  Dépôt : ggml-org/moondream2-20250414-GGUF"
-	@echo "══════════════════════════════════════════════════════"
-	@echo ""
-	@_vision_size=$$(du -sm docker/models/vision 2>/dev/null | cut -f1); \
-	_cached=$$(find docker/models/vision -name "*.gguf" -size +100M 2>/dev/null | head -1); \
-	if [ -n "$$_cached" ] && [ "$${_vision_size:-0}" -gt 1000 ]; then \
-	  echo "  ✅ moondream2 déjà en cache ($$(du -sh docker/models/vision | cut -f1))"; \
-	  echo "  → make restart  pour relancer le container ai-vision"; \
-	  echo ""; \
-	  exit 0; \
-	fi
-	@if ! command -v python3 &>/dev/null; then \
-	  echo "  ❌ python3 requis (sudo apt install python3)"; \
-	  exit 1; \
-	fi
-	@echo "  🐍 Python : $$(python3 --version)"
-	@echo "  📦 Vérification huggingface_hub..."
-	@python3 -c "import huggingface_hub" 2>/dev/null \
-	  || pip3 install -q huggingface_hub --break-system-packages 2>/dev/null \
-	  || pip3 install -q huggingface_hub 2>/dev/null \
-	  || python3 -m pip install -q huggingface_hub 2>/dev/null \
-	  || { echo "  ❌ Impossible d'installer huggingface_hub"; exit 1; }
-	@echo "  ✅ huggingface_hub disponible"
-	@echo ""
-	@echo "  📥 Téléchargement des modèles vision..."
-	@echo "     moondream2 Q4_K_M  : ~1.4 GB"
-	@echo "     mmproj f16         : ~100 MB"
-	@echo "     Durée estimée      : 10-30 min selon connexion"
-	@echo "     Destination        : docker/models/vision/"
-	@echo ""
-	@HF_HOME="$(PWD)/docker/models/vision" \
-	  _VISION_DEST="$(PWD)/docker/models/vision" \
+	@GEMMA4_VARIANT="$(GEMMA4_VARIANT)" \
+	  GEMMA4_QUANT="$(GEMMA4_QUANT)" \
+	  GEMMA4_DEST="$(PWD)/docker/models/gemma4" \
 	  HF_TOKEN="$$(grep '^HF_TOKEN=' .env 2>/dev/null | cut -d= -f2 | tr -d ' "')" \
-	  python3 scripts/download_vision.py
-	@echo ""
-	@echo "  ✅ Vision en cache → $$(du -sh docker/models/vision | cut -f1)"
-	@echo ""
-	@echo "  Prochaine étape : make restart"
+	  python3 scripts/download_gemma4.py
+	@echo "  Prochaine étape : make start"
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## START — Commande principale tout-en-un
+## START
 ## ══════════════════════════════════════════════════════════════════════════════
 
 start: _ensure-dirs _ensure-env _ensure-models
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Démarrage Khidmeti v12.0 — llama.cpp:server direct"
+	@echo "  Démarrage Khidmeti v14.0 — Gemma4 $(GEMMA4_VARIANT) (texte + image + audio)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
-	@echo "  🚀 Démarrage des containers..."
 	@docker compose up -d
 	@echo ""
-	@echo "  ⏳ Attente ai-text (Qwen3, 1er démarrage = téléchargement ~500 MB)..."
-	@echo "     Suivi : make logs-ai-text"
+	@echo "  ⏳ Attente ai-gemma4 (modèles déjà sur disque → ~10-30s)..."
 	@READY=0; \
-	for i in $$(seq 1 90); do \
+	for i in $$(seq 1 24); do \
 	  if curl -sf http://localhost:8011/health > /dev/null 2>&1; then \
-	    READY=1; break; \
-	  fi; \
+	    READY=1; break; fi; \
 	  printf "."; sleep 5; \
-	done; \
-	echo ""; \
+	done; echo ""; \
 	if [ "$$READY" -eq 1 ]; then \
-	  echo "  ✅ ai-text prêt !"; \
+	  echo "  ✅ ai-gemma4 prêt (texte + image + audio natif) !"; \
 	else \
-	  echo "  ⚠️  ai-text non prêt → make logs-ai-text"; \
+	  echo "  ⚠️  ai-gemma4 non prêt → make logs-ai-gemma4"; \
+	  echo "     Si modèles absents : make download-gemma4"; \
 	fi
 	@echo ""
 	@$(MAKE) --no-print-directory health
@@ -356,15 +258,8 @@ logs-minio:
 logs-nginx:
 	@docker compose logs -f nginx
 
-logs-ai-text:
-	@docker compose logs -f ai-text
-
-logs-ai-audio:
-	@docker compose logs -f ai-audio
-
-logs-ai-vision:
-	@docker compose logs -f ai-vision 2>/dev/null \
-	  || echo "  ai-vision non activé (commenté dans docker-compose.yml)"
+logs-ai-gemma4:
+	@docker compose logs -f ai-gemma4
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## DIAGNOSTIC
@@ -373,29 +268,21 @@ logs-ai-vision:
 health:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  État des services Khidmeti v12.0"
+	@echo "  État des services Khidmeti v14.0"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@_c() { \
 	  code=$$(curl -s -o /dev/null -w "%{http_code}" "$$2" 2>/dev/null); \
-	  [ "$$code" = "200" ] && echo "  ✅ $$1" || echo "  ❌ $$1 ($$code)"; \
+	  [ "$$code" = "200" ] && echo "  ✅ $$1" || echo "  ❌ $$1 (HTTP $$code)"; \
 	}; \
 	_c "NestJS  :3000 " "http://localhost:3000/health"; \
 	_c "nginx   :80   " "http://localhost/health"; \
 	_c "Qdrant  :6333 " "http://localhost:6333/healthz"; \
-	_c "MinIO   :9001 " "http://localhost:9001/minio/health/live"; \
-	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
+	_c "MinIO   :9001 " "http://localhost:9001/minio/health/live"
+	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
 	[ "$$code" = "200" ] \
-	  && echo "  ✅ ai-text :8011 (Qwen3)" \
-	  || echo "  ⏳ ai-text :8011 (téléchargement en cours → make logs-ai-text)"; \
-	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
-	[ "$$code" = "200" ] \
-	  && echo "  ✅ ai-audio:8000 (Whisper large-v3-turbo)" \
-	  || echo "  ⏳ ai-audio:8000 (1er démarrage = téléchargement Whisper ~800 MB)"; \
-	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
-	[ "$$code" = "200" ] \
-	  && echo "  ✅ ai-vision:8012 (moondream2)" \
-	  || echo "  ⏳ ai-vision:8012 (téléchargement en cours → make logs-ai-vision)";
+	  && echo "  ✅ ai-gemma4:8011 (texte + image + audio natif)" \
+	  || echo "  ❌ ai-gemma4:8011 (non prêt → make logs-ai-gemma4)"
 	@echo -n "  "; \
 	  docker exec khidmeti-mongo mongosh --quiet \
 	    --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
@@ -409,43 +296,25 @@ health:
 ai-status:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Statut IA v12.0 — llama.cpp:server direct"
+	@echo "  Statut IA v14.0 — Gemma4 E2B/E4B (modèle unique)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  Services :"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
-	[ "$$code" = "200" ] && echo "  ✅ ai-text  :8011  (Qwen3-0.6B)" \
-	                     || echo "  ⏳ ai-text  :8011  (téléchargement → make logs-ai-text)"
-	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
-	[ "$$code" = "200" ] && echo "  ✅ ai-audio :8000  (Whisper large-v3-turbo)" \
-	                     || echo "  ⏳ ai-audio :8000  (démarrage ou modèle absent)"
-	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
-	[ "$$code" = "200" ] && echo "  ✅ ai-vision:8012  (moondream2)" \
-	                     || echo "  ⏳ ai-vision:8012  (téléchargement → make logs-ai-vision)"
+	[ "$$code" = "200" ] && echo "  ✅ ai-gemma4:8011  (texte + image + audio natif — PR#21421)" \
+	                     || echo "  ❌ ai-gemma4:8011  (non prêt → make logs-ai-gemma4)"
 	@echo ""
 	@echo "  Modèles sur disque :"
-	@_text_size=$$(du -sm docker/models/text 2>/dev/null | cut -f1); \
-	if [ "$${_text_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ text/   Qwen3-0.6B cache   ($$(du -sh docker/models/text | cut -f1))"; \
+	@_model=$$(find docker/models/gemma4 -name "*.gguf" -size +100M 2>/dev/null | grep -v mmproj | head -1); \
+	_mmproj=$$(find docker/models/gemma4 -name "*mmproj*.gguf" -size +10M 2>/dev/null | head -1); \
+	if [ -n "$$_model" ] && [ -n "$$_mmproj" ]; then \
+	  echo "  ✅ gemma4/ Model + mmproj f32 ($$(du -sh docker/models/gemma4 | cut -f1))"; \
+	  echo "     model  : $$(basename $$_model)"; \
+	  echo "     mmproj : $$(basename $$_mmproj) (image + audio encoder)"; \
 	else \
-	  echo "  ⏳ text/   Qwen3-0.6B         → téléchargé au 1er démarrage ai-text"; \
-	fi
-	@_vis_size=$$(du -sm docker/models/vision 2>/dev/null | cut -f1); \
-	if [ "$${_vis_size:-0}" -gt 1000 ]; then \
-	  echo "  ✅ vision/ moondream2 cache   ($$(du -sh docker/models/vision | cut -f1))"; \
-	else \
-	  echo "  ⏳ vision/ moondream2         → téléchargé au 1er démarrage ai-vision"; \
-	  echo "            ou : make download-vision  (si container sans internet)"; \
-	fi
-	@_whisper_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
-	if [ "$${_whisper_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ audio/  Whisper turbo $$(du -sh docker/models/audio | cut -f1)"; \
-	else \
-	  echo "  ⏳ audio/  Whisper turbo → téléchargé au 1er démarrage ai-audio"; \
-	  echo "             ou : make download-whisper  (si container sans internet)"; \
-	fi
+	  echo "  ❌ gemma4/ Modèles ABSENTS → make download-gemma4"; fi
 	@echo ""
-	@free -h 2>/dev/null | awk '/^Mem:/{print "  RAM — Total: " $$2 "  Libre: " $$4}' \
+	@free -h 2>/dev/null | awk '/^Mem:/{print "  RAM — Total: " $$2 "  Dispo: " $$7}' \
 	  || echo "  (info RAM non disponible)"
 	@echo ""
 
@@ -464,15 +333,13 @@ dns:
 	@echo "══════════════════════════════════════════════════════"
 	@echo "  URLs  [$(HOST)]"
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  API     : http://$(HOST):3000"
-	@echo "  nginx   : http://$(HOST):80"
-	@echo "  Swagger : http://$(HOST):3000/api/docs"
-	@echo "  Mongo   : http://$(HOST):8081"
-	@echo "  Qdrant  : http://$(HOST):6333/dashboard"
-	@echo "  MinIO   : http://$(HOST):9002"
-	@echo "  ai-text : http://$(HOST):8011"
-	@echo "  ai-audio: http://$(HOST):8000"
-	@echo "  ai-vis  : http://$(HOST):8012"
+	@echo "  API      : http://$(HOST):3000"
+	@echo "  nginx    : http://$(HOST):80"
+	@echo "  Swagger  : http://$(HOST):3000/api/docs"
+	@echo "  Mongo    : http://$(HOST):8081"
+	@echo "  Qdrant   : http://$(HOST):6333/dashboard"
+	@echo "  MinIO    : http://$(HOST):9002"
+	@echo "  Gemma4   : http://$(HOST):8011  (texte + image + audio)"
 	@echo ""
 	@echo "  ── Flutter ──────────────────────────────────────────"
 	@echo "  flutter run --dart-define=API_BASE_URL=http://$(LOCAL_IP):80"
@@ -480,8 +347,7 @@ dns:
 	if [ -n "$$NGROK_DOMAIN" ]; then \
 	  echo ""; \
 	  echo "  ngrok   : https://$$NGROK_DOMAIN"; \
-	  echo "  flutter run --dart-define=API_BASE_URL=https://$$NGROK_DOMAIN"; \
-	fi
+	  echo "  flutter run --dart-define=API_BASE_URL=https://$$NGROK_DOMAIN"; fi
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
@@ -490,38 +356,53 @@ dns:
 
 test-ai:
 	@echo ""
-	@echo "  Test Qwen3 — Darija → JSON..."
+	@echo "  Test Gemma4 — Darija algérienne → JSON..."
 	@curl -s http://localhost:8011/v1/chat/completions \
 	  -H "Content-Type: application/json" \
-	  -d '{"model":"qwen3-0.6b-q4_k_m","messages":[{"role":"system","content":"Réponds UNIQUEMENT en JSON: {\"profession\":null,\"is_urgent\":false,\"problem_description\":\"\",\"confidence\":0}"},{"role":"user","content":"عندي ماء ساقط من السقف"}],"temperature":0.05,"max_tokens":256,"stream":false}' \
+	  -d '{ \
+	    "model":"gemma4", \
+	    "messages":[ \
+	      {"role":"system","content":"Réponds UNIQUEMENT en JSON: {\"profession\":null,\"is_urgent\":false,\"problem_description\":\"\",\"max_radius_km\":null,\"confidence\":0}"}, \
+	      {"role":"user","content":"عندي ماء ساقط من السقف وكليمو ما يبردش"} \
+	    ], \
+	    "temperature":0.05, \
+	    "max_tokens":256, \
+	    "chat_template_kwargs":{"enable_thinking":false} \
+	  }' \
 	  | python3 -m json.tool 2>/dev/null \
-	  || echo "  ❌ ai-text non disponible → make logs-ai-text"
+	  || echo "  ❌ ai-gemma4 non disponible → make logs-ai-gemma4"
 	@echo ""
 
 test-ai-audio:
 	@echo ""
-	@echo "  Test Whisper — santé..."
-	@curl -s http://localhost:8000/health | python3 -m json.tool 2>/dev/null \
-	  || echo "  ⏳ ai-audio en démarrage → make logs-ai-audio"
+	@echo "  Test Gemma4 audio natif — santé endpoint (v14)"
+	@echo "  Note : audio natif via llama.cpp PR#21421 (MERGÉ)"
+	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
+	[ "$$code" = "200" ] \
+	  && echo "  ✅ ai-gemma4:8011 opérationnel — audio natif prêt" \
+	  || echo "  ❌ ai-gemma4:8011 non disponible → make logs-ai-gemma4"
+	@echo ""
+	@echo "  Pour tester audio réel : POST /ai/extract-intent/audio (NestJS API)"
+	@echo "  Format recommandé : WAV 16kHz mono, < 30 secondes"
 	@echo ""
 
-test-ai-vision:
+test-ai-image:
 	@echo ""
-	@echo "  Test moondream2 — santé..."
-	@curl -sf http://localhost:8012/health > /dev/null 2>&1 \
-	  && echo "  ✅ ai-vision :8012 opérationnel" \
-	  || echo "  ❌ ai-vision non disponible → make logs-ai-vision"
+	@echo "  Test Gemma4 — endpoint image (healthcheck simple)..."
+	@curl -s -o /dev/null -w "  HTTP %{http_code}\n" http://localhost:8011/health \
+	  && echo "  ✅ ai-gemma4 opérationnel (images supportées via mmproj)" \
+	  || echo "  ❌ ai-gemma4 non disponible → make logs-ai-gemma4"
 	@echo ""
 
 test-api:
 	@echo ""
-	@echo "  Health  :"; curl -s http://localhost:3000/health
+	@echo "  Health :"; curl -s http://localhost:3000/health
 	@echo ""
 	@echo "  Swagger :"; curl -s -o /dev/null -w "  HTTP %{http_code}\n" http://localhost:3000/api/docs
 	@echo ""
 
 ## ══════════════════════════════════════════════════════════════════════════════
-## NGROK — Auto-installe ngrok si absent
+## NGROK
 ## ══════════════════════════════════════════════════════════════════════════════
 
 ngrok:
@@ -531,7 +412,7 @@ ngrok:
 	@echo "══════════════════════════════════════════════"
 	@echo ""
 	@if ! command -v ngrok &>/dev/null; then \
-	  echo "  ngrok absent — installation automatique..."; \
+	  echo "  ngrok absent — installation..."; \
 	  if [ -f /etc/debian_version ] || grep -qi ubuntu /etc/os-release 2>/dev/null; then \
 	    curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
 	      | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null 2>&1; \
@@ -544,30 +425,22 @@ ngrok:
 	    curl -sL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
 	      | sudo tar xz -C /usr/local/bin; \
 	  fi; \
-	  echo "  ✅ ngrok installé !"; \
-	fi
+	  echo "  ✅ ngrok installé !"; fi
 	@NGROK_TOKEN=$$(grep '^NGROK_AUTH_TOKEN=' .env 2>/dev/null | cut -d= -f2- | tr -d ' "'); \
 	if [ -z "$$NGROK_TOKEN" ]; then \
-	  echo "  https://dashboard.ngrok.com/get-started/your-authtoken"; \
-	  read -p "  Auth Token : " NGROK_TOKEN; \
+	  read -p "  Auth Token ngrok : " NGROK_TOKEN; \
 	  grep -q '^NGROK_AUTH_TOKEN=' .env 2>/dev/null \
 	    && $(SED_I) "s|^NGROK_AUTH_TOKEN=.*|NGROK_AUTH_TOKEN=$$NGROK_TOKEN|" .env \
-	    || echo "NGROK_AUTH_TOKEN=$$NGROK_TOKEN" >> .env; \
-	  echo "  ✅ Sauvegardé."; \
-	fi; \
+	    || echo "NGROK_AUTH_TOKEN=$$NGROK_TOKEN" >> .env; fi; \
 	ngrok config add-authtoken "$$(grep '^NGROK_AUTH_TOKEN=' .env | cut -d= -f2- | tr -d ' "')" >/dev/null 2>&1; \
 	NGROK_DOMAIN=$$(grep '^NGROK_DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d ' "'); \
 	if [ -z "$$NGROK_DOMAIN" ]; then \
-	  echo "  https://dashboard.ngrok.com/domains"; \
-	  read -p "  Domaine statique : " NGROK_DOMAIN; \
+	  read -p "  Domaine statique ngrok : " NGROK_DOMAIN; \
 	  grep -q '^NGROK_DOMAIN=' .env 2>/dev/null \
 	    && $(SED_I) "s|^NGROK_DOMAIN=.*|NGROK_DOMAIN=$$NGROK_DOMAIN|" .env \
-	    || echo "NGROK_DOMAIN=$$NGROK_DOMAIN" >> .env; \
-	  echo "  ✅ Sauvegardé."; \
-	fi; \
+	    || echo "NGROK_DOMAIN=$$NGROK_DOMAIN" >> .env; fi; \
 	ND=$$(grep '^NGROK_DOMAIN=' .env | cut -d= -f2- | tr -d ' "'); \
 	echo "  URL : https://$$ND"; \
-	echo "  flutter run --dart-define=API_BASE_URL=https://$$ND"; \
 	echo "  → Ctrl+C pour arrêter"; echo ""; \
 	ngrok http --domain="$$ND" 80
 
@@ -610,7 +483,7 @@ minio-list:
 	@MK=$$(grep MINIO_ACCESS_KEY .env | cut -d= -f2 | tr -d '[:space:]'); \
 	MS=$$(grep MINIO_SECRET_KEY .env | cut -d= -f2 | tr -d '[:space:]'); \
 	docker run --rm --network khidmeti-network minio/mc:latest sh -c \
-	  "mc alias set local http://minio:9001 $$MK $$MS && mc ls local/profile-images; mc ls local/service-media"
+	  "mc alias set local http://minio:9001 $$MK $$MS && mc ls local/"
 
 ## ══════════════════════════════════════════════════════════════════════════════
 ## SCRIPTS
@@ -764,4 +637,5 @@ prod-update:
 	@echo "✅ API mise à jour."
 
 firewall:
-	@echo "sudo ufw allow 80/tcp 3000/tcp 6333/tcp 8081/tcp 9001/tcp 9002/tcp 8011/tcp 8000/tcp 8012/tcp"
+	@echo "sudo ufw allow 80/tcp 3000/tcp 6333/tcp 8081/tcp 9001/tcp 9002/tcp 8011/tcp"
+	@echo "# Port 8000 (Whisper) supprimé en v14 — Gemma4 audio natif sur 8011"
