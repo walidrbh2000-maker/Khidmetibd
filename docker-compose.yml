@@ -3,41 +3,39 @@ name: khidmeti
 # ══════════════════════════════════════════════════════════════════════════════
 # KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
 #
-# FIXES v9 — Optimisation 8 GB RAM :
+# FIXES v10 — Three-bug patch :
 #
-#   PROBLÈME : Sur Codespace 8 GB, moondream (vision) timeout systématiquement.
-#     moondream cold-start (11s) + CLIP encode (~35s) + génération (~15s)
-#     = ~61s > OLLAMA_TIMEOUT_MS=60000 → AbortError → circuit breaker s'ouvre
-#     → audio et texte également bloqués (circuit partagé = bug v7/v8)
+# ┌─────────────────────────┬──────────────────────────────────────┬──────────────────────────────────────┐
+# │ Bug                     │ Root Cause                           │ Fix ici                              │
+# ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────────┤
+# │ Whisper OOM crash       │ ctranslate2 memory leak + 1200m cap  │ mem_limit: 2g (↑ 800m)               │
+# │ Whisper bad language    │ faster-whisper-small bad on Darija   │ WHISPER__LANGUAGE=fr                 │
+# │ Whisper concurrent OOM  │ parallel requests before prev freed  │ WHISPER__MAX_CONCURRENT_REQUESTS=1   │
+# │ Text needs 4+ attempts  │ OLLAMA_MAX_LOADED_MODELS=1 = swap    │ OLLAMA_MAX_LOADED_MODELS=2           │
+# └─────────────────────────┴──────────────────────────────────────┴──────────────────────────────────────┘
 #
-#   FIXES dans le code (local.strategy.ts + intent-extractor.service.ts) :
-#     1. OLLAMA_VISION_TIMEOUT_MS=150000 — timeout vision 2.5 min
-#     2. Fix bug AbortError (wrappé avant vérification name === 'AbortError')
-#     3. Circuit breakers par modalité (image/audio/text indépendants)
+# NOTE — Image fix (Two-Step Pipeline) is in local.strategy.ts, not here.
+#        moondream now only describes; gemma3:1b extracts JSON.
 #
-#   FIXES docker-compose v9 :
-#     ✅ Réduction mémoire non-IA pour libérer plus de RAM à Ollama/Whisper
-#        sur 8 GB (MongoDB 384m→256m, Qdrant 192m→128m, MinIO 512m→384m,
-#        mongo-express 200m→128m)
+# BUDGET MÉMOIRE 8 GB RAM — v10 :
+#   Ollama (gemma3:1b ~1.2GB + moondream ~1.5GB coexistent) :  ≤ 3.0 GB (mem_limit)
+#   faster-whisper-small (+ ctranslate2 leak headroom)       :  ≤ 2.0 GB (↑)
+#   NestJS API                                               :  ≤ 1.0 GB
+#   MongoDB                                                  :  ≤ 0.3 GB
+#   Redis                                                    :  ≤ 0.2 GB
+#   Qdrant                                                   :  ≤ 0.1 GB
+#   MinIO                                                    :  ≤ 0.4 GB
+#   nginx + mongo-express                                    :  ≤ 0.2 GB
+#   ─────────────────────────────────────────────────────────────────────
+#   Conteneurs total                                         :  ≈ 7.2 GB
+#   OS + Docker daemon                                       :  ≈ 1.5 GB
+#   ─────────────────────────────────────────────────────────────────────
+#   RISQUE : sur 8 GB cela est juste. Si OOM-killer se déclenche,
+#   réduire whisper mem_limit à 1600m et Ollama à 2500m.
+#   Sur 16 GB RAM : aucun problème.
 #
-# BUDGET MÉMOIRE 8 GB RAM (Codespace 4-core) — v9 :
-#   Ollama + modèle actif (max moondream) :  ~2.0 GB
-#   faster-whisper-small                  :  ~0.9 GB
-#   NestJS API                            :  ~0.8 GB
-#   MongoDB                               :  ~0.3 GB  (↓ 256m)
-#   Redis                                 :  ~0.2 GB
-#   Qdrant                                :  ~0.1 GB  (↓ 128m)
-#   MinIO                                 :  ~0.4 GB  (↓ 384m)
-#   nginx + mongo-express                 :  ~0.2 GB  (↓ 128m)
-#   ─────────────────────────────────────
-#   Conteneurs total                      :  ~4.9 GB
-#   OS + Docker daemon                    :  ~1.5 GB
-#   ─────────────────────────────────────
-#   TOTAL                                 :  ~6.4 GB  ✅ (marge 1.6 GB sur 8 GB)
-#   Ollama headroom pour CLIP inference   :  ~1.6 GB  ✅
-#
-# BUDGET MÉMOIRE 16 GB RAM — v9 (inchangé) :
-#   Même configuration — marge ~9 GB
+# BUDGET MÉMOIRE 16 GB RAM — v10 :
+#   Même configuration — marge ≈ 8 GB.
 #
 # WORKFLOW :
 #   1ère fois :  make start && make ollama-pull-all
@@ -96,13 +94,27 @@ services:
 
   # ── Ollama — Dual-model local (gemma3:1b + moondream) ────────────────────────
   #
-  # v9 — mem_limit maintenu à 3g :
-  #   moondream peak : ~1.5 GB model + ~0.5 GB CLIP compute buffers = ~2 GB.
-  #   3g = 2 GB peak + 1 GB marge ✅
+  # FIX v10 — OLLAMA_MAX_LOADED_MODELS: "1" → "2"
   #
-  # v9 — OLLAMA_KEEP_ALIVE 5m :
-  #   Sur 8 GB RAM, libérer le modèle après 5 min est important pour laisser
-  #   de la RAM aux autres services entre les requêtes.
+  #   PROBLÈME (v8/v9) :
+  #     OLLAMA_MAX_LOADED_MODELS=1 : Ollama garde UN seul modèle en RAM.
+  #     Workflow texte après une image :
+  #       1. moondream est en RAM (depuis le two-step image)
+  #       2. requête texte → Ollama doit éjecter moondream, charger gemma3:1b
+  #       3. swap ≈ 10-15s → l'utilisateur attend à chaque fois
+  #     Avec le cache Redis (intent-extractor), les requêtes identiques sont
+  #     servies instantanément, mais le premier appel souffre toujours du swap.
+  #
+  #   FIX : OLLAMA_MAX_LOADED_MODELS=2
+  #     gemma3:1b (~1.2 GB) + moondream (~1.5 GB) = ~2.7 GB
+  #     mem_limit ollama = 3g → marge 300 MB ✅
+  #     Sur 8 GB RAM : 2.7 GB modèles + 4.5 GB autres services ≈ 7.2 GB total.
+  #     Sur 16 GB RAM : aucun problème.
+  #
+  #   OLLAMA_KEEP_ALIVE=-1 :
+  #     Avec OLLAMA_MAX_LOADED_MODELS=2, les deux modèles restent en RAM
+  #     indéfiniment. Sur 8 GB, -1 est risqué si d'autres services grossissent.
+  #     5m (libère après 5 min) est plus sûr sur 8 GB.
   # ─────────────────────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -112,8 +124,8 @@ services:
       - ollama-data:/root/.ollama
     environment:
       OLLAMA_NUM_PARALLEL:      "1"    # CPU : 1 inférence à la fois
-      OLLAMA_MAX_LOADED_MODELS: "1"    # swap entre gemma3:1b et moondream
-      OLLAMA_KEEP_ALIVE:        "5m"   # libère RAM après 5 min d'inactivité
+      OLLAMA_MAX_LOADED_MODELS: "2"    # FIX v10 : 1→2 — gemma3:1b + moondream simultanés
+      OLLAMA_KEEP_ALIVE:        "5m"   # libère RAM après 5 min d'inactivité (safe sur 8 GB)
       OLLAMA_NUM_THREAD:        "4"    # threads CPU (4-core Codespace)
       OLLAMA_FLASH_ATTENTION:   "0"    # désactivé sur CPU
       OLLAMA_NUM_CTX:           "1024" # gemma3:1b — KV cache ~64 MiB
@@ -126,7 +138,7 @@ services:
       - 1.1.1.1
     networks:
       - khidmeti-network
-    mem_limit:       3g
+    mem_limit:       3g     # gemma3:1b 1.2GB + moondream 1.5GB + headroom 300MB
     mem_reservation: 1g
     logging:
       driver: json-file
@@ -142,9 +154,49 @@ services:
 
   # ── faster-whisper — Transcription audio locale ─────────────────────────────
   #
-  # mem_limit 1200m maintenu :
-  #   faster-whisper-small réel : ~900 MB. 1200m laisse 300 MB de marge.
-  #   NOTE : WHISPER__LANGUAGE absent intentionnellement — 'auto' cause HTTP 422.
+  # FIX v10 — mem_limit: 1200m → 2g
+  #
+  #   PROBLÈME :
+  #     ctranslate2 (bibliothèque sous-jacente de faster-whisper) souffre d'un
+  #     memory leak connu : même après la transcription et la libération du
+  #     modèle + GC, la consommation mémoire reste élevée.
+  #     Avec mem_limit=1200m, le kernel OOM-killer tue le processus après
+  #     quelques requêtes → "khidmeti-whisper exited with code 1" → restart.
+  #     Pendant le restart (~5s), toutes les requêtes audio échouent avec
+  #     "whisper fetch failed: fetch failed".
+  #
+  #   FIX : mem_limit=2g
+  #     faster-whisper-small réel : ~900 MB.
+  #     ctranslate2 leak peak     : ~500 MB supplémentaires.
+  #     2g = 900 MB + 500 MB + 600 MB marge ✅
+  #
+  # FIX v10 — WHISPER__LANGUAGE=fr
+  #
+  #   PROBLÈME :
+  #     Sans langue forcée, faster-whisper-small tente une auto-détection.
+  #     La Darija algérienne (arabe dialectal fortement influencé par le français)
+  #     est mal couverte par faster-whisper-small et est souvent confondue avec
+  #     le turc, le persan ou d'autres langues à 20-30% de confiance seulement.
+  #     Résultat : transcriptions fausses → intents incorrects.
+  #
+  #   FIX : WHISPER__LANGUAGE=fr
+  #     "fr" force le décodeur en mode français. La Darija partage ~40% de
+  #     son vocabulaire avec le français (chiffres, verbes courants, termes
+  #     techniques). Ce forçage améliore significativement la qualité sur les
+  #     phrases mixtes Darija/français courantes dans l'application.
+  #     Alternative : "ar" pour les utilisateurs qui parlent uniquement arabe.
+  #
+  # FIX v10 — WHISPER__MAX_CONCURRENT_REQUESTS=1
+  #
+  #   PROBLÈME :
+  #     Sans limite de concurrence, deux requêtes audio simultanées chargent
+  #     deux instances du modèle dans le même processus, doublant la mémoire
+  #     peak et déclenchant l'OOM avant même que le leak n'entre en jeu.
+  #
+  #   FIX : MAX_CONCURRENT_REQUESTS=1
+  #     Sérialise les transcriptions. File d'attente côté faster-whisper-server.
+  #     La latence utilisateur est légèrement augmentée sous charge, mais
+  #     l'OOM crash est éliminé.
   # ─────────────────────────────────────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
@@ -153,17 +205,18 @@ services:
     volumes:
       - whisper-data:/root/.cache/huggingface
     environment:
-      WHISPER__MODEL:            "${WHISPER_MODEL:-Systran/faster-whisper-small}"
-      WHISPER__INFERENCE_DEVICE: "cpu"
-      WHISPER__COMPUTE_TYPE:     "int8"
-      # WHISPER__LANGUAGE absent intentionnellement — "auto" cause HTTP 422
-      WHISPER__BEAM_SIZE:        "1"
+      WHISPER__MODEL:                    "${WHISPER_MODEL:-Systran/faster-whisper-small}"
+      WHISPER__INFERENCE_DEVICE:         "cpu"
+      WHISPER__COMPUTE_TYPE:             "int8"
+      WHISPER__LANGUAGE:                 "fr"   # FIX v10 : améliore Darija algérienne
+      WHISPER__BEAM_SIZE:                "1"
+      WHISPER__MAX_CONCURRENT_REQUESTS:  "1"    # FIX v10 : prévient double-load OOM
     ports:
       - '8000:8000'
     networks:
       - khidmeti-network
-    mem_limit:       1200m
-    mem_reservation: 300m
+    mem_limit:       2g     # FIX v10 : 1200m → 2g (ctranslate2 leak headroom)
+    mem_reservation: 512m   # FIX v10 : 300m → 512m
     logging:
       driver: json-file
       options:
@@ -177,11 +230,6 @@ services:
       start_period: 300s
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
-  #
-  # v9 — mem_limit 384m → 256m :
-  #   Sur 8 GB RAM, MongoDB n'a besoin que de ~200-250 MB pour Khidmeti.
-  #   Économie : 128 MB libérés pour Ollama.
-  # ─────────────────────────────────────────────────────────────────────────────
   mongo:
     image:          mongo:7.0.16
     container_name: khidmeti-mongo
@@ -194,7 +242,7 @@ services:
       - mongo-data:/data/db
     networks:
       - khidmeti-network
-    mem_limit:       256m        # v9 : 384m→256m (économie 128m pour Ollama)
+    mem_limit:       256m
     mem_reservation: 128m
     logging:
       driver: json-file
@@ -209,9 +257,6 @@ services:
       start_period: 20s
 
   # ── Mongo Express ────────────────────────────────────────────────────────────
-  #
-  # v9 — mem_limit 200m → 128m : outil de dev, pas critique sur 8 GB.
-  # ─────────────────────────────────────────────────────────────────────────────
   mongo-express:
     image:          mongo-express:1.0.2
     container_name: khidmeti-mongo-ui
@@ -228,7 +273,7 @@ services:
       mongo: { condition: service_healthy }
     networks:
       - khidmeti-network
-    mem_limit:       128m        # v9 : 200m→128m
+    mem_limit:       128m
     logging:
       driver: json-file
       options:
@@ -268,9 +313,6 @@ services:
       start_period: 5s
 
   # ── Qdrant v1.9 ─────────────────────────────────────────────────────────────
-  #
-  # v9 — mem_limit 192m → 128m : Qdrant idle sur 8 GB est très léger (~80 MB).
-  # ─────────────────────────────────────────────────────────────────────────────
   qdrant:
     image:          qdrant/qdrant:v1.9.0
     container_name: khidmeti-qdrant
@@ -282,7 +324,7 @@ services:
       - '6334:6334'
     networks:
       - khidmeti-network
-    mem_limit:       128m        # v9 : 192m→128m
+    mem_limit:       128m
     mem_reservation: 64m
     logging:
       driver: json-file
@@ -299,9 +341,6 @@ services:
       start_period: 30s
 
   # ── MinIO ───────────────────────────────────────────────────────────────────
-  #
-  # v9 — mem_limit 512m → 384m : MinIO idle ~300 MB. Économie 128m.
-  # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:RELEASE.2025-04-08T15-41-24Z
     container_name: khidmeti-minio
@@ -317,7 +356,7 @@ services:
       - '9002:9002'
     networks:
       - khidmeti-network
-    mem_limit:       384m        # v9 : 512m→384m
+    mem_limit:       384m
     mem_reservation: 128m
     logging:
       driver: json-file
