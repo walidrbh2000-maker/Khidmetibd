@@ -1,10 +1,11 @@
 ## ══════════════════════════════════════════════════════════════════════════════
-## KHIDMETI BACKEND — Makefile v11.1
+## KHIDMETI BACKEND — Makefile v11.2
 ##
 ## Téléchargement automatique et intelligent de tous les modèles IA :
 ##   make start          → vérifie, télécharge si absent, démarre tout
 ##   make models         → force la vérification/téléchargement de tous les modèles
 ##   make download-whisper → télécharge Whisper depuis l'HÔTE (Codespaces)
+##   make download-vision  → télécharge moondream2 depuis l'HÔTE (Codespaces)
 ##
 ## Architecture modèles :
 ##   docker/models/text/    Qwen3-0.6B-Q4_K_M.gguf       (~500 MB)
@@ -65,7 +66,7 @@ WHISPER_MODEL_ID := $(shell \
 .PHONY: help start stop restart models \
         _ensure-env _ensure-dirs _ensure-models \
         _dl-qwen3 _dl-moondream-text _dl-moondream-proj \
-        download-whisper \
+        download-whisper download-vision \
         build rebuild logs logs-api logs-mongo logs-redis \
         logs-qdrant logs-minio logs-nginx logs-mongo-ui \
         logs-ai-text logs-ai-audio logs-ai-vision \
@@ -83,7 +84,7 @@ WHISPER_MODEL_ID := $(shell \
 help:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  KHIDMETI v11.1 — كل شيء بأمر واحد"
+	@echo "  KHIDMETI v11.2 — كل شيء بأمر واحد"
 	@echo "  OS : $(OS) | IP : $(LOCAL_IP)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
@@ -99,8 +100,9 @@ help:
 	@echo "  make dns            URLs + Flutter config"
 	@echo ""
 	@echo "  [Modèles IA]"
-	@echo "  make models         Vérifier/télécharger tous les modèles"
-	@echo "  make download-whisper  Télécharger Whisper depuis l'hôte (Codespaces)"
+	@echo "  make models              Vérifier/télécharger tous les modèles"
+	@echo "  make download-whisper    Télécharger Whisper depuis l'hôte (Codespaces)"
+	@echo "  make download-vision     Télécharger moondream2 depuis l'hôte (Codespaces)"
 	@echo ""
 	@echo "  [Logs par service]"
 	@echo "  make logs-api       NestJS"
@@ -359,13 +361,84 @@ download-whisper: _ensure-dirs
 	@echo "  Prochaine étape : make restart"
 	@echo ""
 
+# ══════════════════════════════════════════════════════════════════════════════
+# download-vision : télécharge moondream2 depuis l'HÔTE (contourne les
+#                  restrictions réseau des containers Codespaces)
+#
+# POURQUOI cela fonctionne :
+#   L'hôte Codespaces a toujours accès à internet, même quand le container
+#   Docker échoue à télécharger depuis huggingface.co (reçoit une page HTML
+#   au lieu du fichier GGUF → "1 MB < 1500 MB attendus").
+#
+# STRATÉGIE :
+#   huggingface_hub.hf_hub_download() écrit directement dans
+#   docker/models/vision/, monté en volume :ro dans le container ai-vision.
+#   Les fichiers sont disponibles immédiatement au prochain démarrage.
+#
+# FICHIERS :
+#   moondream2-text-Q8_0.gguf   (~1.7 GB)
+#   moondream2-mmproj-f16.gguf  (~100 MB)
+#
+# FLOW :
+#   1. Vérifie si les deux fichiers sont déjà valides → early exit
+#   2. Installe huggingface_hub si absent
+#   3. Télécharge via hf_hub_download avec local_dir=docker/models/vision
+#   4. Affiche le résumé et invite à faire make restart
+# ══════════════════════════════════════════════════════════════════════════════
+download-vision: _ensure-dirs
+	@echo ""
+	@echo "══════════════════════════════════════════════════════"
+	@echo "  Téléchargement moondream2 depuis l'hôte"
+	@echo "  Dépôt : vikhyatk/moondream2"
+	@echo "══════════════════════════════════════════════════════"
+	@echo ""
+	@_text="docker/models/vision/moondream2-text-Q8_0.gguf"; \
+	_proj="docker/models/vision/moondream2-mmproj-f16.gguf"; \
+	_text_mb=$$(du -sm "$$_text" 2>/dev/null | cut -f1); \
+	_proj_mb=$$(du -sm "$$_proj" 2>/dev/null | cut -f1); \
+	if [ "$${_text_mb:-0}" -ge "$(MODEL_MOON_TEXT_MIN_MB)" ] \
+	  && [ "$${_proj_mb:-0}" -ge "$(MODEL_MOON_PROJ_MIN_MB)" ]; then \
+	  echo "  ✅ moondream2-text-Q8_0   ($$(du -sh $$_text | cut -f1)) — déjà présent"; \
+	  echo "  ✅ moondream2-mmproj-f16  ($$(du -sh $$_proj | cut -f1)) — déjà présent"; \
+	  echo "  → make restart  pour relancer le container ai-vision"; \
+	  echo ""; \
+	  exit 0; \
+	fi
+	@if ! command -v python3 &>/dev/null; then \
+	  echo "  ❌ python3 requis (sudo apt install python3)"; \
+	  exit 1; \
+	fi
+	@echo "  🐍 Python : $$(python3 --version)"
+	@echo "  📦 Vérification huggingface_hub..."
+	@python3 -c "import huggingface_hub" 2>/dev/null \
+	  || pip3 install -q huggingface_hub --break-system-packages 2>/dev/null \
+	  || pip3 install -q huggingface_hub 2>/dev/null \
+	  || python3 -m pip install -q huggingface_hub 2>/dev/null \
+	  || { echo "  ❌ Impossible d'installer huggingface_hub"; exit 1; }
+	@echo "  ✅ huggingface_hub disponible"
+	@echo ""
+	@echo "  📥 Téléchargement des modèles vision..."
+	@echo "     moondream2-text-Q8_0.gguf  : ~1.7 GB"
+	@echo "     moondream2-mmproj-f16.gguf : ~100 MB"
+	@echo "     Durée estimée : 10-30 min selon connexion"
+	@echo "     Destination   : docker/models/vision/"
+	@echo ""
+	@HF_HOME="$(PWD)/docker/models/vision" \
+	  _VISION_DEST="$(PWD)/docker/models/vision" \
+	  python3 scripts/download_vision.py
+	@echo ""
+	@echo "  ✅ Vision en cache → $$(du -sh docker/models/vision | cut -f1)"
+	@echo ""
+	@echo "  Prochaine étape : make restart"
+	@echo ""
+
 ## ══════════════════════════════════════════════════════════════════════════════
 ## START — Commande principale tout-en-un
 ## ══════════════════════════════════════════════════════════════════════════════
 
 start: _ensure-dirs _ensure-env _ensure-models
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Démarrage Khidmeti v11.1 — llama.cpp:server direct"
+	@echo "  Démarrage Khidmeti v11.2 — llama.cpp:server direct"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  🚀 Démarrage des containers..."
@@ -452,7 +525,7 @@ logs-ai-vision:
 health:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  État des services Khidmeti v11.1"
+	@echo "  État des services Khidmeti v11.2"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@_c() { \
@@ -471,7 +544,7 @@ health:
 	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
 	[ "$$code" = "200" ] \
 	  && echo "  ✅ ai-vision:8012 (moondream2)" \
-	  || echo "  ❌ ai-vision:8012 (modèles absents ? → make models)";
+	  || echo "  ❌ ai-vision:8012 (modèles absents ? → make download-vision)";
 	@echo -n "  "; \
 	  docker exec khidmeti-mongo mongosh --quiet \
 	    --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
@@ -485,7 +558,7 @@ health:
 ai-status:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Statut IA v11.1 — llama.cpp:server direct"
+	@echo "  Statut IA v11.2 — llama.cpp:server direct"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  Services :"
@@ -497,7 +570,7 @@ ai-status:
 	                     || echo "  ⏳ ai-audio :8000  (démarrage ou modèle absent)"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
 	[ "$$code" = "200" ] && echo "  ✅ ai-vision:8012  (moondream2)" \
-	                     || echo "  ❌ ai-vision:8012  (modèles absents ?)"
+	                     || echo "  ❌ ai-vision:8012  (modèles absents ? → make download-vision)"
 	@echo ""
 	@echo "  Modèles sur disque :"
 	@if [ -f docker/models/text/qwen3-0.6b-q4_k_m.gguf ]; then \
@@ -505,10 +578,10 @@ ai-status:
 	else echo "  ❌ text/  Qwen3-0.6B   absent → make models"; fi
 	@if [ -f docker/models/vision/moondream2-text-Q8_0.gguf ]; then \
 	  echo "  ✅ vision/moondream2-text    $$(du -sh docker/models/vision/moondream2-text-Q8_0.gguf | cut -f1)"; \
-	else echo "  ❌ vision/moondream2-text   absent → make models"; fi
+	else echo "  ❌ vision/moondream2-text   absent → make download-vision"; fi
 	@if [ -f docker/models/vision/moondream2-mmproj-f16.gguf ]; then \
 	  echo "  ✅ vision/moondream2-mmproj  $$(du -sh docker/models/vision/moondream2-mmproj-f16.gguf | cut -f1)"; \
-	else echo "  ❌ vision/moondream2-mmproj absent → make models"; fi
+	else echo "  ❌ vision/moondream2-mmproj absent → make download-vision"; fi
 	@_whisper_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
 	if [ "$${_whisper_size:-0}" -gt 100 ]; then \
 	  echo "  ✅ audio/ Whisper turbo $$(du -sh docker/models/audio | cut -f1)"; \
