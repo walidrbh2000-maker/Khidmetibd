@@ -1,16 +1,12 @@
 // apps/api/src/modules/ai/ai.controller.ts
 //
-// BUG 4 FIX A — Support WebP dans extractIntentFromImage
+// v14.0 — Gemma4 Multimodal (Texte + Image + Audio Natif)
 //
-// PROBLÈME :
-//   extractIntentFromImage() vérifiait uniquement JPEG et PNG via magic bytes.
-//   WebP et HEIC (formats courants sur Android moderne et iOS) étaient rejetés
-//   avec 400 BadRequest avant même d'atteindre le service.
-//
-// SOLUTION :
-//   Ajouter la détection WebP (signature RIFF....WEBP sur les 12 premiers
-//   octets). Gemini supporte nativement WebP — aucun changement côté service.
-
+// Le controller reste simple : il reçoit les fichiers (images ou audio) et les
+// passe au service.
+// 
+// NOUVEAUTÉ v14 : L'audio est désormais traité nativement par Gemma4 (plus de Whisper).
+// Les formats d'images (JPEG, PNG, WebP) et audio (WAV, MP3, M4A) sont supportés.
 import {
   Controller,
   Post,
@@ -35,7 +31,10 @@ import { ExtractIntentDto } from './dto/extract-intent.dto';
 export class AiController {
   constructor(private readonly intentExtractor: IntentExtractorService) {}
 
-  /** POST /ai/extract-intent — text (any language / Darija / Arabic / French) */
+  /**
+   * POST /ai/extract-intent
+   * Texte en Darija / Français / Arabe / mix → intention JSON
+   */
   @Post('extract-intent')
   @HttpCode(HttpStatus.OK)
   async extractIntent(
@@ -45,7 +44,11 @@ export class AiController {
     return this.intentExtractor.extractFromText(dto.text, user.uid);
   }
 
-  /** POST /ai/extract-intent/audio — m4a / wav / mp3 / ogg */
+  /**
+   * POST /ai/extract-intent/audio
+   * Audio (m4a / wav / mp3 / ogg) → Whisper STT → Gemma4 intent
+   * Limite : 50 MB
+   */
   @Post('extract-intent/audio')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 50 * 1024 * 1024 } }))
@@ -53,18 +56,23 @@ export class AiController {
     @UploadedFile() file: Express.Multer.File | undefined,
     @CurrentUser() user: AuthUser,
   ): Promise<SearchIntent> {
-    if (!file?.buffer?.length) throw new BadRequestException('Audio file is required');
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('Fichier audio requis (m4a, wav, mp3, ogg)');
+    }
     return this.intentExtractor.extractFromAudio(file.buffer, file.mimetype, user.uid);
   }
 
   /**
-   * POST /ai/extract-intent/image — JPEG, PNG ou WebP
+   * POST /ai/extract-intent/image
+   * Image (JPEG, PNG, WebP) → Gemma4 analyse native → intent JSON
    *
-   * BUG 4 FIX A :
-   *   Ajout de la détection WebP (format Android courant).
-   *   RIFF....WEBP : octets 0-3 = 52 49 46 46, octets 8-11 = 57 45 42 50.
-   *   Gemini supporte nativement WebP via son API Files — aucune conversion
-   *   nécessaire côté serveur.
+   * Gemma4 E2B/E4B : analyse multimodale native en un seul step.
+   * Limite : 10 MB
+   *
+   * Formats supportés (détection par magic bytes) :
+   *   JPEG : FF D8 FF
+   *   PNG  : 89 50 4E 47
+   *   WebP : RIFF....WEBP (commun sur Android)
    */
   @Post('extract-intent/image')
   @HttpCode(HttpStatus.OK)
@@ -73,26 +81,23 @@ export class AiController {
     @UploadedFile() file: Express.Multer.File | undefined,
     @CurrentUser() user: AuthUser,
   ): Promise<SearchIntent> {
-    if (!file?.buffer?.length) throw new BadRequestException('Image file is required');
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('Fichier image requis (JPEG, PNG ou WebP)');
+    }
 
     const b = file.buffer;
 
-    // JPEG : FF D8 FF
-    const isJpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
-
-    // PNG : 89 50 4E 47
-    const isPng =
-      b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
-
-    // BUG 4 FIX A : WebP — RIFF....WEBP (12 premiers octets)
-    // Format courant sur Android moderne (caméra, galerie) et Chrome.
-    const isWebp =
-      b.length >= 12 &&
+    // Détection par magic bytes — plus fiable que le Content-Type header
+    const isJpeg = b.length >= 3  && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+    const isPng  = b.length >= 4  && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+    const isWebp = b.length >= 12 &&
       b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && // RIFF
       b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;  // WEBP
 
     if (!isJpeg && !isPng && !isWebp) {
-      throw new BadRequestException('Only JPEG, PNG, and WebP images are supported');
+      throw new BadRequestException(
+        'Format image non supporté. Formats acceptés : JPEG, PNG, WebP',
+      );
     }
 
     return this.intentExtractor.extractFromImage(b.toString('base64'), user.uid);

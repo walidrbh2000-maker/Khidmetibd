@@ -1,31 +1,38 @@
 // apps/api/src/modules/ai/ai.module.ts
 //
-// Architecture simplifiée — un seul backend IA 100% local.
-// Pas de factory, pas de switch, pas de stratégies multiples.
+// v14 — Gemma4Strategy : modèle unique texte + image + audio natif
 //
-// Ollama  → gemma4:e2b → texte + image (multimodal natif)
-// Whisper → faster-whisper small → audio (Darija / Arabe / Français)
+// MIGRATION v14 :
+//   SUPPRIMÉ : ai-audio (Whisper faster-whisper-server)
+//   Gemma4 gère désormais texte + images + audio en un seul service
+//
+// Architecture simplifiée :
+//   Avant v14 : Gemma4 (texte + image) + Whisper (audio STT)
+//   Après v14 : Gemma4 uniquement (texte + image + audio natif)
+//
+// L'interface IAiProvider est conservée pour l'extensibilité future
+// (ex: basculer vers Gemma4 E4B GPU sans changer IntentExtractorService).
 
 import { Module }  from '@nestjs/common';
 import { AI_PROVIDER_TOKEN } from './interfaces/ai-provider.interface';
-import { LocalStrategy }     from './providers/local.strategy';
+import { Gemma4Strategy }   from './providers/gemma4.strategy';
 import { IntentExtractorService } from './services/intent-extractor.service';
-import { AiController }      from './ai.controller';
-import { AuthModule }        from '../auth/auth.module';
-import Redis                 from 'ioredis';
+import { AiController } from './ai.controller';
+import { AuthModule }   from '../auth/auth.module';
+import Redis            from 'ioredis';
 
 @Module({
   imports:     [AuthModule],
   controllers: [AiController],
   providers: [
-    // ── Backend IA unique (100% local) ────────────────────────────────────────
-    LocalStrategy,
+    // ── Backend IA Gemma4 (texte + image + audio natif) ──────────────────────
+    Gemma4Strategy,
     {
       provide:     AI_PROVIDER_TOKEN,
-      useExisting: LocalStrategy,
+      useExisting: Gemma4Strategy,
     },
 
-    // ── Redis — rate-limiting optionnel (dégradation gracieuse si absent) ─────
+    // ── Redis — rate-limiting (dégradation gracieuse si absent) ───────────────
     {
       provide:    'REDIS_CLIENT',
       useFactory: (): Redis | null => {
@@ -36,7 +43,7 @@ import Redis                 from 'ioredis';
           maxRetriesPerRequest: 1,
           enableOfflineQueue:   false,
         });
-        client.on('error', () => { /* silent */ });
+        client.on('error', () => { /* silent — Redis est optionnel */ });
         return client;
       },
     },
