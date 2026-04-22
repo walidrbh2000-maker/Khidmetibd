@@ -1,59 +1,24 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose (stack CPU, IA 100% locale — Architecture directe)
+# KHIDMETI — Docker Compose v11.1
 #
-# MIGRATION v11 — llama.cpp:server direct (sans Ollama)
+# FIX v11.1 :
+#   1. ai-text     CTX 512 → 1024     (corrige "606 tokens exceeds 512")
+#   2. ai-vision   OBLIGATOIRE        (décommenté + ajouté dans depends_on api)
+#   3. ai-audio    HF_HUB_OFFLINE=0   (force téléchargement HuggingFace)
+#   4. ai-text     N_PREDICT 200→256  (headroom pour JSON complexes)
 #
-# POURQUOI supprimer Ollama ?
-#   Problème observé dans les logs (screenshots 8-10) :
-#     "llama runner process has terminated: %w(<nil>)"
-#     "AI overloaded/unavailable [image]: Ollama 500"
-#   CAUSE : Ollama est un wrapper Go autour de llama.cpp. Il ajoute :
-#     - Une couche HTTP Go (~100 MB RAM overhead)
-#     - Un gestionnaire de "runners" instable sur CPU limité
-#     - Un swap automatique entre modèles qui cause des OOM sur 8 GB
-#   SOLUTION : utiliser llama.cpp:server directement
-#     → Même binaire C++ qu'Ollama utilise en interne
-#     → Zéro overhead Go
-#     → Démarrage en <8s (modèle déjà sur disque)
-#     → API OpenAI-compatible identique
+# BUDGET MÉMOIRE avec vision obligatoire (RAM 10+ GB recommandée) :
+#   ai-text  (Qwen3 Q4_K_M)   :  900 MB
+#   ai-vision (moondream2)    : 2200 MB
+#   ai-audio (whisper turbo)  : 2000 MB
+#   api + infra               : 3000 MB
+#   ─────────────────────────────────
+#   Total                     : ~8.1 GB → recommandé 10+ GB RAM
 #
-# ARCHITECTURE :
-#
-#   ┌──────────────────────────────────────────────────────────┐
-#   │  docker/models/           ← bind mount (dossier local)  │
-#   │  ├── text/                                               │
-#   │  │   └── qwen3-0.6b-q4_k_m.gguf   (~500 MB)            │
-#   │  ├── audio/                                              │
-#   │  │   └── [téléchargé au 1er start] (~800 MB)            │
-#   │  └── vision/              ← optionnel                   │
-#   │      ├── moondream2-text-Q8_0.gguf  (~1.7 GB)           │
-#   │      └── moondream2-mmproj-f16.gguf (~100 MB)           │
-#   └──────────────────────────────────────────────────────────┘
-#
-#   NestJS API
-#     ├── ai-text:8011   → llama.cpp:server + Qwen3-0.6B  (JSON)
-#     ├── ai-audio:8000  → faster-whisper + large-v3-turbo (STT)
-#     └── ai-vision:8012 → llama.cpp:server + moondream2  (image, optionnel)
-#
-# BUDGET MÉMOIRE 8 GB RAM :
-#   ai-text  (Qwen3 Q4_K_M)     : ≤  900 MB
-#   ai-audio (large-v3-turbo)   : ≤ 2000 MB
-#   api (NestJS)                 : ≤ 1024 MB
-#   mongo                        : ≤  256 MB
-#   redis                        : ≤  192 MB
-#   qdrant                       : ≤  128 MB
-#   minio                        : ≤  384 MB
-#   nginx + mongo-express        : ≤  192 MB
-#   ─────────────────────────────────────────
-#   Total sans vision            : ≈ 5.1 GB  ✅ OK sur 8 GB
-#   Total avec vision (2200m)    : ≈ 7.3 GB  ⚠️  Décommenter sur 10+ GB
-#
-# PREMIERS PAS :
-#   chmod +x scripts/download-models.sh
-#   ./scripts/download-models.sh
-#   docker compose up -d
+# Si votre machine a 8 GB, commentez ai-vision et son depends_on dans api.
+# Téléchargement auto des modèles : make start (ou make models)
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -88,12 +53,13 @@ services:
     volumes:
       - ./apps/api/src:/app/src:ro
     depends_on:
-      mongo:    { condition: service_healthy }
-      redis:    { condition: service_healthy }
-      qdrant:   { condition: service_healthy }
-      minio:    { condition: service_healthy }
-      ai-text:  { condition: service_healthy }
-      ai-audio: { condition: service_started }
+      mongo:      { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      qdrant:     { condition: service_healthy }
+      minio:      { condition: service_healthy }
+      ai-text:    { condition: service_healthy }
+      ai-audio:   { condition: service_started }
+      ai-vision:  { condition: service_healthy }   # FIX v11.1 — vision obligatoire
     networks:
       - khidmeti-network
     mem_limit:       1g
@@ -107,21 +73,13 @@ services:
   # ════════════════════════════════════════════════════════════════════════════
   # AI-TEXT — llama.cpp:server + Qwen3-0.6B-Q4_K_M
   #
-  # Image  : ghcr.io/ggml-org/llama.cpp:server (~200 MB compressed)
-  # Modèle : ./docker/models/text/qwen3-0.6b-q4_k_m.gguf (~500 MB)
-  # API    : OpenAI /v1/chat/completions
-  # Port   : 8011
+  # FIX v11.1 :
+  #   LLAMA_ARG_CTX_SIZE  : 512 → 1024
+  #   CAUSE  : system prompt few-shot (~500 tokens) + user (~100) = ~606 > 512
+  #   IMPACT MÉMOIRE : +~50 MB KV cache (620 MB total, mem_limit 900m inchangé)
   #
-  # POURQUOI Qwen3-0.6B et non gemma3:1b ?
-  #   → 119 langues (Darija, Arabe, Français, Anglais, Russe...)
-  #   → Mode non-thinking (/no_think) = JSON immédiat sans chain-of-thought
-  #   → Q4_K_M = meilleur compromis taille/qualité pour CPU
-  #   → Démarrage en ~3s (modèle déjà sur disque, pas de téléchargement)
-  #
-  # POURQUOI pas Ollama ?
-  #   → Ollama wrappait llama.cpp dans Go → 100 MB RAM overhead inutile
-  #   → Crash "llama runner process has terminated" sur CPU limité
-  #   → Ce container = le même engine SANS le wrapper instable
+  #   LLAMA_ARG_N_PREDICT : 200 → 256
+  #   RAISON : headroom pour JSON structurés avec champs optionnels longs
   # ════════════════════════════════════════════════════════════════════════════
   ai-text:
     image: ghcr.io/ggml-org/llama.cpp:server
@@ -133,10 +91,10 @@ services:
       LLAMA_ARG_MODEL:         /models/qwen3-0.6b-q4_k_m.gguf
       LLAMA_ARG_PORT:          "8011"
       LLAMA_ARG_HOST:          "0.0.0.0"
-      LLAMA_ARG_CTX_SIZE:      "512"     # system prompt + query + JSON = ~400 tokens
-      LLAMA_ARG_N_PREDICT:     "200"     # JSON court, 200 tokens suffisent
+      LLAMA_ARG_CTX_SIZE:      "1024"   # FIX v11.1 : 512→1024
+      LLAMA_ARG_N_PREDICT:     "256"    # FIX v11.1 : 200→256
       LLAMA_ARG_THREADS:       "4"
-      LLAMA_ARG_PARALLEL:      "2"       # 2 requêtes simultanées max
+      LLAMA_ARG_PARALLEL:      "2"
       LLAMA_ARG_CONT_BATCHING: "true"
     ports:
       - "8011:8011"
@@ -159,25 +117,14 @@ services:
   # ════════════════════════════════════════════════════════════════════════════
   # AI-AUDIO — faster-whisper-server + large-v3-turbo INT8
   #
-  # Image  : fedirz/faster-whisper-server:latest-cpu (~400 MB)
-  # Modèle : Systran/faster-whisper-large-v3-turbo (~800 MB, INT8)
-  #          → téléchargé automatiquement dans docker/models/audio/ au 1er start
-  # API    : OpenAI /v1/audio/transcriptions
-  # Port   : 8000
+  # FIX v11.1 :
+  #   HF_HUB_OFFLINE=0             : force le téléchargement même si variable
+  #                                   héritée forçait le mode offline
+  #   HUGGINGFACE_HUB_VERBOSITY=info : logs de progression du téléchargement
   #
-  # POURQUOI large-v3-turbo et pas whisper-small ?
-  #   Screenshots montrent "Chosnip lombé" au lieu de transcription correcte
-  #   → small WER Darija : ~25% (1 mot sur 4 incorrect)
-  #   → turbo WER Darija : ~8%  (beaucoup mieux sur dialecte algérien)
-  #   → turbo INT8 RAM   :  1.2 GB (acceptable, vs 600 MB small)
-  #
-  # FIX OOM (1200m → 2g) :
-  #   ctranslate2 memory leak connu → pic mémoire après plusieurs requêtes
-  #   2g = 800 MB modèle + 800 MB ctranslate2 peak + 400 MB marge
-  #
-  # WHISPER__LANGUAGE=fr :
-  #   La Darija algérienne partage ~40% vocabulaire avec le français
-  #   → forcer "fr" améliore significativement la reconnaissance
+  # Si le téléchargement échoue (restrictions réseau Codespaces) :
+  #   make download-whisper        → télécharge depuis l'hôte (toujours connecté)
+  #   make restart
   # ════════════════════════════════════════════════════════════════════════════
   ai-audio:
     image: fedirz/faster-whisper-server:latest-cpu
@@ -192,6 +139,8 @@ services:
       WHISPER__LANGUAGE:                "fr"
       WHISPER__BEAM_SIZE:               "1"
       WHISPER__MAX_CONCURRENT_REQUESTS: "1"
+      HF_HUB_OFFLINE:                   "0"          # FIX v11.1
+      HUGGINGFACE_HUB_VERBOSITY:        "info"        # FIX v11.1
     ports:
       - "8000:8000"
     networks:
@@ -211,61 +160,52 @@ services:
         max-file: "2"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # AI-VISION — llama.cpp:server + moondream2 (OPTIONNEL)
+  # AI-VISION — llama.cpp:server + moondream2 (OBLIGATOIRE depuis v11.1)
   #
-  # Image  : ghcr.io/ggml-org/llama.cpp:server (même image que ai-text)
-  # Modèles: moondream2-20250414 en GGUF (2 fichiers, ~1.8 GB total)
-  # API    : OpenAI /v1/chat/completions (avec support images base64)
-  # Port   : 8012
+  # FIX v11.1 : rendu obligatoire (décommenté + dans depends_on api)
   #
-  # PRÉREQUIS :
-  #   1. Exécuter : ./scripts/download-models.sh (répondre Y à la question vision)
-  #   2. Décommenter ce service
-  #   3. Décommenter "ai-vision" dans depends_on du service api ci-dessus
-  #   4. RAM recommandée : 10+ GB
+  # Modèles téléchargés automatiquement par `make start` :
+  #   docker/models/vision/moondream2-text-Q8_0.gguf   (~1.7 GB)
+  #   docker/models/vision/moondream2-mmproj-f16.gguf  (~100 MB)
   #
-  # POURQUOI deux fichiers GGUF ?
-  #   moondream2-text-Q8_0.gguf   : le LLM (génération de texte)
-  #   moondream2-mmproj-f16.gguf  : le projecteur CLIP (encodage visuel)
-  #   → llama.cpp charge les deux via --model + --mmproj
+  # Pipeline two-step (inchangé depuis v10) :
+  #   Step 1 : moondream2 décrit l'image → description anglais
+  #   Step 2 : Qwen3 (ai-text) extrait le JSON d'intent
   #
-  # PIPELINE TWO-STEP (conservé depuis v10) :
-  #   Step 1 : moondream2 décrit l'image en anglais (1 phrase)
-  #            → ce pour quoi moondream est conçu (description, pas JSON)
-  #   Step 2 : Qwen3 (ai-text) extrait le JSON d'intent depuis la description
-  #            → JSON fiable, moondream ne suit jamais les instructions JSON
+  # ⚠️  RAM : si votre machine a ≤ 8 GB, commentez ce service et
+  #     décommentez `ai-vision` dans depends_on du service api.
   # ════════════════════════════════════════════════════════════════════════════
-  # ai-vision:
-  #   image: ghcr.io/ggml-org/llama.cpp:server
-  #   container_name: khidmeti-ai-vision
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./docker/models/vision:/models:ro
-  #   environment:
-  #     LLAMA_ARG_MODEL:     /models/moondream2-text-Q8_0.gguf
-  #     LLAMA_ARG_MMPROJ:    /models/moondream2-mmproj-f16.gguf
-  #     LLAMA_ARG_PORT:      "8012"
-  #     LLAMA_ARG_HOST:      "0.0.0.0"
-  #     LLAMA_ARG_CTX_SIZE:  "1024"
-  #     LLAMA_ARG_N_PREDICT: "100"
-  #     LLAMA_ARG_THREADS:   "4"
-  #   ports:
-  #     - "8012:8012"
-  #   networks:
-  #     - khidmeti-network
-  #   mem_limit:       2200m
-  #   mem_reservation: 1500m
-  #   healthcheck:
-  #     test:         ["CMD", "curl", "-sf", "http://localhost:8012/health"]
-  #     interval:     20s
-  #     timeout:      10s
-  #     retries:      3
-  #     start_period: 15s
-  #   logging:
-  #     driver: json-file
-  #     options:
-  #       max-size: "5m"
-  #       max-file: "2"
+  ai-vision:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: khidmeti-ai-vision
+    restart: unless-stopped
+    volumes:
+      - ./docker/models/vision:/models:ro
+    environment:
+      LLAMA_ARG_MODEL:     /models/moondream2-text-Q8_0.gguf
+      LLAMA_ARG_MMPROJ:    /models/moondream2-mmproj-f16.gguf
+      LLAMA_ARG_PORT:      "8012"
+      LLAMA_ARG_HOST:      "0.0.0.0"
+      LLAMA_ARG_CTX_SIZE:  "1024"
+      LLAMA_ARG_N_PREDICT: "100"
+      LLAMA_ARG_THREADS:   "4"
+    ports:
+      - "8012:8012"
+    networks:
+      - khidmeti-network
+    mem_limit:       2200m
+    mem_reservation: 1500m
+    healthcheck:
+      test:         ["CMD", "curl", "-sf", "http://localhost:8012/health"]
+      interval:     20s
+      timeout:      10s
+      retries:      3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
