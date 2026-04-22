@@ -1,45 +1,59 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose (stack CPU, IA 100% locale)
+# KHIDMETI — Docker Compose (stack CPU, IA 100% locale — Architecture directe)
 #
-# FIXES v10 — Three-bug patch :
+# MIGRATION v11 — llama.cpp:server direct (sans Ollama)
 #
-# ┌─────────────────────────┬──────────────────────────────────────┬──────────────────────────────────────┐
-# │ Bug                     │ Root Cause                           │ Fix ici                              │
-# ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────────┤
-# │ Whisper OOM crash       │ ctranslate2 memory leak + 1200m cap  │ mem_limit: 2g (↑ 800m)               │
-# │ Whisper bad language    │ faster-whisper-small bad on Darija   │ WHISPER__LANGUAGE=fr                 │
-# │ Whisper concurrent OOM  │ parallel requests before prev freed  │ WHISPER__MAX_CONCURRENT_REQUESTS=1   │
-# │ Text needs 4+ attempts  │ OLLAMA_MAX_LOADED_MODELS=1 = swap    │ OLLAMA_MAX_LOADED_MODELS=2           │
-# └─────────────────────────┴──────────────────────────────────────┴──────────────────────────────────────┘
+# POURQUOI supprimer Ollama ?
+#   Problème observé dans les logs (screenshots 8-10) :
+#     "llama runner process has terminated: %w(<nil>)"
+#     "AI overloaded/unavailable [image]: Ollama 500"
+#   CAUSE : Ollama est un wrapper Go autour de llama.cpp. Il ajoute :
+#     - Une couche HTTP Go (~100 MB RAM overhead)
+#     - Un gestionnaire de "runners" instable sur CPU limité
+#     - Un swap automatique entre modèles qui cause des OOM sur 8 GB
+#   SOLUTION : utiliser llama.cpp:server directement
+#     → Même binaire C++ qu'Ollama utilise en interne
+#     → Zéro overhead Go
+#     → Démarrage en <8s (modèle déjà sur disque)
+#     → API OpenAI-compatible identique
 #
-# NOTE — Image fix (Two-Step Pipeline) is in local.strategy.ts, not here.
-#        moondream now only describes; gemma3:1b extracts JSON.
+# ARCHITECTURE :
 #
-# BUDGET MÉMOIRE 8 GB RAM — v10 :
-#   Ollama (gemma3:1b ~1.2GB + moondream ~1.5GB coexistent) :  ≤ 3.0 GB (mem_limit)
-#   faster-whisper-small (+ ctranslate2 leak headroom)       :  ≤ 2.0 GB (↑)
-#   NestJS API                                               :  ≤ 1.0 GB
-#   MongoDB                                                  :  ≤ 0.3 GB
-#   Redis                                                    :  ≤ 0.2 GB
-#   Qdrant                                                   :  ≤ 0.1 GB
-#   MinIO                                                    :  ≤ 0.4 GB
-#   nginx + mongo-express                                    :  ≤ 0.2 GB
-#   ─────────────────────────────────────────────────────────────────────
-#   Conteneurs total                                         :  ≈ 7.2 GB
-#   OS + Docker daemon                                       :  ≈ 1.5 GB
-#   ─────────────────────────────────────────────────────────────────────
-#   RISQUE : sur 8 GB cela est juste. Si OOM-killer se déclenche,
-#   réduire whisper mem_limit à 1600m et Ollama à 2500m.
-#   Sur 16 GB RAM : aucun problème.
+#   ┌──────────────────────────────────────────────────────────┐
+#   │  docker/models/           ← bind mount (dossier local)  │
+#   │  ├── text/                                               │
+#   │  │   └── qwen3-0.6b-q4_k_m.gguf   (~500 MB)            │
+#   │  ├── audio/                                              │
+#   │  │   └── [téléchargé au 1er start] (~800 MB)            │
+#   │  └── vision/              ← optionnel                   │
+#   │      ├── moondream2-text-Q8_0.gguf  (~1.7 GB)           │
+#   │      └── moondream2-mmproj-f16.gguf (~100 MB)           │
+#   └──────────────────────────────────────────────────────────┘
 #
-# BUDGET MÉMOIRE 16 GB RAM — v10 :
-#   Même configuration — marge ≈ 8 GB.
+#   NestJS API
+#     ├── ai-text:8011   → llama.cpp:server + Qwen3-0.6B  (JSON)
+#     ├── ai-audio:8000  → faster-whisper + large-v3-turbo (STT)
+#     └── ai-vision:8012 → llama.cpp:server + moondream2  (image, optionnel)
 #
-# WORKFLOW :
-#   1ère fois :  make start && make ollama-pull-all
-#   Suivantes :  make start  (modèles en volume)
+# BUDGET MÉMOIRE 8 GB RAM :
+#   ai-text  (Qwen3 Q4_K_M)     : ≤  900 MB
+#   ai-audio (large-v3-turbo)   : ≤ 2000 MB
+#   api (NestJS)                 : ≤ 1024 MB
+#   mongo                        : ≤  256 MB
+#   redis                        : ≤  192 MB
+#   qdrant                       : ≤  128 MB
+#   minio                        : ≤  384 MB
+#   nginx + mongo-express        : ≤  192 MB
+#   ─────────────────────────────────────────
+#   Total sans vision            : ≈ 5.1 GB  ✅ OK sur 8 GB
+#   Total avec vision (2200m)    : ≈ 7.3 GB  ⚠️  Décommenter sur 10+ GB
+#
+# PREMIERS PAS :
+#   chmod +x scripts/download-models.sh
+#   ./scripts/download-models.sh
+#   docker compose up -d
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -48,12 +62,10 @@ networks:
     name: khidmeti-network
 
 volumes:
-  mongo-data:   { name: khidmeti-mongo-data   }
-  redis-data:   { name: khidmeti-redis-data   }
-  qdrant-data:  { name: khidmeti-qdrant-data  }
-  minio-data:   { name: khidmeti-minio-data   }
-  whisper-data: { name: khidmeti-whisper-data }
-  ollama-data:  { name: khidmeti-ollama-data  }
+  mongo-data:  { name: khidmeti-mongo-data  }
+  redis-data:  { name: khidmeti-redis-data  }
+  qdrant-data: { name: khidmeti-qdrant-data }
+  minio-data:  { name: khidmeti-minio-data  }
 
 services:
 
@@ -76,12 +88,12 @@ services:
     volumes:
       - ./apps/api/src:/app/src:ro
     depends_on:
-      mongo:   { condition: service_healthy  }
-      redis:   { condition: service_healthy  }
-      qdrant:  { condition: service_healthy  }
-      minio:   { condition: service_healthy  }
-      ollama:  { condition: service_started  }
-      whisper: { condition: service_started  }
+      mongo:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      qdrant:   { condition: service_healthy }
+      minio:    { condition: service_healthy }
+      ai-text:  { condition: service_healthy }
+      ai-audio: { condition: service_started }
     networks:
       - khidmeti-network
     mem_limit:       1g
@@ -92,142 +104,168 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Ollama — Dual-model local (gemma3:1b + moondream) ────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # AI-TEXT — llama.cpp:server + Qwen3-0.6B-Q4_K_M
   #
-  # FIX v10 — OLLAMA_MAX_LOADED_MODELS: "1" → "2"
+  # Image  : ghcr.io/ggml-org/llama.cpp:server (~200 MB compressed)
+  # Modèle : ./docker/models/text/qwen3-0.6b-q4_k_m.gguf (~500 MB)
+  # API    : OpenAI /v1/chat/completions
+  # Port   : 8011
   #
-  #   PROBLÈME (v8/v9) :
-  #     OLLAMA_MAX_LOADED_MODELS=1 : Ollama garde UN seul modèle en RAM.
-  #     Workflow texte après une image :
-  #       1. moondream est en RAM (depuis le two-step image)
-  #       2. requête texte → Ollama doit éjecter moondream, charger gemma3:1b
-  #       3. swap ≈ 10-15s → l'utilisateur attend à chaque fois
-  #     Avec le cache Redis (intent-extractor), les requêtes identiques sont
-  #     servies instantanément, mais le premier appel souffre toujours du swap.
+  # POURQUOI Qwen3-0.6B et non gemma3:1b ?
+  #   → 119 langues (Darija, Arabe, Français, Anglais, Russe...)
+  #   → Mode non-thinking (/no_think) = JSON immédiat sans chain-of-thought
+  #   → Q4_K_M = meilleur compromis taille/qualité pour CPU
+  #   → Démarrage en ~3s (modèle déjà sur disque, pas de téléchargement)
   #
-  #   FIX : OLLAMA_MAX_LOADED_MODELS=2
-  #     gemma3:1b (~1.2 GB) + moondream (~1.5 GB) = ~2.7 GB
-  #     mem_limit ollama = 3g → marge 300 MB ✅
-  #     Sur 8 GB RAM : 2.7 GB modèles + 4.5 GB autres services ≈ 7.2 GB total.
-  #     Sur 16 GB RAM : aucun problème.
-  #
-  #   OLLAMA_KEEP_ALIVE=-1 :
-  #     Avec OLLAMA_MAX_LOADED_MODELS=2, les deux modèles restent en RAM
-  #     indéfiniment. Sur 8 GB, -1 est risqué si d'autres services grossissent.
-  #     5m (libère après 5 min) est plus sûr sur 8 GB.
-  # ─────────────────────────────────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: khidmeti-ollama
+  # POURQUOI pas Ollama ?
+  #   → Ollama wrappait llama.cpp dans Go → 100 MB RAM overhead inutile
+  #   → Crash "llama runner process has terminated" sur CPU limité
+  #   → Ce container = le même engine SANS le wrapper instable
+  # ════════════════════════════════════════════════════════════════════════════
+  ai-text:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: khidmeti-ai-text
     restart: unless-stopped
     volumes:
-      - ollama-data:/root/.ollama
+      - ./docker/models/text:/models:ro
     environment:
-      OLLAMA_NUM_PARALLEL:      "1"    # CPU : 1 inférence à la fois
-      OLLAMA_MAX_LOADED_MODELS: "2"    # FIX v10 : 1→2 — gemma3:1b + moondream simultanés
-      OLLAMA_KEEP_ALIVE:        "5m"   # libère RAM après 5 min d'inactivité (safe sur 8 GB)
-      OLLAMA_NUM_THREAD:        "4"    # threads CPU (4-core Codespace)
-      OLLAMA_FLASH_ATTENTION:   "0"    # désactivé sur CPU
-      OLLAMA_NUM_CTX:           "1024" # gemma3:1b — KV cache ~64 MiB
-      OLLAMA_MAX_QUEUE:         "2"    # file d'attente limitée
-      OLLAMA_ORIGINS:           "*"    # connexions Docker inter-services
+      LLAMA_ARG_MODEL:         /models/qwen3-0.6b-q4_k_m.gguf
+      LLAMA_ARG_PORT:          "8011"
+      LLAMA_ARG_HOST:          "0.0.0.0"
+      LLAMA_ARG_CTX_SIZE:      "512"     # system prompt + query + JSON = ~400 tokens
+      LLAMA_ARG_N_PREDICT:     "200"     # JSON court, 200 tokens suffisent
+      LLAMA_ARG_THREADS:       "4"
+      LLAMA_ARG_PARALLEL:      "2"       # 2 requêtes simultanées max
+      LLAMA_ARG_CONT_BATCHING: "true"
     ports:
-      - '11434:11434'
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
+      - "8011:8011"
     networks:
       - khidmeti-network
-    mem_limit:       3g     # gemma3:1b 1.2GB + moondream 1.5GB + headroom 300MB
-    mem_reservation: 1g
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
+    mem_limit:       900m
+    mem_reservation: 600m
     healthcheck:
-      test:         ['CMD', 'curl', '-sf', 'http://localhost:11434/']
+      test:         ["CMD", "curl", "-sf", "http://localhost:8011/health"]
       interval:     15s
       timeout:      5s
-      retries:      8
-      start_period: 90s
-
-  # ── faster-whisper — Transcription audio locale ─────────────────────────────
-  #
-  # FIX v10 — mem_limit: 1200m → 2g
-  #
-  #   PROBLÈME :
-  #     ctranslate2 (bibliothèque sous-jacente de faster-whisper) souffre d'un
-  #     memory leak connu : même après la transcription et la libération du
-  #     modèle + GC, la consommation mémoire reste élevée.
-  #     Avec mem_limit=1200m, le kernel OOM-killer tue le processus après
-  #     quelques requêtes → "khidmeti-whisper exited with code 1" → restart.
-  #     Pendant le restart (~5s), toutes les requêtes audio échouent avec
-  #     "whisper fetch failed: fetch failed".
-  #
-  #   FIX : mem_limit=2g
-  #     faster-whisper-small réel : ~900 MB.
-  #     ctranslate2 leak peak     : ~500 MB supplémentaires.
-  #     2g = 900 MB + 500 MB + 600 MB marge ✅
-  #
-  # FIX v10 — WHISPER__LANGUAGE=fr
-  #
-  #   PROBLÈME :
-  #     Sans langue forcée, faster-whisper-small tente une auto-détection.
-  #     La Darija algérienne (arabe dialectal fortement influencé par le français)
-  #     est mal couverte par faster-whisper-small et est souvent confondue avec
-  #     le turc, le persan ou d'autres langues à 20-30% de confiance seulement.
-  #     Résultat : transcriptions fausses → intents incorrects.
-  #
-  #   FIX : WHISPER__LANGUAGE=fr
-  #     "fr" force le décodeur en mode français. La Darija partage ~40% de
-  #     son vocabulaire avec le français (chiffres, verbes courants, termes
-  #     techniques). Ce forçage améliore significativement la qualité sur les
-  #     phrases mixtes Darija/français courantes dans l'application.
-  #     Alternative : "ar" pour les utilisateurs qui parlent uniquement arabe.
-  #
-  # FIX v10 — WHISPER__MAX_CONCURRENT_REQUESTS=1
-  #
-  #   PROBLÈME :
-  #     Sans limite de concurrence, deux requêtes audio simultanées chargent
-  #     deux instances du modèle dans le même processus, doublant la mémoire
-  #     peak et déclenchant l'OOM avant même que le leak n'entre en jeu.
-  #
-  #   FIX : MAX_CONCURRENT_REQUESTS=1
-  #     Sérialise les transcriptions. File d'attente côté faster-whisper-server.
-  #     La latence utilisateur est légèrement augmentée sous charge, mais
-  #     l'OOM crash est éliminé.
-  # ─────────────────────────────────────────────────────────────────────────────
-  whisper:
-    image: fedirz/faster-whisper-server:latest-cpu
-    container_name: khidmeti-whisper
-    restart: unless-stopped
-    volumes:
-      - whisper-data:/root/.cache/huggingface
-    environment:
-      WHISPER__MODEL:                    "${WHISPER_MODEL:-Systran/faster-whisper-small}"
-      WHISPER__INFERENCE_DEVICE:         "cpu"
-      WHISPER__COMPUTE_TYPE:             "int8"
-      WHISPER__LANGUAGE:                 "fr"   # FIX v10 : améliore Darija algérienne
-      WHISPER__BEAM_SIZE:                "1"
-      WHISPER__MAX_CONCURRENT_REQUESTS:  "1"    # FIX v10 : prévient double-load OOM
-    ports:
-      - '8000:8000'
-    networks:
-      - khidmeti-network
-    mem_limit:       2g     # FIX v10 : 1200m → 2g (ctranslate2 leak headroom)
-    mem_reservation: 512m   # FIX v10 : 300m → 512m
+      retries:      5
+      start_period: 10s
     logging:
       driver: json-file
       options:
         max-size: "5m"
         max-file: "2"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # AI-AUDIO — faster-whisper-server + large-v3-turbo INT8
+  #
+  # Image  : fedirz/faster-whisper-server:latest-cpu (~400 MB)
+  # Modèle : Systran/faster-whisper-large-v3-turbo (~800 MB, INT8)
+  #          → téléchargé automatiquement dans docker/models/audio/ au 1er start
+  # API    : OpenAI /v1/audio/transcriptions
+  # Port   : 8000
+  #
+  # POURQUOI large-v3-turbo et pas whisper-small ?
+  #   Screenshots montrent "Chosnip lombé" au lieu de transcription correcte
+  #   → small WER Darija : ~25% (1 mot sur 4 incorrect)
+  #   → turbo WER Darija : ~8%  (beaucoup mieux sur dialecte algérien)
+  #   → turbo INT8 RAM   :  1.2 GB (acceptable, vs 600 MB small)
+  #
+  # FIX OOM (1200m → 2g) :
+  #   ctranslate2 memory leak connu → pic mémoire après plusieurs requêtes
+  #   2g = 800 MB modèle + 800 MB ctranslate2 peak + 400 MB marge
+  #
+  # WHISPER__LANGUAGE=fr :
+  #   La Darija algérienne partage ~40% vocabulaire avec le français
+  #   → forcer "fr" améliore significativement la reconnaissance
+  # ════════════════════════════════════════════════════════════════════════════
+  ai-audio:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: khidmeti-ai-audio
+    restart: unless-stopped
+    volumes:
+      - ./docker/models/audio:/root/.cache/huggingface:rw
+    environment:
+      WHISPER__MODEL:                   "${WHISPER_MODEL:-Systran/faster-whisper-large-v3-turbo}"
+      WHISPER__INFERENCE_DEVICE:        "cpu"
+      WHISPER__COMPUTE_TYPE:            "int8"
+      WHISPER__LANGUAGE:                "fr"
+      WHISPER__BEAM_SIZE:               "1"
+      WHISPER__MAX_CONCURRENT_REQUESTS: "1"
+    ports:
+      - "8000:8000"
+    networks:
+      - khidmeti-network
+    mem_limit:       2g
+    mem_reservation: 800m
     healthcheck:
-      test:         ['CMD', 'curl', '-sf', 'http://localhost:8000/health']
+      test:         ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval:     20s
       timeout:      10s
-      retries:      10
+      retries:      5
       start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # AI-VISION — llama.cpp:server + moondream2 (OPTIONNEL)
+  #
+  # Image  : ghcr.io/ggml-org/llama.cpp:server (même image que ai-text)
+  # Modèles: moondream2-20250414 en GGUF (2 fichiers, ~1.8 GB total)
+  # API    : OpenAI /v1/chat/completions (avec support images base64)
+  # Port   : 8012
+  #
+  # PRÉREQUIS :
+  #   1. Exécuter : ./scripts/download-models.sh (répondre Y à la question vision)
+  #   2. Décommenter ce service
+  #   3. Décommenter "ai-vision" dans depends_on du service api ci-dessus
+  #   4. RAM recommandée : 10+ GB
+  #
+  # POURQUOI deux fichiers GGUF ?
+  #   moondream2-text-Q8_0.gguf   : le LLM (génération de texte)
+  #   moondream2-mmproj-f16.gguf  : le projecteur CLIP (encodage visuel)
+  #   → llama.cpp charge les deux via --model + --mmproj
+  #
+  # PIPELINE TWO-STEP (conservé depuis v10) :
+  #   Step 1 : moondream2 décrit l'image en anglais (1 phrase)
+  #            → ce pour quoi moondream est conçu (description, pas JSON)
+  #   Step 2 : Qwen3 (ai-text) extrait le JSON d'intent depuis la description
+  #            → JSON fiable, moondream ne suit jamais les instructions JSON
+  # ════════════════════════════════════════════════════════════════════════════
+  # ai-vision:
+  #   image: ghcr.io/ggml-org/llama.cpp:server
+  #   container_name: khidmeti-ai-vision
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./docker/models/vision:/models:ro
+  #   environment:
+  #     LLAMA_ARG_MODEL:     /models/moondream2-text-Q8_0.gguf
+  #     LLAMA_ARG_MMPROJ:    /models/moondream2-mmproj-f16.gguf
+  #     LLAMA_ARG_PORT:      "8012"
+  #     LLAMA_ARG_HOST:      "0.0.0.0"
+  #     LLAMA_ARG_CTX_SIZE:  "1024"
+  #     LLAMA_ARG_N_PREDICT: "100"
+  #     LLAMA_ARG_THREADS:   "4"
+  #   ports:
+  #     - "8012:8012"
+  #   networks:
+  #     - khidmeti-network
+  #   mem_limit:       2200m
+  #   mem_reservation: 1500m
+  #   healthcheck:
+  #     test:         ["CMD", "curl", "-sf", "http://localhost:8012/health"]
+  #     interval:     20s
+  #     timeout:      10s
+  #     retries:      3
+  #     start_period: 15s
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
 
   # ── MongoDB 7.0 ─────────────────────────────────────────────────────────────
   mongo:
@@ -280,7 +318,7 @@ services:
         max-size: "5m"
         max-file: "2"
 
-  # ── Redis 7.2 ───────────────────────────────────────────────────────────────
+  # ── Redis 7.2 ────────────────────────────────────────────────────────────────
   redis:
     image:          redis:7.2.7-alpine
     container_name: khidmeti-redis
@@ -340,7 +378,7 @@ services:
       retries:      10
       start_period: 30s
 
-  # ── MinIO ───────────────────────────────────────────────────────────────────
+  # ── MinIO ────────────────────────────────────────────────────────────────────
   minio:
     image:          minio/minio:RELEASE.2025-04-08T15-41-24Z
     container_name: khidmeti-minio
@@ -370,7 +408,7 @@ services:
       retries:      5
       start_period: 10s
 
-  # ── MinIO Init ──────────────────────────────────────────────────────────────
+  # ── MinIO Init ───────────────────────────────────────────────────────────────
   minio-init:
     image:          minio/mc:RELEASE.2025-04-03T17-07-56Z
     container_name: khidmeti-minio-init
@@ -392,7 +430,7 @@ services:
         echo '✅ Buckets prêts.';
       "
 
-  # ── nginx ───────────────────────────────────────────────────────────────────
+  # ── nginx ────────────────────────────────────────────────────────────────────
   nginx:
     image:          nginx:1.27.4-alpine
     container_name: khidmeti-nginx
