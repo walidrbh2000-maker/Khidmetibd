@@ -14,7 +14,6 @@
 ## ══════════════════════════════════════════════════════════════════════════════
 
 SHELL := /bin/bash
-.ONESHELL:
 
 # ── Détection OS / Arch ───────────────────────────────────────────────────────
 OS   := $(shell uname -s 2>/dev/null || echo Windows_NT)
@@ -352,23 +351,8 @@ download-whisper: _ensure-dirs
 	@echo "     Taille : ~800 MB — durée : 5-15 min selon connexion"
 	@echo "     Destination : docker/models/audio/ (cache HuggingFace)"
 	@echo ""
-	@HF_HOME="$(PWD)/docker/models/audio" python3 - <<'PYEOF'
-import sys, os
-os.environ.setdefault("HF_HOME", os.path.join(os.getcwd(), "docker/models/audio"))
-try:
-    from huggingface_hub import snapshot_download
-    model_id = os.environ.get("_WHISPER_MODEL", "Systran/faster-whisper-large-v3-turbo")
-    print(f"  → Téléchargement de {model_id}...")
-    path = snapshot_download(
-        repo_id=model_id,
-        local_files_only=False,
-        ignore_patterns=["*.msgpack", "*.h5", "flax_model*", "tf_model*"],
-    )
-    print(f"  ✅ Modèle téléchargé : {path}")
-except Exception as e:
-    print(f"  ❌ Erreur : {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
+	@_WHISPER_MODEL="$(WHISPER_MODEL_ID)" HF_HOME="$(PWD)/docker/models/audio" \
+	  python3 scripts/download_whisper.py
 	@echo ""
 	@echo "  ✅ Whisper en cache → $$(du -sh docker/models/audio | cut -f1)"
 	@echo ""
