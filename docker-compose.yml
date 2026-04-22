@@ -1,39 +1,35 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose v14.0
+# KHIDMETI — Docker Compose v14.1
 #
-# MIGRATION v14 — Gemma4 audio natif : modèle unique pour tout
-#   SUPPRIMÉ : ai-audio (faster-whisper-server) — Gemma4 gère l'audio nativement
+# CORRECTIFS v14.1 (audio Gemma4 natif sur CPU 8 GB RAM) :
 #
-# BASE TECHNIQUE :
-#   llama.cpp PR#21421 "mtmd: add Gemma 4 audio conformer encoder support" (MERGÉ)
-#   Testé CPU + Vulkan sur E2B et E4B — mmproj f32 inclut l'encodeur audio
+#   1. pull_policy: always → force le pull de la dernière image ghcr.io/ggml-org/llama.cpp:server
+#      qui contient PR#21421 (Gemma4 audio conformer encoder).
+#      Sans ça, Docker utilise le cache local (ancienne image sans audio).
 #
-# AVANTAGES v14 vs v13 :
-#   • ~2 GB RAM économisés (Whisper retiré)
-#   • 1 seul service IA (ai-gemma4 gère texte + images + audio)
-#   • Pipeline audio single-step (audio → JSON intent sans STT intermédiaire)
-#   • Pas de téléchargement Whisper au premier lancement
-#   • Darija algérienne mieux comprise (Gemma4 = 140+ langues natives)
+#   2. LLAMA_ARG_PARALLEL: "2" → "1"
+#      Sur 8 GB RAM : model(3.46G) + mmproj-bf16(1G) + KV×2(0.7G) = 5.16G
+#      → KV×1(0.35G) = 4.81G  →  marge RAM : ~3.2G ✅ (infra + OS)
+#      2 requêtes parallèles audio sur CPU = risque d'OOM sur 8 GB.
 #
-# BUDGET MÉMOIRE v14 (6 GB RAM suffisant, 8 GB recommandé) :
-#   ai-gemma4  (Gemma4 E2B Q4_K_M) : ~4.5 GB (model 3.46G + mmproj 0.3G + KV)
-#   api + infra                     : ~1.5 GB
-#   ─────────────────────────────────────────
-#   Total (limits)                  : ~6.0 GB (mmap SSD pour overflow rare)
+#   3. LLAMA_ARG_FLASH_ATTN supprimé
+#      Flash Attention n'est pas supporté sur CPU (backend GGML CPU only).
+#      L'option était ignorée silencieusement mais peut générer un warning
+#      et perturber l'initialisation du mmproj audio.
 #
-# FORMAT AUDIO (recommandations) :
-#   WAV 16kHz mono : optimal (décodage natif llama.cpp)
-#   MP3/M4A/OGG   : supportés si libsndfile compilé dans llama.cpp
-#   Limite Gemma4  : 30 secondes maximum
+#   4. mem_limit: 5g → 5500m + start_period: 60s → 120s
+#      mmproj BF16 (~1 GB) prend plus de temps à charger que mmproj f32.
+#      start_period plus long évite les faux healthcheck failures au démarrage.
 #
-# SETUP INITIAL (obligatoire avant make start) :
-#   1. make download-gemma4   → télécharge model.gguf + mmproj.gguf (~3.8 GB)
-#   2. make start
-#
-# PASSAGE GPU (E4B) :
-#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# BUDGET MÉMOIRE v14.1 (8 GB RAM) :
+#   ai-gemma4 : model(3.46G) + mmproj-bf16(1G) + KV-4096×1(0.35G) = ~4.81 GB
+#   api        : 1g  (NestJS + Node.js)
+#   infra      : ~0.7 GB (mongo 256m + redis 192m + qdrant 128m + minio 256m + nginx 64m)
+#   OS + Docker: ~0.5 GB
+#   ──────────────────────────────────────────────────────
+#   Total      : ~7.0 GB  →  marge ~1.0 GB ✅
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -73,7 +69,6 @@ services:
       qdrant:    { condition: service_healthy }
       minio:     { condition: service_healthy }
       ai-gemma4: { condition: service_healthy }
-      # v14 : ai-audio (Whisper) supprimé — Gemma4 gère l'audio nativement
     networks:
       - khidmeti-network
     mem_limit:       1g
@@ -87,56 +82,69 @@ services:
   # ════════════════════════════════════════════════════════════════════════════
   # AI-GEMMA4 — llama.cpp:server + Gemma4 E2B Q4_K_M
   #
-  # v14 : gère désormais texte + images + AUDIO NATIF (PR#21421 mergé)
+  # v14.1 : correctifs pour audio natif sur CPU 8 GB RAM
   #
-  # PRÉREQUIS : make download-gemma4
-  #   → docker/models/gemma4/gemma-4-e2b-it-Q4_K_M.gguf    (~3.46 GB)
-  #   → docker/models/gemma4/mmproj-gemma-4-e2b-it-f32.gguf (~0.3 GB)
-  #                            ↑ f32 = optimal pour audio (conformer encoder)
+  # PRÉREQUIS : make download-gemma4  (télécharge model + mmproj BF16)
+  #   → docker/models/gemma4/google_gemma-4-e2b-it-Q4_K_M.gguf    (~3.46 GB)
+  #   → docker/models/gemma4/mmproj-google_gemma-4-e2b-it-bf16.gguf (~1.00 GB)
+  #                            ↑ BF16 obligatoire pour l'encodeur audio (PR#21421)
   #
-  # LLAMA_ARG_JINJA    : requis pour le chat template Gemma4 (roles system/user)
-  # LLAMA_ARG_CTX_SIZE : 4096 pour 8 GB RAM — augmenter si plus de RAM
-  # LLAMA_ARG_THREADS  : 4 = bon compromis sur CPU 4+ cœurs
-  # LLAMA_ARG_PARALLEL : 2 = 2 requêtes parallèles (texte + audio simultanés)
+  # pull_policy: always
+  #   → Garantit que la dernière image est utilisée à chaque `make start`.
+  #   → Image `:server` = rebuild à chaque commit master de llama.cpp.
+  #   → Sans pull_policy, Docker utilise le cache local (ancienne image sans audio).
   #
-  # AUDIO NATIF (v14) :
-  #   Format API : { type: "input_audio", input_audio: { data: "base64", format: "wav" } }
-  #   mmproj f32 : contient encodeur image ET encodeur audio (conformer USM-style)
-  #   Limite     : 30 secondes audio maximum par requête
-  #   Timeout    : GEMMA4_TIMEOUT_MS=45000 (audio = mel spectrogram sur CPU → plus long)
+  # LLAMA_ARG_PARALLEL: "1"
+  #   → 1 seule requête parallèle sur CPU 8 GB.
+  #   → Réduit le KV cache de 0.7 GB (×2) à 0.35 GB (×1).
+  #   → Les requêtes audio sont longues sur CPU — le parallélisme n'aide pas.
+  #
+  # LLAMA_ARG_FLASH_ATTN supprimé
+  #   → Flash Attention = GPU uniquement (CUDA/Metal/Vulkan).
+  #   → Sur CPU : non supporté, warning au démarrage, peut perturber mmproj init.
+  #
+  # FORMAT AUDIO ATTENDU (OpenAI-compatible mtmd) :
+  #   { type: "input_audio", input_audio: { data: "<base64>", format: "wav" } }
+  #   WAV 16kHz mono recommandé — max 30 secondes (~5 MB)
   # ════════════════════════════════════════════════════════════════════════════
   ai-gemma4:
     image: ghcr.io/ggml-org/llama.cpp:server
+    # Force le pull de la dernière image à chaque démarrage.
+    # Garantit que PR#21421 (Gemma4 audio) est inclus.
+    pull_policy: always
     container_name: khidmeti-ai-gemma4
     restart: unless-stopped
     volumes:
       - ./docker/models/gemma4:/models:rw
     environment:
-      LLAMA_ARG_MODEL:         "/models/${GEMMA4_MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
-      LLAMA_ARG_MMPROJ:        "/models/${GEMMA4_MMPROJ_FILE:-mmproj-gemma-4-e2b-it-f32.gguf}"
+      LLAMA_ARG_MODEL:         "/models/${GEMMA4_MODEL_FILE:-google_gemma-4-e2b-it-Q4_K_M.gguf}"
+      LLAMA_ARG_MMPROJ:        "/models/${GEMMA4_MMPROJ_FILE:-mmproj-google_gemma-4-e2b-it-bf16.gguf}"
       LLAMA_ARG_HF_TOKEN:      "${HF_TOKEN}"
       LLAMA_ARG_PORT:          "8011"
       LLAMA_ARG_HOST:          "0.0.0.0"
       LLAMA_ARG_CTX_SIZE:      "${GEMMA4_CTX_SIZE:-4096}"
       LLAMA_ARG_N_PREDICT:     "512"
       LLAMA_ARG_THREADS:       "4"
-      LLAMA_ARG_PARALLEL:      "2"
+      # v14.1 : 2 → 1 (8 GB RAM — économise ~0.35 GB de KV cache)
+      LLAMA_ARG_PARALLEL:      "1"
       LLAMA_ARG_CONT_BATCHING: "true"
-      LLAMA_ARG_FLASH_ATTN:    "true"
+      # v14.1 : LLAMA_ARG_FLASH_ATTN supprimé (CPU only — non supporté)
       # Requis pour le chat template Gemma4 (roles system/user/assistant)
       LLAMA_ARG_JINJA:         "true"
     ports:
       - "8011:8011"
     networks:
       - khidmeti-network
-    mem_limit:       5g
-    mem_reservation: 3500m
+    # v14.1 : 5g → 5500m (model 3.46G + mmproj-bf16 1G + KV 0.35G + overhead)
+    mem_limit:       5500m
+    mem_reservation: 4500m
     healthcheck:
       test:         ["CMD", "curl", "-sf", "http://localhost:8011/health"]
-      interval:     15s
-      timeout:      5s
-      retries:      5
-      start_period: 60s
+      interval:     20s
+      timeout:      10s
+      retries:      6
+      # v14.1 : 60s → 120s (mmproj BF16 ~1 GB est plus lent à charger que f32)
+      start_period: 120s
     logging:
       driver: json-file
       options:
