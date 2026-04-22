@@ -1,13 +1,22 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose v11.1
+# KHIDMETI — Docker Compose v12.0
 #
 # FIX v11.1 :
 #   1. ai-text     CTX 512 → 1024     (corrige "606 tokens exceeds 512")
 #   2. ai-vision   OBLIGATOIRE        (décommenté + ajouté dans depends_on api)
 #   3. ai-audio    HF_HUB_OFFLINE=0   (force téléchargement HuggingFace)
 #   4. ai-text     N_PREDICT 200→256  (headroom pour JSON complexes)
+#
+# FIX v12.0 :
+#   5. ai-text     LLAMA_ARG_MODEL → LLAMA_ARG_HF_REPO (téléchargement natif)
+#   6. ai-vision   LLAMA_ARG_MODEL/MMPROJ → LLAMA_ARG_HF_REPO (repo officiel)
+#   7. ai-text/vision  volumes :ro → :rw (llama.cpp écrit son cache)
+#   8. ai-text/vision  HF_TOKEN injecté via LLAMA_ARG_HF_TOKEN
+#   9. ai-text     start_period 10s → 300s  (téléchargement ~500 MB)
+#  10. ai-vision   start_period 15s → 600s  (téléchargement ~1.8 GB)
+#  11. ai-vision   repo vikhyatk → ggml-org/moondream2-20250414-GGUF (officiel)
 #
 # BUDGET MÉMOIRE avec vision obligatoire (RAM 10+ GB recommandée) :
 #   ai-text  (Qwen3 Q4_K_M)   :  900 MB
@@ -18,7 +27,6 @@ name: khidmeti
 #   Total                     : ~8.1 GB → recommandé 10+ GB RAM
 #
 # Si votre machine a 8 GB, commentez ai-vision et son depends_on dans api.
-# Téléchargement auto des modèles : make start (ou make models)
 # ══════════════════════════════════════════════════════════════════════════════
 
 networks:
@@ -73,26 +81,27 @@ services:
   # ════════════════════════════════════════════════════════════════════════════
   # AI-TEXT — llama.cpp:server + Qwen3-0.6B-Q4_K_M
   #
-  # FIX v11.1 :
-  #   LLAMA_ARG_CTX_SIZE  : 512 → 1024
-  #   CAUSE  : system prompt few-shot (~500 tokens) + user (~100) = ~606 > 512
-  #   IMPACT MÉMOIRE : +~50 MB KV cache (620 MB total, mem_limit 900m inchangé)
-  #
-  #   LLAMA_ARG_N_PREDICT : 200 → 256
-  #   RAISON : headroom pour JSON structurés avec champs optionnels longs
+  # FIX v12.0 :
+  #   LLAMA_ARG_HF_REPO    : llama.cpp télécharge et cache le modèle nativement
+  #   LLAMA_ARG_HF_TOKEN   : lève les rate-limits HuggingFace
+  #   LLAMA_CACHE          : répertoire de cache dans le volume
+  #   volume :rw           : nécessaire pour que llama.cpp écrive le cache
+  #   start_period 300s    : temps de téléchargement initial (~500 MB)
   # ════════════════════════════════════════════════════════════════════════════
   ai-text:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: khidmeti-ai-text
     restart: unless-stopped
     volumes:
-      - ./docker/models/text:/models:ro
+      - ./docker/models/text:/models:rw   # rw — llama.cpp écrit son cache ici
     environment:
-      LLAMA_ARG_MODEL:         /models/qwen3-0.6b-q4_k_m.gguf
+      LLAMA_ARG_HF_REPO:       "unsloth/Qwen3-0.6B-GGUF:Q4_K_M"
+      LLAMA_ARG_HF_TOKEN:      "${HF_TOKEN}"
+      LLAMA_CACHE:             "/models"
       LLAMA_ARG_PORT:          "8011"
       LLAMA_ARG_HOST:          "0.0.0.0"
-      LLAMA_ARG_CTX_SIZE:      "1024"   # FIX v11.1 : 512→1024
-      LLAMA_ARG_N_PREDICT:     "256"    # FIX v11.1 : 200→256
+      LLAMA_ARG_CTX_SIZE:      "1024"
+      LLAMA_ARG_N_PREDICT:     "256"
       LLAMA_ARG_THREADS:       "4"
       LLAMA_ARG_PARALLEL:      "2"
       LLAMA_ARG_CONT_BATCHING: "true"
@@ -107,7 +116,7 @@ services:
       interval:     15s
       timeout:      5s
       retries:      5
-      start_period: 10s
+      start_period: 300s   # FIX v12.0 : 10s → 300s (téléchargement ~500 MB)
     logging:
       driver: json-file
       options:
@@ -162,11 +171,15 @@ services:
   # ════════════════════════════════════════════════════════════════════════════
   # AI-VISION — llama.cpp:server + moondream2 (OBLIGATOIRE depuis v11.1)
   #
-  # FIX v11.1 : rendu obligatoire (décommenté + dans depends_on api)
-  #
-  # Modèles téléchargés automatiquement par `make start` :
-  #   docker/models/vision/moondream2-text-Q8_0.gguf   (~1.7 GB)
-  #   docker/models/vision/moondream2-mmproj-f16.gguf  (~100 MB)
+  # FIX v12.0 :
+  #   LLAMA_ARG_HF_REPO    : ggml-org/moondream2-20250414-GGUF (repo officiel)
+  #     → vikhyatk/moondream2 ne contient PAS moondream2-text-Q8_0.gguf (404)
+  #     → ggml-org corrige aussi le chat_template manquant
+  #   LLAMA_ARG_HF_TOKEN   : lève les rate-limits HuggingFace
+  #   LLAMA_CACHE          : répertoire de cache dans le volume
+  #   volume :rw           : nécessaire pour que llama.cpp écrive le cache
+  #   mmproj               : téléchargé automatiquement par llama.cpp (pas de LLAMA_ARG_MMPROJ)
+  #   start_period 600s    : temps de téléchargement initial (~1.8 GB)
   #
   # Pipeline two-step (inchangé depuis v10) :
   #   Step 1 : moondream2 décrit l'image → description anglais
@@ -180,10 +193,14 @@ services:
     container_name: khidmeti-ai-vision
     restart: unless-stopped
     volumes:
-      - ./docker/models/vision:/models:ro
+      - ./docker/models/vision:/models:rw   # rw — cache + mmproj auto-téléchargé
     environment:
-      LLAMA_ARG_MODEL:     /models/moondream2-text-Q8_0.gguf
-      LLAMA_ARG_MMPROJ:    /models/moondream2-mmproj-f16.gguf
+      # ggml-org/moondream2-20250414-GGUF = repo officiel llama.cpp-compatible
+      # Le chat_template manquant dans vikhyatk/moondream2 est corrigé ici
+      # mmproj téléchargé automatiquement par llama.cpp (pas besoin de LLAMA_ARG_MMPROJ)
+      LLAMA_ARG_HF_REPO:   "ggml-org/moondream2-20250414-GGUF"
+      LLAMA_ARG_HF_TOKEN:  "${HF_TOKEN}"
+      LLAMA_CACHE:         "/models"
       LLAMA_ARG_PORT:      "8012"
       LLAMA_ARG_HOST:      "0.0.0.0"
       LLAMA_ARG_CTX_SIZE:  "1024"
@@ -200,7 +217,7 @@ services:
       interval:     20s
       timeout:      10s
       retries:      3
-      start_period: 15s
+      start_period: 600s   # FIX v12.0 : 15s → 600s (téléchargement ~1.8 GB)
     logging:
       driver: json-file
       options:

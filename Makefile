@@ -1,16 +1,21 @@
 ## ══════════════════════════════════════════════════════════════════════════════
-## KHIDMETI BACKEND — Makefile v11.2
+## KHIDMETI BACKEND — Makefile v12.0
+##
+## FIX v12.0 :
+##   - _ensure-models : téléchargement délégué à llama.cpp:server (LLAMA_ARG_HF_REPO)
+##   - download-vision : nouveau repo ggml-org/moondream2-20250414-GGUF
+##   - ai-status / health : noms de fichiers mis à jour (Q4_K_M auto-sélectionné)
+##   - Makefile header : architecture modèles mise à jour
 ##
 ## Téléchargement automatique et intelligent de tous les modèles IA :
-##   make start          → vérifie, télécharge si absent, démarre tout
-##   make models         → force la vérification/téléchargement de tous les modèles
+##   make start          → vérifie dirs, démarre tout (modèles téléchargés par llama.cpp)
+##   make models         → vérifie l'état des répertoires modèles
 ##   make download-whisper → télécharge Whisper depuis l'HÔTE (Codespaces)
 ##   make download-vision  → télécharge moondream2 depuis l'HÔTE (Codespaces)
 ##
-## Architecture modèles :
-##   docker/models/text/    Qwen3-0.6B-Q4_K_M.gguf       (~500 MB)
-##   docker/models/vision/  moondream2-text-Q8_0.gguf     (~1.7 GB)
-##                          moondream2-mmproj-f16.gguf    (~100 MB)
+## Architecture modèles (v12) :
+##   docker/models/text/    [cache llama.cpp — Qwen3-0.6B-Q4_K_M via HF_REPO]
+##   docker/models/vision/  [cache llama.cpp — moondream2 via HF_REPO]
 ##   docker/models/audio/   [cache HuggingFace Whisper]   (~800 MB)
 ## ══════════════════════════════════════════════════════════════════════════════
 
@@ -42,20 +47,6 @@ HOST     := $(shell hostname)
 DATETIME := $(shell date +%Y%m%d-%H%M%S)
 ARGS     ?=
 
-# ── URLs des modèles GGUF (HuggingFace) ──────────────────────────────────────
-#
-# Ces URLs pointent directement vers les fichiers GGUF.
-# Modifiez-les si vous utilisez un mirror ou une version différente.
-#
-MODEL_QWEN3_URL      := https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
-MODEL_MOON_TEXT_URL  := https://huggingface.co/vikhyatk/moondream2/resolve/main/moondream2-text-Q8_0.gguf
-MODEL_MOON_PROJ_URL  := https://huggingface.co/vikhyatk/moondream2/resolve/main/moondream2-mmproj-f16.gguf
-
-# Tailles minimales attendues (MB) — permet de détecter un téléchargement corrompu
-MODEL_QWEN3_MIN_MB      := 350
-MODEL_MOON_TEXT_MIN_MB  := 1500
-MODEL_MOON_PROJ_MIN_MB  := 80
-
 # Modèle Whisper (lu depuis .env, avec fallback)
 WHISPER_MODEL_ID := $(shell \
   grep '^WHISPER_MODEL=' .env 2>/dev/null | cut -d= -f2 | tr -d ' "' \
@@ -65,7 +56,6 @@ WHISPER_MODEL_ID := $(shell \
 
 .PHONY: help start stop restart models \
         _ensure-env _ensure-dirs _ensure-models \
-        _dl-qwen3 _dl-moondream-text _dl-moondream-proj \
         download-whisper download-vision \
         build rebuild logs logs-api logs-mongo logs-redis \
         logs-qdrant logs-minio logs-nginx logs-mongo-ui \
@@ -84,12 +74,12 @@ WHISPER_MODEL_ID := $(shell \
 help:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  KHIDMETI v11.2 — كل شيء بأمر واحد"
+	@echo "  KHIDMETI v12.0 — كل شيء بأمر واحد"
 	@echo "  OS : $(OS) | IP : $(LOCAL_IP)"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  make start          ← COMMANDE PRINCIPALE (tout automatique)"
-	@echo "  make models         ← Vérifier/télécharger tous les modèles IA"
+	@echo "  make models         ← Vérifier l'état des répertoires modèles"
 	@echo ""
 	@echo "  [Quotidien]"
 	@echo "  make stop           Arrêter"
@@ -100,15 +90,14 @@ help:
 	@echo "  make dns            URLs + Flutter config"
 	@echo ""
 	@echo "  [Modèles IA]"
-	@echo "  make models              Vérifier/télécharger tous les modèles"
+	@echo "  make models              Vérifier l'état des répertoires modèles"
 	@echo "  make download-whisper    Télécharger Whisper depuis l'hôte (Codespaces)"
 	@echo "  make download-vision     Télécharger moondream2 depuis l'hôte (Codespaces)"
 	@echo ""
-	@echo "  [Logs par service]"
-	@echo "  make logs-api       NestJS"
-	@echo "  make logs-ai-text   Qwen3 (llama.cpp)"
-	@echo "  make logs-ai-audio  Whisper"
-	@echo "  make logs-ai-vision Moondream2"
+	@echo "  [Suivi 1er démarrage — téléchargement en cours]"
+	@echo "  make logs-ai-text   Qwen3   (~500 MB, ~2-5 min)"
+	@echo "  make logs-ai-vision moondream2 (~1.8 GB, ~10-20 min)"
+	@echo "  make logs-ai-audio  Whisper (~800 MB, ~5-15 min)"
 	@echo ""
 	@echo "  [Tests IA]"
 	@echo "  make test-ai        Darija → JSON"
@@ -149,151 +138,28 @@ _ensure-env:
 	fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# _check_free_space : vérifie l'espace disque disponible
-# Usage : $(call _check_free_space,SIZE_MB,LABEL)
-# ──────────────────────────────────────────────────────────────────────────────
-define _check_free_space
-	_free_kb=$$(df . 2>/dev/null | awk 'NR==2{print $$4}' || echo 9999999); \
-	_needed_kb=$$(( $(1) * 1024 )); \
-	if [ "$${_free_kb:-0}" -lt "$$_needed_kb" ]; then \
-	  echo "  ❌ Espace insuffisant pour $(2) (besoin: $(1) MB, libre: $$(( $${_free_kb:-0} / 1024 )) MB)"; \
-	  echo "     Libérer de l'espace : docker system prune -f"; \
-	  exit 1; \
-	fi;
-endef
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _dl_gguf : télécharge un fichier GGUF avec retry et validation d'intégrité
-# Usage : $(call _dl_gguf,URL,DEST,MIN_MB,LABEL)
+# _ensure-models : crée les répertoires, les téléchargements sont gérés
+#                 nativement par llama.cpp:server via LLAMA_ARG_HF_REPO
 #
-# Stratégie :
-#   1. Vérification de l'espace disque avant téléchargement
-#   2. Téléchargement atomique → .tmp puis renommage
-#   3. Validation de taille (détecte les téléchargements partiels/corrompus)
-#   4. Retry automatique (5 tentatives, délai croissant)
-# ──────────────────────────────────────────────────────────────────────────────
-define _dl_gguf
-	{ $(call _check_free_space,$(3),$(4)) true; }; \
-	echo "  📥 $(4) → $(notdir $(2))"; \
-	echo "     Source  : $(1)"; \
-	echo "     Dest    : $(2)"; \
-	echo ""; \
-	if curl -L \
-	    --retry 5 \
-	    --retry-delay 5 \
-	    --retry-max-time 600 \
-	    --connect-timeout 30 \
-	    --progress-bar \
-	    -o "$(2).tmp" \
-	    "$(1)"; then \
-	  _actual_mb=$$(du -sm "$(2).tmp" 2>/dev/null | cut -f1); \
-	  if [ "$${_actual_mb:-0}" -lt "$(3)" ]; then \
-	    echo "  ❌ Fichier trop petit ($${_actual_mb} MB < $(3) MB attendus)"; \
-	    echo "     Le téléchargement semble corrompu ou incomplet."; \
-	    rm -f "$(2).tmp"; \
-	    exit 1; \
-	  fi; \
-	  mv "$(2).tmp" "$(2)"; \
-	  echo "  ✅ $(4) prêt : $$(du -sh $(2) | cut -f1)"; \
-	else \
-	  echo "  ❌ Téléchargement de $(4) échoué (vérifiez la connexion)"; \
-	  rm -f "$(2).tmp"; \
-	  exit 1; \
-	fi
-endef
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _dl-qwen3 : télécharge Qwen3 si absent ou corrompu
-# ──────────────────────────────────────────────────────────────────────────────
-_dl-qwen3:
-	@_dest="docker/models/text/qwen3-0.6b-q4_k_m.gguf"; \
-	if [ -f "$$_dest" ]; then \
-	  _mb=$$(du -sm "$$_dest" 2>/dev/null | cut -f1); \
-	  if [ "$${_mb:-0}" -ge "$(MODEL_QWEN3_MIN_MB)" ]; then \
-	    echo "  ✅ [text]   Qwen3-0.6B-Q4_K_M  ($$(du -sh $$_dest | cut -f1))"; \
-	    exit 0; \
-	  else \
-	    echo "  ⚠️  [text]   Qwen3 présent mais trop petit ($${_mb} MB) → re-téléchargement"; \
-	    rm -f "$$_dest"; \
-	  fi; \
-	fi; \
-	echo "  📥 [text]   Qwen3-0.6B-Q4_K_M (~500 MB) — une seule fois..."; \
-	$(call _dl_gguf,$(MODEL_QWEN3_URL),$$_dest,$(MODEL_QWEN3_MIN_MB),Qwen3-0.6B-Q4_K_M)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _dl-moondream-text : télécharge moondream2 text model si absent ou corrompu
-# ──────────────────────────────────────────────────────────────────────────────
-_dl-moondream-text:
-	@_dest="docker/models/vision/moondream2-text-Q8_0.gguf"; \
-	if [ -f "$$_dest" ]; then \
-	  _mb=$$(du -sm "$$_dest" 2>/dev/null | cut -f1); \
-	  if [ "$${_mb:-0}" -ge "$(MODEL_MOON_TEXT_MIN_MB)" ]; then \
-	    echo "  ✅ [vision] moondream2-text-Q8_0  ($$(du -sh $$_dest | cut -f1))"; \
-	    exit 0; \
-	  else \
-	    echo "  ⚠️  [vision] moondream2-text trop petit ($${_mb} MB) → re-téléchargement"; \
-	    rm -f "$$_dest"; \
-	  fi; \
-	fi; \
-	echo "  📥 [vision] moondream2-text-Q8_0 (~1.7 GB) — une seule fois..."; \
-	$(call _dl_gguf,$(MODEL_MOON_TEXT_URL),$$_dest,$(MODEL_MOON_TEXT_MIN_MB),moondream2-text-Q8_0)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _dl-moondream-proj : télécharge moondream2 multimodal projector
-# ──────────────────────────────────────────────────────────────────────────────
-_dl-moondream-proj:
-	@_dest="docker/models/vision/moondream2-mmproj-f16.gguf"; \
-	if [ -f "$$_dest" ]; then \
-	  _mb=$$(du -sm "$$_dest" 2>/dev/null | cut -f1); \
-	  if [ "$${_mb:-0}" -ge "$(MODEL_MOON_PROJ_MIN_MB)" ]; then \
-	    echo "  ✅ [vision] moondream2-mmproj-f16 ($$(du -sh $$_dest | cut -f1))"; \
-	    exit 0; \
-	  else \
-	    echo "  ⚠️  [vision] mmproj trop petit ($${_mb} MB) → re-téléchargement"; \
-	    rm -f "$$_dest"; \
-	  fi; \
-	fi; \
-	echo "  📥 [vision] moondream2-mmproj-f16 (~100 MB) — une seule fois..."; \
-	$(call _dl_gguf,$(MODEL_MOON_PROJ_URL),$$_dest,$(MODEL_MOON_PROJ_MIN_MB),moondream2-mmproj-f16)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _ensure-models : vérifie et télécharge TOUS les modèles manquants
+# AVANT (v11.x) : curl → HuggingFace échouait dans Codespaces (HTML au lieu de GGUF)
+# APRÈS (v12)   : llama.cpp télécharge au démarrage avec HF_TOKEN → plus robuste
 #
-# INTELLIGENCE :
-#   1. Qwen3   : toujours requis (texte + JSON)
-#   2. Vision  : téléchargé seulement si ai-vision est actif dans docker-compose.yml
-#   3. Whisper : détecte le cache HuggingFace et propose download-whisper si absent
-#
-# Validation d'intégrité : vérifie la taille minimale de chaque fichier
-# pour détecter les téléchargements partiels ou corrompus.
+# Suivi du premier démarrage (téléchargement en cours) :
+#   make logs-ai-text    → Qwen3   (~500 MB, ~2-5 min)
+#   make logs-ai-vision  → moondream2 (~1.8 GB, ~10-20 min)
 # ──────────────────────────────────────────────────────────────────────────────
 _ensure-models: _ensure-dirs
 	@echo ""
-	@echo "  🔍 Vérification des modèles IA..."
+	@echo "  ✅ Répertoires modèles prêts"
+	@echo "     Téléchargement géré par llama.cpp:server au 1er démarrage"
+	@echo "     via LLAMA_ARG_HF_REPO + HF_TOKEN (.env)"
 	@echo ""
-	@$(MAKE) --no-print-directory _dl-qwen3
-	@echo ""
-	@_vision_active=$$(grep -v '^\s*#' docker-compose.yml 2>/dev/null \
-	  | grep -c 'container_name:.*ai-vision' || echo "0"); \
-	if [ "$$_vision_active" -gt 0 ]; then \
-	  echo "  [vision] Service ai-vision actif dans docker-compose.yml"; \
-	  $(MAKE) --no-print-directory _dl-moondream-text; \
-	  $(MAKE) --no-print-directory _dl-moondream-proj; \
+	@_whisper_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
+	if [ "$${_whisper_size:-0}" -gt 100 ]; then \
+	  echo "  ✅ [audio]  Whisper en cache ($$(du -sh docker/models/audio | cut -f1))"; \
 	else \
-	  echo "  ⏸  [vision] Service ai-vision commenté → modèles non téléchargés"; \
-	  echo "     Pour activer : décommenter ai-vision dans docker-compose.yml"; \
-	fi
-	@echo ""
-	@_whisper_cached=$$(find docker/models/audio -name "*.bin" -o -name "model.safetensors" \
-	  2>/dev/null | head -1); \
-	_whisper_dir_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
-	if [ -n "$$_whisper_cached" ] || [ "$${_whisper_dir_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ [audio]  Whisper large-v3-turbo  ($$(du -sh docker/models/audio | cut -f1))"; \
-	else \
-	  echo "  ⏳ [audio]  Whisper large-v3-turbo → 2 options :"; \
-	  echo "     Option A (auto) : le container télécharge au 1er démarrage (~800 MB, 5-15 min)"; \
-	  echo "               → make logs-ai-audio  pour suivre la progression"; \
-	  echo "     Option B (hôte) : make download-whisper  (recommandé si container sans internet)"; \
+	  echo "  ⏳ [audio]  Whisper → téléchargé au 1er démarrage ai-audio (~800 MB)"; \
+	  echo "             ou : make download-whisper  (si container sans internet)"; \
 	fi
 	@echo ""
 
@@ -313,12 +179,6 @@ models: _ensure-models
 #   docker/models/audio/, qui est monté en volume dans le container ai-audio :
 #     ./docker/models/audio → /root/.cache/huggingface
 #   Le container trouve donc les fichiers au prochain démarrage.
-#
-# FLOW :
-#   1. Vérifie si le modèle est déjà en cache → early exit
-#   2. Installe huggingface_hub si absent (pip3, fallback python -m pip)
-#   3. Télécharge via snapshot_download avec HF_HOME=./docker/models/audio
-#   4. Affiche le résumé et invite à faire make restart
 # ══════════════════════════════════════════════════════════════════════════════
 download-whisper: _ensure-dirs
 	@echo ""
@@ -365,41 +225,27 @@ download-whisper: _ensure-dirs
 # download-vision : télécharge moondream2 depuis l'HÔTE (contourne les
 #                  restrictions réseau des containers Codespaces)
 #
-# POURQUOI cela fonctionne :
-#   L'hôte Codespaces a toujours accès à internet, même quand le container
-#   Docker échoue à télécharger depuis huggingface.co (reçoit une page HTML
-#   au lieu du fichier GGUF → "1 MB < 1500 MB attendus").
+# FIX v12.0 :
+#   Repo mis à jour : ggml-org/moondream2-20250414-GGUF
+#   → vikhyatk/moondream2 ne contient PAS moondream2-text-Q8_0.gguf (404)
+#   → ggml-org est le repo officiel llama.cpp-compatible avec chat_template
+#   → HF_TOKEN injecté automatiquement depuis .env
 #
-# STRATÉGIE :
-#   huggingface_hub.hf_hub_download() écrit directement dans
-#   docker/models/vision/, monté en volume :ro dans le container ai-vision.
-#   Les fichiers sont disponibles immédiatement au prochain démarrage.
-#
-# FICHIERS :
-#   moondream2-text-Q8_0.gguf   (~1.7 GB)
-#   moondream2-mmproj-f16.gguf  (~100 MB)
-#
-# FLOW :
-#   1. Vérifie si les deux fichiers sont déjà valides → early exit
-#   2. Installe huggingface_hub si absent
-#   3. Télécharge via hf_hub_download avec local_dir=docker/models/vision
-#   4. Affiche le résumé et invite à faire make restart
+# FICHIERS (sélectionnés automatiquement par le script) :
+#   moondream2-*-Q4_K_M.gguf  (~1.4 GB)  — modèle texte
+#   mmproj-*-f16.gguf         (~100 MB)  — projecteur multimodal
 # ══════════════════════════════════════════════════════════════════════════════
 download-vision: _ensure-dirs
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
 	@echo "  Téléchargement moondream2 depuis l'hôte"
-	@echo "  Dépôt : vikhyatk/moondream2"
+	@echo "  Dépôt : ggml-org/moondream2-20250414-GGUF"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
-	@_text="docker/models/vision/moondream2-text-Q8_0.gguf"; \
-	_proj="docker/models/vision/moondream2-mmproj-f16.gguf"; \
-	_text_mb=$$(du -sm "$$_text" 2>/dev/null | cut -f1); \
-	_proj_mb=$$(du -sm "$$_proj" 2>/dev/null | cut -f1); \
-	if [ "$${_text_mb:-0}" -ge "$(MODEL_MOON_TEXT_MIN_MB)" ] \
-	  && [ "$${_proj_mb:-0}" -ge "$(MODEL_MOON_PROJ_MIN_MB)" ]; then \
-	  echo "  ✅ moondream2-text-Q8_0   ($$(du -sh $$_text | cut -f1)) — déjà présent"; \
-	  echo "  ✅ moondream2-mmproj-f16  ($$(du -sh $$_proj | cut -f1)) — déjà présent"; \
+	@_vision_size=$$(du -sm docker/models/vision 2>/dev/null | cut -f1); \
+	_cached=$$(find docker/models/vision -name "*.gguf" -size +100M 2>/dev/null | head -1); \
+	if [ -n "$$_cached" ] && [ "$${_vision_size:-0}" -gt 1000 ]; then \
+	  echo "  ✅ moondream2 déjà en cache ($$(du -sh docker/models/vision | cut -f1))"; \
 	  echo "  → make restart  pour relancer le container ai-vision"; \
 	  echo ""; \
 	  exit 0; \
@@ -418,13 +264,14 @@ download-vision: _ensure-dirs
 	@echo "  ✅ huggingface_hub disponible"
 	@echo ""
 	@echo "  📥 Téléchargement des modèles vision..."
-	@echo "     moondream2-text-Q8_0.gguf  : ~1.7 GB"
-	@echo "     moondream2-mmproj-f16.gguf : ~100 MB"
-	@echo "     Durée estimée : 10-30 min selon connexion"
-	@echo "     Destination   : docker/models/vision/"
+	@echo "     moondream2 Q4_K_M  : ~1.4 GB"
+	@echo "     mmproj f16         : ~100 MB"
+	@echo "     Durée estimée      : 10-30 min selon connexion"
+	@echo "     Destination        : docker/models/vision/"
 	@echo ""
 	@HF_HOME="$(PWD)/docker/models/vision" \
 	  _VISION_DEST="$(PWD)/docker/models/vision" \
+	  HF_TOKEN="$$(grep '^HF_TOKEN=' .env 2>/dev/null | cut -d= -f2 | tr -d ' "')" \
 	  python3 scripts/download_vision.py
 	@echo ""
 	@echo "  ✅ Vision en cache → $$(du -sh docker/models/vision | cut -f1)"
@@ -438,19 +285,20 @@ download-vision: _ensure-dirs
 
 start: _ensure-dirs _ensure-env _ensure-models
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Démarrage Khidmeti v11.2 — llama.cpp:server direct"
+	@echo "  Démarrage Khidmeti v12.0 — llama.cpp:server direct"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  🚀 Démarrage des containers..."
 	@docker compose up -d
 	@echo ""
-	@echo "  ⏳ Attente ai-text (Qwen3, ~5-10s)..."
+	@echo "  ⏳ Attente ai-text (Qwen3, 1er démarrage = téléchargement ~500 MB)..."
+	@echo "     Suivi : make logs-ai-text"
 	@READY=0; \
-	for i in $$(seq 1 30); do \
+	for i in $$(seq 1 90); do \
 	  if curl -sf http://localhost:8011/health > /dev/null 2>&1; then \
 	    READY=1; break; \
 	  fi; \
-	  printf "."; sleep 2; \
+	  printf "."; sleep 5; \
 	done; \
 	echo ""; \
 	if [ "$$READY" -eq 1 ]; then \
@@ -525,7 +373,7 @@ logs-ai-vision:
 health:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  État des services Khidmeti v11.2"
+	@echo "  État des services Khidmeti v12.0"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@_c() { \
@@ -536,7 +384,10 @@ health:
 	_c "nginx   :80   " "http://localhost/health"; \
 	_c "Qdrant  :6333 " "http://localhost:6333/healthz"; \
 	_c "MinIO   :9001 " "http://localhost:9001/minio/health/live"; \
-	_c "ai-text :8011 " "http://localhost:8011/health"; \
+	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
+	[ "$$code" = "200" ] \
+	  && echo "  ✅ ai-text :8011 (Qwen3)" \
+	  || echo "  ⏳ ai-text :8011 (téléchargement en cours → make logs-ai-text)"; \
 	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
 	[ "$$code" = "200" ] \
 	  && echo "  ✅ ai-audio:8000 (Whisper large-v3-turbo)" \
@@ -544,7 +395,7 @@ health:
 	code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
 	[ "$$code" = "200" ] \
 	  && echo "  ✅ ai-vision:8012 (moondream2)" \
-	  || echo "  ❌ ai-vision:8012 (modèles absents ? → make download-vision)";
+	  || echo "  ⏳ ai-vision:8012 (téléchargement en cours → make logs-ai-vision)";
 	@echo -n "  "; \
 	  docker exec khidmeti-mongo mongosh --quiet \
 	    --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 \
@@ -558,36 +409,40 @@ health:
 ai-status:
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  Statut IA v11.2 — llama.cpp:server direct"
+	@echo "  Statut IA v12.0 — llama.cpp:server direct"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "  Services :"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8011/health 2>/dev/null); \
 	[ "$$code" = "200" ] && echo "  ✅ ai-text  :8011  (Qwen3-0.6B)" \
-	                     || echo "  ❌ ai-text  :8011  (HTTP $$code)"
+	                     || echo "  ⏳ ai-text  :8011  (téléchargement → make logs-ai-text)"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null); \
 	[ "$$code" = "200" ] && echo "  ✅ ai-audio :8000  (Whisper large-v3-turbo)" \
 	                     || echo "  ⏳ ai-audio :8000  (démarrage ou modèle absent)"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8012/health 2>/dev/null); \
 	[ "$$code" = "200" ] && echo "  ✅ ai-vision:8012  (moondream2)" \
-	                     || echo "  ❌ ai-vision:8012  (modèles absents ? → make download-vision)"
+	                     || echo "  ⏳ ai-vision:8012  (téléchargement → make logs-ai-vision)"
 	@echo ""
 	@echo "  Modèles sur disque :"
-	@if [ -f docker/models/text/qwen3-0.6b-q4_k_m.gguf ]; then \
-	  echo "  ✅ text/  Qwen3-0.6B   $$(du -sh docker/models/text/qwen3-0.6b-q4_k_m.gguf | cut -f1)"; \
-	else echo "  ❌ text/  Qwen3-0.6B   absent → make models"; fi
-	@if [ -f docker/models/vision/moondream2-text-Q8_0.gguf ]; then \
-	  echo "  ✅ vision/moondream2-text    $$(du -sh docker/models/vision/moondream2-text-Q8_0.gguf | cut -f1)"; \
-	else echo "  ❌ vision/moondream2-text   absent → make download-vision"; fi
-	@if [ -f docker/models/vision/moondream2-mmproj-f16.gguf ]; then \
-	  echo "  ✅ vision/moondream2-mmproj  $$(du -sh docker/models/vision/moondream2-mmproj-f16.gguf | cut -f1)"; \
-	else echo "  ❌ vision/moondream2-mmproj absent → make download-vision"; fi
+	@_text_size=$$(du -sm docker/models/text 2>/dev/null | cut -f1); \
+	if [ "$${_text_size:-0}" -gt 100 ]; then \
+	  echo "  ✅ text/   Qwen3-0.6B cache   ($$(du -sh docker/models/text | cut -f1))"; \
+	else \
+	  echo "  ⏳ text/   Qwen3-0.6B         → téléchargé au 1er démarrage ai-text"; \
+	fi
+	@_vis_size=$$(du -sm docker/models/vision 2>/dev/null | cut -f1); \
+	if [ "$${_vis_size:-0}" -gt 1000 ]; then \
+	  echo "  ✅ vision/ moondream2 cache   ($$(du -sh docker/models/vision | cut -f1))"; \
+	else \
+	  echo "  ⏳ vision/ moondream2         → téléchargé au 1er démarrage ai-vision"; \
+	  echo "            ou : make download-vision  (si container sans internet)"; \
+	fi
 	@_whisper_size=$$(du -sm docker/models/audio 2>/dev/null | cut -f1); \
 	if [ "$${_whisper_size:-0}" -gt 100 ]; then \
-	  echo "  ✅ audio/ Whisper turbo $$(du -sh docker/models/audio | cut -f1)"; \
+	  echo "  ✅ audio/  Whisper turbo $$(du -sh docker/models/audio | cut -f1)"; \
 	else \
-	  echo "  ⏳ audio/ Whisper turbo → téléchargé au 1er démarrage ai-audio"; \
-	  echo "            ou : make download-whisper  (si container sans internet)"; \
+	  echo "  ⏳ audio/  Whisper turbo → téléchargé au 1er démarrage ai-audio"; \
+	  echo "             ou : make download-whisper  (si container sans internet)"; \
 	fi
 	@echo ""
 	@free -h 2>/dev/null | awk '/^Mem:/{print "  RAM — Total: " $$2 "  Libre: " $$4}' \
