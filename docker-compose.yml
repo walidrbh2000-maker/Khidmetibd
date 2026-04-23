@@ -1,7 +1,7 @@
 name: khidmeti
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KHIDMETI — Docker Compose v14.1
+# KHIDMETI — Docker Compose v14.2
 #
 # CORRECTIFS v14.1 (audio Gemma4 natif sur CPU 8 GB RAM) :
 #
@@ -108,10 +108,19 @@ services:
   #   WAV 16kHz mono recommandé — max 30 secondes (~5 MB)
   # ════════════════════════════════════════════════════════════════════════════
   ai-gemma4:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    # Force le pull de la dernière image à chaque démarrage.
-    # Garantit que PR#21421 (Gemma4 audio) est inclus.
-    pull_policy: always
+    # v14.2 : build custom depuis master (contient PR#21421 — audio Gemma4 natif)
+    #
+    # OPTION A — Build custom (recommandé si :server public n'a pas encore PR#21421)
+    #   Prérequis : mkdir -p docker/llama-cpp-audio && cp Dockerfile.llama-audio docker/llama-cpp-audio/Dockerfile
+    #   Commande  : docker compose build ai-gemma4 && make stop && make start
+    build:
+      context: ./docker/llama-cpp-audio
+      dockerfile: Dockerfile
+    #
+    # OPTION B — Image publique (activer si PR#21421 confirmé dans :server)
+    #   Commenter les 2 lignes "build" ci-dessus et décommenter :
+    # image: ghcr.io/ggml-org/llama.cpp:server
+    # pull_policy: always
     container_name: khidmeti-ai-gemma4
     restart: unless-stopped
     volumes:
@@ -122,7 +131,7 @@ services:
       LLAMA_ARG_HF_TOKEN:      "${HF_TOKEN}"
       LLAMA_ARG_PORT:          "8011"
       LLAMA_ARG_HOST:          "0.0.0.0"
-      LLAMA_ARG_CTX_SIZE:      "${GEMMA4_CTX_SIZE:-4096}"
+      LLAMA_ARG_CTX_SIZE:      "${GEMMA4_CTX_SIZE:-8192}"
       LLAMA_ARG_N_PREDICT:     "512"
       LLAMA_ARG_THREADS:       "4"
       # v14.1 : 2 → 1 (8 GB RAM — économise ~0.35 GB de KV cache)
