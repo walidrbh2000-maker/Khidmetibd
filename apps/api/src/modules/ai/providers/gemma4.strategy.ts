@@ -1,41 +1,43 @@
 // apps/api/src/modules/ai/providers/gemma4.strategy.ts
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// MIGRATION v14 — Gemma4 E2B : modèle unique texte + image + AUDIO natif
+// MIGRATION v14.1 — Correctifs audio Gemma4 natif sur CPU 8 GB RAM
 //
-// AVANT (v13) :
-//   - ai-gemma4:8011 (llama.cpp) → texte + images
-//   - ai-audio:8000  (Whisper)   → audio STT → texte → Gemma4
-//   → 2 services IA, 2 circuits, pipeline deux-étapes pour audio
+// CHANGEMENTS v14.1 vs v14.0 :
 //
-// APRÈS (v14) :
-//   - ai-gemma4:8011 (llama.cpp) → texte + images + AUDIO natif
-//   → 1 seul service IA, inférence unique audio → JSON intent
+// 1. VALIDATION TAILLE AUDIO (nouveau)
+//    Limite stricte : 5 MB (~30s WAV 16kHz mono)
+//    Raison : llama.cpp refuse silencieusement les audio > 30s.
+//    Un fichier de 60s ne produit pas d'erreur mais tronque le résultat.
+//    Le circuit breaker s'ouvre alors pour rien.
+//    → Rejet explicite côté NestJS avant l'envoi à Gemma4.
+//
+// 2. FORMAT AUDIO NORMALISÉ AVANT ENVOI (nouveau)
+//    Certains clients envoient "audio/wav" avec des headers non-standard.
+//    On force systématiquement le format "wav" dans l'API call (sauf m4a/mp3).
+//    Raison : llama.cpp mtmd utilise le champ "format" pour choisir le décodeur.
+//    Un format inconnu → erreur 400 silencieuse "failed to decode image bytes".
+//
+// 3. TIMEOUT AUDIO AUGMENTÉ (env GEMMA4_TIMEOUT_MS)
+//    .env : 30000 → 90000 ms
+//    Le strategy lit GEMMA4_TIMEOUT_MS depuis l'env — aucun changement de code.
+//    Mais le fallback interne dans processAudio passe de 45s à 90s.
+//
+// INCHANGÉ vs v14.0 :
+//   - Pipeline single-step (audio → JSON intent direct via Gemma4 natif)
+//   - Format API OpenAI-compatible : { type: "input_audio", input_audio: {...} }
+//   - AUDIO_INTENT_SYSTEM_PROMPT (vocabulaire Darija algérienne)
+//   - cleanResponse(), detectImageMime(), normalizeMime(), mimeToExt()
 //
 // BASE TECHNIQUE :
 //   PR ggml-org/llama.cpp#21421 — "mtmd: add Gemma 4 audio conformer encoder support"
-//   Statut : MERGÉ dans master (avril 2026), testé CPU + Vulkan sur E2B et E4B
-//   Ref issue : ggml-org/llama.cpp#21325
-//   Précision : BF16 mmproj recommandé — f32 mmproj (déjà téléchargé) = encore meilleur
+//   Statut : MERGÉ dans master (avril 2026)
+//   mmproj BF16 requis (recommandé par PR#21421) — f32/f16 fonctionnent mais
+//   qualité audio réduite pour l'encodeur conformer USM-style.
 //
-// FORMAT AUDIO API (OpenAI-compatible, llama.cpp/mtmd) :
-//   { type: "input_audio", input_audio: { data: "<base64>", format: "wav" } }
-//   Recommandation : audio WAV 16kHz mono pour meilleure précision
-//   Limite Gemma4   : 30 secondes maximum
-//
-// AVANTAGES vs Whisper :
-//   ✅ ~2 GB RAM économisés (Whisper retiré)
-//   ✅ 1 seul container IA (au lieu de 2)
-//   ✅ Audio → JSON intent en une seule inférence (plus de pipeline deux-étapes)
-//   ✅ Darija algérienne mieux comprise (Gemma4 = 140+ langues, mixte Darija/FR natif)
-//   ✅ Pas de téléchargement Whisper au premier lancement
-//   ✅ Scalabilité E4B GPU : même code, performances x5-10
-//
-// NOTE FORMAT AUDIO :
-//   WAV  : supporté nativement par llama.cpp/libsndfile ✅
-//   M4A  : si refusé, convertir en WAV côté client (recommandé)
-//   MP3  : même recommandation
-//   Pour conversion automatique côté serveur : ajouter ffmpeg-static (v15)
+// FORMAT AUDIO RECOMMANDÉ :
+//   WAV 16kHz mono, max 30 secondes (~5 MB)
+//   Format envoyé à llama.cpp : { type: "input_audio", input_audio: { data: "base64", format: "wav" } }
 // ══════════════════════════════════════════════════════════════════════════════
 
 import { Injectable, Logger } from '@nestjs/common';
@@ -77,14 +79,23 @@ interface LlamaCppErrorBody {
   error?: string | { message?: string };
 }
 
+// ── Constantes audio ──────────────────────────────────────────────────────────
+
+// Limite Gemma4 : 30 secondes audio maximum
+// WAV 16kHz mono 16-bit = 32 000 bytes/s → 30s = ~960 000 bytes ≈ 1 MB
+// WAV 16kHz mono 32-bit = 64 000 bytes/s → 30s = ~1 920 000 bytes ≈ 2 MB
+// Marge de sécurité à 5 MB (couvre WAV 44kHz stéréo ~28s)
+const MAX_AUDIO_BYTES = 5 * 1024 * 1024; // 5 MB
+
+// Timeout audio par défaut si GEMMA4_TIMEOUT_MS n'est pas défini
+// L'audio mel spectrogram sur CPU prend 20-60s selon la longueur
+const AUDIO_TIMEOUT_FALLBACK_MS = 90_000;
+
 // ── System prompt audio ───────────────────────────────────────────────────────
 //
 // Identique au SYSTEM_PROMPT de intent-extractor.service.ts
-// Séparé ici pour éviter la dépendance circulaire entre le provider et le service.
-// Si le prompt évolue dans intent-extractor, mettre à jour ici aussi.
-//
-// Ce prompt est utilisé en mode audio natif (single-step audio → JSON intent).
-// L'audio et le texte sont traités en une seule inférence par Gemma4.
+// Copie intentionnelle pour éviter la dépendance circulaire provider ↔ service.
+// Si le prompt évolue dans intent-extractor, répercuter ici.
 
 const AUDIO_INTENT_SYSTEM_PROMPT = `\
 Tu es l'extracteur d'intention de Khidmeti — application algérienne de services à domicile.
@@ -144,7 +155,8 @@ confidence : 0.0 à 1.0 — mettre 0.0 si profession introuvable, pas null
 
 /**
  * Supprime les balises de "thinking" que Gemma4 peut émettre malgré
- * enable_thinking:false (cas rares ou version llama.cpp ancienne).
+ * enable_thinking:false (cas rares ou ancienne version de llama.cpp).
+ * Nettoie également les backticks markdown résiduels.
  */
 function cleanResponse(raw: string): string {
   return raw
@@ -166,18 +178,18 @@ export class Gemma4Strategy implements IAiProvider {
 
   constructor() {
     this.gemma4Url     = process.env['GEMMA4_BASE_URL']    ?? 'http://ai-gemma4:8011';
-    this.gemma4Timeout = parseInt(process.env['GEMMA4_TIMEOUT_MS'] ?? '45000', 10);
+    this.gemma4Timeout = parseInt(process.env['GEMMA4_TIMEOUT_MS'] ?? String(AUDIO_TIMEOUT_FALLBACK_MS), 10);
 
     this.logger.log(
-      `✅ Gemma4Strategy v14 — single-model multimodal (texte + image + audio)\n` +
-      `   └─ endpoint : ${this.gemma4Url}  (timeout=${this.gemma4Timeout}ms)\n` +
-      `   ℹ️  Audio natif via llama.cpp PR#21421 — mmproj f32 inclut l'encodeur audio`,
+      `✅ Gemma4Strategy v14.1 — single-model multimodal (texte + image + audio natif)\n` +
+      `   └─ endpoint  : ${this.gemma4Url}\n` +
+      `   └─ timeout   : ${this.gemma4Timeout}ms\n` +
+      `   └─ audio max : ${MAX_AUDIO_BYTES / 1024 / 1024} MB (~30s WAV 16kHz)\n` +
+      `   ℹ️  Audio natif via llama.cpp PR#21421 — mmproj BF16 requis`,
     );
   }
 
   // ── IAiProvider : generateText ─────────────────────────────────────────────
-  //
-  // Extraction d'intention depuis un texte (Darija / Français / Arabe / mix).
 
   async generateText(
     prompt:       string,
@@ -194,8 +206,6 @@ export class Gemma4Strategy implements IAiProvider {
   }
 
   // ── IAiProvider : analyzeImage ─────────────────────────────────────────────
-  //
-  // Single-step avec Gemma4 natif — image + texte dans une seule inférence.
 
   async analyzeImage(
     imageBase64: string,
@@ -225,42 +235,54 @@ export class Gemma4Strategy implements IAiProvider {
 
   // ── IAiProvider : processAudio ─────────────────────────────────────────────
   //
-  // v14 — Audio natif Gemma4 via llama.cpp (PR#21421 mergé)
+  // v14.1 — Correctifs audio natif Gemma4 sur CPU 8 GB RAM
   //
-  // PIPELINE v14 (single-step) :
-  //   Audio → Gemma4 (audio + system prompt) → JSON intent
-  //   SUPPRIMÉ : Whisper STT → texte → Gemma4 (pipeline deux-étapes v13)
+  // VALIDATION (nouveau v14.1) :
+  //   1. Taille : rejet si > MAX_AUDIO_BYTES (5 MB ≈ 30s WAV 16kHz)
+  //      Raison : llama.cpp tronque silencieusement l'audio > 30s
+  //      → le circuit breaker s'ouvre pour un timeout évitable.
   //
-  // FORMAT API llama.cpp/mtmd (OpenAI-compatible) :
-  //   { type: "input_audio", input_audio: { data: "base64...", format: "wav" } }
+  // FORMAT AUDIO (normalisé v14.1) :
+  //   On force "wav" comme format par défaut pour les MIME non reconnus.
+  //   llama.cpp mtmd utilise ce champ pour sélectionner le décodeur audio.
+  //   Un format inconnu → "failed to decode image bytes" (erreur 400).
   //
-  // TIMEOUT AUDIO : 45s (plus long que texte — décodage mel spectrogram sur CPU)
-  // FORMATS RECOMMANDÉS : WAV 16kHz mono (qualité optimale pour conformer encoder)
-  // LIMITE GEMMA4 : 30 secondes d'audio maximum
-  //
-  // COMPATIBILITÉ INTERFACE :
-  //   Retourne AudioResult { text: jsonString, language: 'auto' }
-  //   Le jsonString est le JSON intent (parsé par IntentExtractorService)
+  // PIPELINE (inchangé vs v14.0) :
+  //   Audio → Gemma4 (audio natif PR#21421) → JSON intent direct
+  //   Format API : { type: "input_audio", input_audio: { data: "base64", format: "wav" } }
 
   async processAudio(
     buffer: Buffer,
     mime:   string,
     _opts:  { temperature?: number; maxTokens?: number } = {},
   ): Promise<AudioResult> {
+    // ── Validation taille (v14.1) ────────────────────────────────────────────
+    if (buffer.length > MAX_AUDIO_BYTES) {
+      throw new Error(
+        `Audio trop long : ${(buffer.length / 1024 / 1024).toFixed(1)} MB ` +
+        `(max ${MAX_AUDIO_BYTES / 1024 / 1024} MB ≈ 30s WAV 16kHz mono). ` +
+        `Raccourcissez l'enregistrement ou réduisez la qualité (16kHz mono recommandé).`,
+      );
+    }
+
     const normalizedMime = this.normalizeMime(mime);
     const ext            = this.mimeToExt(normalizedMime);
     const audioBase64    = buffer.toString('base64');
 
     this.logger.debug(
-      `Audio natif Gemma4 — format=${ext} taille=${(buffer.length / 1024).toFixed(0)}KB`,
+      `Audio natif Gemma4 v14.1 — ` +
+      `format=${ext} taille=${(buffer.length / 1024).toFixed(0)} KB ` +
+      `mime_original=${mime} mime_normalisé=${normalizedMime}`,
     );
 
-    // Gemma4 : recommandation Google — placer audio AVANT le texte dans le prompt
-    // Le système prompt contient le schéma JSON + vocabulaire Darija algérienne
+    // ── Envoi à Gemma4 (format API mtmd OpenAI-compatible) ───────────────────
+    //
+    // Google recommande de placer l'audio AVANT le texte dans le contenu user.
+    // Le system prompt contient : schéma JSON + professions + vocabulaire Darija.
     const raw = await this.chat(
       [
         {
-          role: 'system',
+          role:    'system',
           content: AUDIO_INTENT_SYSTEM_PROMPT,
         },
         {
@@ -285,20 +307,21 @@ export class Gemma4Strategy implements IAiProvider {
       },
     );
 
-    // raw = réponse JSON de Gemma4 (le JSON intent)
-    // language 'auto' : Gemma4 comprend le mix nativement, pas besoin de détecter
+    // language 'auto' : Gemma4 comprend le mix nativement (140+ langues)
     return { text: raw, language: 'auto' };
   }
 
   // ── Privé : chat générique ────────────────────────────────────────────────
   //
-  // Unique méthode HTTP vers ai-gemma4:8011 (texte, images ET audio).
+  // Point d'entrée unique vers ai-gemma4:8011 pour texte, images ET audio.
   //
-  // GEMMA4 PARAMS RECOMMANDÉS (Google) :
-  //   temp=1.0, top_p=0.95, top_k=64 — mais on override temp=0.05 pour JSON structuré
+  // PARAMÈTRES GEMMA4 (Google recommandations) :
+  //   temp=1.0, top_p=0.95, top_k=64 en général
+  //   temp=0.05 overridé ici pour JSON structuré (pas de créativité)
   //
-  // ENABLE_THINKING : false → supprime le CoT <|think|> pour un JSON direct
-  //   Si le serveur llama.cpp ne supporte pas l'option, cleanResponse() filtre les tags.
+  // ENABLE_THINKING: false
+  //   Désactive le Chain-of-Thought <|think|> pour un JSON direct.
+  //   cleanResponse() filtre les tags résiduels si le serveur ne supporte pas.
 
   private async chat(
     messages: ChatMessage[],
@@ -324,7 +347,9 @@ export class Gemma4Strategy implements IAiProvider {
         }),
       }).catch((e: unknown) => {
         if ((e as Error).name === 'AbortError') throw e;
-        throw new Error(`Gemma4 fetch failed [${this.gemma4Url}]: ${(e as Error).message}`);
+        throw new Error(
+          `Gemma4 fetch failed [${this.gemma4Url}]: ${(e as Error).message}`,
+        );
       });
 
       if (!res.ok) {
@@ -337,20 +362,22 @@ export class Gemma4Strategy implements IAiProvider {
               ? parsed.error
               : (parsed.error.message ?? rawBody);
           }
-        } catch { /* raw body pas du JSON */ }
+        } catch { /* raw body non-JSON */ }
 
         if (res.status === 404) {
           throw new Error(
-            `Gemma4 modèle introuvable sur ${this.gemma4Url}. Lancez: make download-gemma4`,
+            `Gemma4 modèle introuvable sur ${this.gemma4Url}. ` +
+            `Lancez : make download-gemma4`,
           );
         }
 
-        // Audio spécifique : si 400/422 → format audio probablement non supporté
+        // Erreur 400/422 audio : format non supporté ou mmproj absent/incorrect
         if (res.status === 400 || res.status === 422) {
           throw new Error(
             `Gemma4 audio non supporté (${res.status}): ${errMsg}. ` +
-            `Assurez-vous que llama.cpp >= b4900 et que le mmproj f32 est chargé. ` +
-            `Format WAV 16kHz recommandé.`,
+            `Vérifiez : (1) llama.cpp image récente avec PR#21421, ` +
+            `(2) mmproj BF16 présent dans docker/models/gemma4/, ` +
+            `(3) format audio WAV 16kHz mono < 30s.`,
           );
         }
 
@@ -372,7 +399,7 @@ export class Gemma4Strategy implements IAiProvider {
       if ((err as Error).name === 'AbortError') {
         throw new Error(
           `Gemma4 timeout (${this.gemma4Timeout}ms) [${this.gemma4Url}]. ` +
-          `Audio : vérifiez que le fichier fait <30s et que le mmproj f32 est présent.`,
+          `Audio : vérifiez que le fichier fait <30s et que GEMMA4_TIMEOUT_MS=90000 dans .env.`,
         );
       }
       throw err;
@@ -383,29 +410,54 @@ export class Gemma4Strategy implements IAiProvider {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
+  /**
+   * Détecte le MIME type d'une image par magic bytes.
+   * Plus fiable que le Content-Type HTTP (souvent absent ou incorrect).
+   */
   private detectImageMime(buf: Buffer): string {
     if (buf.length < 12) return 'image/jpeg';
-    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+      return 'image/jpeg';
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+      return 'image/png';
     if (
       buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
       buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
     ) return 'image/webp';
-    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46)
+      return 'image/gif';
     return 'image/jpeg';
   }
 
+  /**
+   * Normalise les MIME types audio vers des formes canoniques.
+   * Cas fréquents : Android envoie audio/x-wav, iOS envoie audio/x-m4a.
+   * application/octet-stream → on suppose WAV (format le plus courant en dev).
+   */
   private normalizeMime(mime: string): string {
-    const map: Record<string, string> = {
-      'audio/x-wav':  'audio/wav',
-      'audio/x-m4a':  'audio/mp4',
-      'audio/mpeg':   'audio/mp3',
-      'audio/x-mpeg': 'audio/mp3',
-    };
     if (!mime || mime === 'application/octet-stream') return 'audio/wav';
+    const map: Record<string, string> = {
+      'audio/x-wav':       'audio/wav',
+      'audio/wave':        'audio/wav',
+      'audio/vnd.wave':    'audio/wav',
+      'audio/x-m4a':       'audio/mp4',
+      'audio/x-mp4':       'audio/mp4',
+      'audio/mpeg':        'audio/mp3',
+      'audio/x-mpeg':      'audio/mp3',
+      'audio/mpeg3':       'audio/mp3',
+      'audio/x-mpeg3':     'audio/mp3',
+      'audio/ogg':         'audio/ogg',
+      'audio/x-ogg':       'audio/ogg',
+      'audio/vorbis':      'audio/ogg',
+    };
     return map[mime] ?? mime;
   }
 
+  /**
+   * Convertit un MIME type audio en extension de fichier pour l'API llama.cpp.
+   * llama.cpp mtmd utilise l'extension pour sélectionner le décodeur audio.
+   * Défaut "wav" si inconnu — le plus compatible avec libsndfile.
+   */
   private mimeToExt(mime: string): string {
     const map: Record<string, string> = {
       'audio/wav':  'wav',
