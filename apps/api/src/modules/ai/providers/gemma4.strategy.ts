@@ -1,9 +1,9 @@
 // apps/api/src/modules/ai/providers/gemma4.strategy.ts
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// MIGRATION v14.1 — Correctifs audio Gemma4 natif sur CPU 8 GB RAM
+// MIGRATION v14.2 — Correctifs audio Gemma4 natif sur CPU 8 GB RAM
 //
-// CHANGEMENTS v14.1 vs v14.0 :
+// CHANGEMENTS v14.2 vs v14.1 :
 //
 // 1. VALIDATION TAILLE AUDIO (nouveau)
 //    Limite stricte : 5 MB (~30s WAV 16kHz mono)
@@ -181,7 +181,7 @@ export class Gemma4Strategy implements IAiProvider {
     this.gemma4Timeout = parseInt(process.env['GEMMA4_TIMEOUT_MS'] ?? String(AUDIO_TIMEOUT_FALLBACK_MS), 10);
 
     this.logger.log(
-      `✅ Gemma4Strategy v14.1 — single-model multimodal (texte + image + audio natif)\n` +
+      `✅ Gemma4Strategy v14.2 — single-model multimodal (texte + image + audio natif)\n` +
       `   └─ endpoint  : ${this.gemma4Url}\n` +
       `   └─ timeout   : ${this.gemma4Timeout}ms\n` +
       `   └─ audio max : ${MAX_AUDIO_BYTES / 1024 / 1024} MB (~30s WAV 16kHz)\n` +
@@ -437,15 +437,22 @@ export class Gemma4Strategy implements IAiProvider {
   private normalizeMime(mime: string): string {
     if (!mime || mime === 'application/octet-stream') return 'audio/wav';
     const map: Record<string, string> = {
+      // WAV — toutes les variantes
       'audio/x-wav':       'audio/wav',
       'audio/wave':        'audio/wav',
       'audio/vnd.wave':    'audio/wav',
+      // M4A / MP4 — iOS envoie audio/x-m4a, Android envoie audio/m4a ou audio/mp4
+      // BUG v14.1 : 'audio/m4a' manquait → tombait dans le fallback 'audio/wav'
+      //             → llama.cpp recevait des données m4a avec format='wav' → erreur decode
+      'audio/m4a':         'audio/mp4',
       'audio/x-m4a':       'audio/mp4',
       'audio/x-mp4':       'audio/mp4',
+      // MP3
       'audio/mpeg':        'audio/mp3',
       'audio/x-mpeg':      'audio/mp3',
       'audio/mpeg3':       'audio/mp3',
       'audio/x-mpeg3':     'audio/mp3',
+      // OGG
       'audio/ogg':         'audio/ogg',
       'audio/x-ogg':       'audio/ogg',
       'audio/vorbis':      'audio/ogg',
