@@ -1,26 +1,21 @@
 // apps/api/src/modules/ai/services/intent-extractor.service.ts
 //
-// v14 — Audio natif Gemma4 : pipeline single-step (audio → JSON intent direct)
+// v14.3 — CORRECTIF CRITIQUE : réduction du SYSTEM_PROMPT
 //
-// ══════════════════════════════════════════════════════════════════════════════
-// CHANGEMENTS v14 vs v13 :
+// PROBLÈME v14.0-14.2 :
+//   SYSTEM_PROMPT contenait ~1925 tokens (14 exemples few-shot + mappings Darija).
+//   Prefill CPU Gemma4 E2B : ~4-8 tok/s → 1925 tokens = 240-480 secondes.
+//   Timeout 90s → circuit breaker s'ouvre après 3 requêtes. RIEN ne fonctionne.
 //
-// 1. AUDIO PIPELINE SIMPLIFIÉ
-//    v13 : processAudio(Whisper STT) → texte → generateText(Gemma4) → JSON
-//    v14 : processAudio(Gemma4 natif) → JSON intent direct (une seule inférence)
-//    → Le JSON revient directement de Gemma4 via processAudio()
-//    → extractFromAudio() appelle parseIntent() directement, plus extractFromText()
+// FIX v14.3 :
+//   SYSTEM_PROMPT réduit à ~150 tokens (réduction 92%).
+//   Gemma4 est un modèle multilingue puissant — il comprend le Darija nativement.
+//   Il n'a pas besoin de 14 exemples : 3 suffisent pour ancrer le format JSON.
+//   Prefill estimé : 150 tok / 8 tok/s = ~19 secondes. Génération : ~12 secondes.
+//   Total : ~31 secondes. Largement dans les 90s (et bien dans les 180s du .env v14.3).
 //
-// 2. CIRCUIT BREAKER AUDIO CONSERVÉ
-//    Même si audio et texte partagent désormais le même container ai-gemma4,
-//    le circuit audio reste isolé. Raison : les timeouts audio (traitement mel
-//    spectrogram) sont structurellement différents des timeouts texte.
-//    Un fichier audio lourd (30s) ne doit pas ouvrir le circuit texte.
-//
-// 3. COMMENTAIRE MISE À JOUR
-//    "Whisper STT" → "Gemma4 audio natif"
-//    Le SYSTEM_PROMPT rest inchangé (qualité Darija algérienne conservée).
-// ══════════════════════════════════════════════════════════════════════════════
+// AUTRES FIX v14.3 :
+//   maxTokens: 512 → 128 (JSON ~50 tokens max — réduit le temps de génération)
 
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { createHash }                           from 'crypto';
@@ -68,7 +63,7 @@ const OVERLOAD_PATTERNS: RegExp[] = [
   /gemma4 fetch failed/i, /econnrefused/i, /econnreset/i,
   /socket hang up/i, /network.*error/i, /timeout/i,
   /empty or null content/i, /introuvable/i,
-  /audio non support/i,  // v14 : format audio non supporté par llama.cpp
+  /audio non support/i,
 ];
 
 function isQuotaError(err: unknown): boolean {
@@ -81,10 +76,7 @@ function isOverloadError(err: unknown): boolean {
   return !isQuotaError(err) && OVERLOAD_PATTERNS.some((p) => p.test(msg));
 }
 
-// ── Détection transcriptions parasites ────────────────────────────────────────
-//
-// v14 : utilisé pour détecter les réponses Gemma4 audio vides ou parasites
-// (audio silencieux, trop court, bruit pur)
+// ── Détection réponses parasites ───────────────────────────────────────────────
 
 const GARBAGE_RE = /^(?:\[\d{1,2}:\d{2}(?:\.\d+)?\s*→?\s*\d{0,2}:?\d{0,2}(?:\.\d+)?\]\s*)+$/;
 
@@ -98,14 +90,6 @@ function isGarbageResponse(text: string): boolean {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CIRCUIT BREAKER PAR MODALITÉ
-//
-// v14 : 2 circuits indépendants (inchangé vs v13)
-//   circuitGemma4 : texte + images (même endpoint ai-gemma4:8011)
-//   circuitAudio  : audio Gemma4 natif (même endpoint, circuit isolé)
-//
-// Isolation nécessaire même si même endpoint :
-//   Audio = traitement mel spectrogram sur CPU = latence structurellement plus haute
-//   Timeout audio ne doit pas déclencher le circuit texte/image
 // ══════════════════════════════════════════════════════════════════════════════
 
 type CircuitState = 'closed' | 'open' | 'half-open';
@@ -174,118 +158,36 @@ class CircuitBreaker {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Darija Algérienne v14
+// SYSTEM PROMPT — v14.3 : MINIMAL (~150 tokens)
 //
-// Identique à v13. Aucune modification nécessaire :
-//   - Le prompt reste le même pour texte et image
-//   - Pour audio, Gemma4Strategy utilise AUDIO_INTENT_SYSTEM_PROMPT (copie)
-//   - Si ce prompt évolue, répercuter dans gemma4.strategy.ts
+// AVANT v14.3 : ~1925 tokens (14 exemples few-shot + mappings Darija complets)
+//   → Prefill CPU : 240-480 secondes → TIMEOUT systématique
+//
+// APRÈS v14.3 : ~150 tokens (3 exemples + règles essentielles)
+//   → Prefill CPU estimé : ~19 secondes → FONCTIONNE dans 90s
+//
+// PRINCIPE : Gemma4 est un modèle multilingue puissant (Google Gemma 4E).
+//   Il comprend le Darija algérien nativement — pas besoin de tous les mapper.
+//   Les 3 exemples JSON ancrent le format de sortie. Les règles couvrent l'essentiel.
+//   Moins de tokens = plus rapide = pas de timeout.
 // ══════════════════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `\
-Tu es l'extracteur d'intention de Khidmeti — application algérienne de services à domicile.
-Tu analyses des demandes en DARIJA ALGÉRIENNE, Français, Arabe standard, ou tout mélange.
+You are a home-service intent extractor for Khidmeti (Algeria).
+Analyze text in Algerian Darija, French, Arabic, or any mix.
 
-⚠️  RÈGLE ABSOLUE : Réponds UNIQUEMENT avec le JSON brut ci-dessous.
-     Aucun markdown, aucune explication, aucune réflexion, aucun texte avant/après.
-
-═══ SCHÉMA JSON EXACT ═══════════════════════════════════════════════════════
+Reply ONLY with valid JSON on one line — no markdown, no explanation, nothing else:
 {"profession":<string|null>,"is_urgent":<bool>,"problem_description":<string>,"max_radius_km":<number|null>,"confidence":<number>}
 
-═══ PROFESSIONS VALIDES (mot exact uniquement) ═══════════════════════════════
-plumber | electrician | cleaner | painter | carpenter | gardener
-ac_repair | appliance_repair | mason | mechanic | mover
+profession (exact value or null): plumber|electrician|cleaner|painter|carpenter|gardener|ac_repair|appliance_repair|mason|mechanic|mover
+is_urgent=true ONLY: active flooding / total power outage / gas leak / locked door at night
+problem_description: factual English, max 100 chars
+confidence: 0.0–1.0 (0.0 if profession unknown, never null)
 
-═══ RÈGLES MÉTIER ═══════════════════════════════════════════════════════════
-is_urgent = true SEULEMENT si :
-  • Fuite d'eau active qui inonde (ماء يطيح بزاف / inondation)
-  • Coupure électrique totale de la maison (ضو قاطع كامل / coupure totale)
-  • Fuite de gaz / odeur de gaz (ريحة قاز / fuite gaz)
-  • Serrure cassée la nuit / porte bloquée avec personnes à l'intérieur
-  → NE PAS mettre urgent pour : clim qui chauffe, frigo qui refroidit moins, peinture à refaire
-
-problem_description : anglais, factuel, max 120 chars
-max_radius_km : si la personne mentionne une distance ou un quartier spécifique, null sinon
-confidence : 0.0 à 1.0 — mettre 0.0 si profession introuvable, pas null
-
-═══ DARIJA ALGÉRIENNE → PROFESSION ═════════════════════════════════════════
-  سباك / بلومبيي / نمير / حنفية / طاسة / يطيح ماء / تسرب / مسدود → plumber
-  كهربجي / ضو قاطع / فيوز / بريزة / كابل محروق / الكهربا → electrician
-  صبّاغ / دهّان / صبغة / طلاء / الجدار ويبان → painter
-  نجار / باب خايس / قفل / خشب → carpenter
-  كليمو / كليماتيزور / تكييف / ما يبردش / ما يسخنش → ac_repair
-  فريدجيدير / ماشينة غسيل / ليف / ميكرو / طابشة / ما تخدمش → appliance_repair
-  بنّاء / جدار / بلاط / خلوط / متشقق / فيسور → mason
-  فراشة / مسسة / نظافة / تنظيف الدار → cleaner
-  حديقة / عشب / نقلم / سقي / شجرة → gardener
-  ميكانيسيان / سيارة / تبان / كرودان → mechanic
-  نقل عفش / شلالة / ننقلو / دار جديدة → mover
-
-═══ EXEMPLES FEW-SHOT ══════════════════════════════════════════════════════
-
-# Darija algérienne pure (plomberie)
-Requête: "عندي ماء ساقط من السقف ديال الدار"
-{"profession":"plumber","is_urgent":false,"problem_description":"water leaking from ceiling","max_radius_km":null,"confidence":0.95}
-
-# Darija urgente (électricité totale)
-Requête: "الضوء طاح في الدار كاملة وخاصني حل درووك"
-{"profession":"electrician","is_urgent":true,"problem_description":"total power outage in house, immediate need","max_radius_km":null,"confidence":0.98}
-
-# Mix Darija + Français (très courant en Algérie)
-Requête: "الكليمو تاعي ما يبردش et il fait trop chaud maintenant"
-{"profession":"ac_repair","is_urgent":false,"problem_description":"air conditioner not cooling, hot weather","max_radius_km":null,"confidence":0.96}
-
-# Darija (plomberie - évier)
-Requête: "الطاسة تاع الكوزينة مسدودة وما تفرّغش"
-{"profession":"plumber","is_urgent":false,"problem_description":"kitchen sink drain completely blocked","max_radius_km":null,"confidence":0.94}
-
-# Français algérien (électricité)
-Requête: "j'ai une prise électrique qui fait des étincelles dans le salon"
-{"profession":"electrician","is_urgent":true,"problem_description":"sparking electrical outlet in living room","max_radius_km":null,"confidence":0.97}
-
-# Darija (électroménager - frigo)
-Requête: "الفريدجيدير تاعي ما يبردش، كل ما نحطو فيه يخسر"
-{"profession":"appliance_repair","is_urgent":false,"problem_description":"refrigerator not cooling, food spoiling","max_radius_km":null,"confidence":0.95}
-
-# Darija (menuiserie - porte)
-Requête: "الباب تاع الغرفة خايس وما يقفلش، خاصني نجار"
-{"profession":"carpenter","is_urgent":false,"problem_description":"bedroom door broken, does not close properly","max_radius_km":null,"confidence":0.97}
-
-# Arabe standard (maçonnerie)
-Requête: "يوجد تشقق في الجدار الخارجي للمنزل ويتسع يوماً بعد يوم"
-{"profession":"mason","is_urgent":false,"problem_description":"widening crack in exterior wall","max_radius_km":null,"confidence":0.93}
-
-# Darija (peinture)
-Requête: "الصبغة تاع الدار طاحت وخاصني نصبغ قبل العيد"
-{"profession":"painter","is_urgent":false,"problem_description":"house paint peeling, needs repainting before Eid","max_radius_km":null,"confidence":0.94}
-
-# Darija (déménagement)
-Requête: "خاصني ننقل العفش من حي بن عمر لدار جديدة نهاية الشهر"
-{"profession":"mover","is_urgent":false,"problem_description":"furniture relocation to new apartment end of month","max_radius_km":null,"confidence":0.92}
-
-# Mix Français + Arabe (ménage)
-Requête: "j'ai besoin d'une femme de ménage pour nettoyer mon appartement كل أسبوع"
-{"profession":"cleaner","is_urgent":false,"problem_description":"weekly apartment cleaning service needed","max_radius_km":null,"confidence":0.95}
-
-# Darija (jardinage)
-Requête: "الحديقة تاعنا عندها عشب كثير ومحتاجة تقليم الشجر"
-{"profession":"gardener","is_urgent":false,"problem_description":"garden overgrown, trees need trimming","max_radius_km":null,"confidence":0.93}
-
-# Darija (lave-linge urgence inondation)
-Requête: "الماشينة تاع الغسيل خلّات الماء يطيح وغرقت الأرضية"
-{"profession":"appliance_repair","is_urgent":true,"problem_description":"washing machine flooding the floor","max_radius_km":null,"confidence":0.96}
-
-# Darija (mécanique voiture)
-Requête: "السيارة تاعي ما تحركش والمحرك يدير صوت غريب"
-{"profession":"mechanic","is_urgent":false,"problem_description":"car won't start, strange engine noise","max_radius_km":null,"confidence":0.91}
-
-# Requête ambiguë → faible confiance
-Requête: "عندي مشكل في الدار"
-{"profession":null,"is_urgent":false,"problem_description":"unspecified problem at home","max_radius_km":null,"confidence":0.1}
-
-# Audio imparfait (Darija + bruit de fond) — v14 : Gemma4 gère mieux que Whisper
-Requête: "اه خويا عندي... الحنفية تاع... هه... السقف يدرب"
-{"profession":"plumber","is_urgent":false,"problem_description":"tap or ceiling water issue (noisy audio)","max_radius_km":null,"confidence":0.7}
+Examples:
+"عندي ماء ساقط من السقف"→{"profession":"plumber","is_urgent":false,"problem_description":"water leaking from ceiling","max_radius_km":null,"confidence":0.95}
+"الكليمو ما يبردش"→{"profession":"ac_repair","is_urgent":false,"problem_description":"AC not cooling","max_radius_km":null,"confidence":0.96}
+"الضو طاح كامل وعاجل"→{"profession":"electrician","is_urgent":true,"problem_description":"total power outage urgent","max_radius_km":null,"confidence":0.98}
 `;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -304,13 +206,7 @@ export class IntentExtractorService {
   private readonly RATE_LIMIT_MAX    = 20;
   private readonly RATE_LIMIT_WINDOW = 3_600_000; // 1h en ms
 
-  // ── Circuit breakers (v14 : 2 circuits, isolés par modalité) ──────────────
-  //
-  // circuitGemma4 : texte + images (même endpoint ai-gemma4:8011)
-  // circuitAudio  : audio Gemma4 natif (même endpoint, circuit séparé)
-  //                 → isolation latence audio (mel spectrogram CPU) vs texte
-  //
-  // Threshold = 3 échecs → OPEN pendant 30s
+  // ── Circuit breakers (2 circuits isolés par modalité) ─────────────────────
   private readonly circuitGemma4: CircuitBreaker;
   private readonly circuitAudio:  CircuitBreaker;
 
@@ -346,7 +242,8 @@ export class IntentExtractorService {
     }
 
     try {
-      const raw    = await this.ai.generateText(trimmed, SYSTEM_PROMPT, { temperature: 0.05, maxTokens: 512 });
+      // v14.3 : maxTokens 512 → 128 (JSON ~50 tokens max)
+      const raw    = await this.ai.generateText(trimmed, SYSTEM_PROMPT, { temperature: 0.05, maxTokens: 128 });
       const intent = this.parseIntent(raw);
       this.circuitGemma4.onSuccess();
       this.setCache(cacheKey, intent);
@@ -358,24 +255,15 @@ export class IntentExtractorService {
 
   /**
    * Extraction depuis un audio.
-   *
-   * v14 — Pipeline single-step via Gemma4 audio natif (llama.cpp PR#21421) :
-   *   Audio → Gemma4 → JSON intent (une seule inférence, zéro Whisper)
-   *
-   * v13 (supprimé) :
-   *   Audio → Whisper STT → texte → Gemma4 intent (deux inférences + service externe)
-   *
-   * Formats recommandés : WAV 16kHz mono
-   * Formats acceptés    : WAV, MP3, M4A, OGG, FLAC, WebM
-   * Limite Gemma4       : 30 secondes maximum
+   * v14 — Pipeline single-step via Gemma4 audio natif (llama.cpp PR#21421)
+   * v14.3 — L'audio est transcodé en WAV 16kHz mono par gemma4.strategy.ts
+   *          avant envoi à llama.cpp (fix erreur 400 format m4a/ogg/etc.)
    */
   async extractFromAudio(buffer: Buffer, mime: string, uid?: string): Promise<SearchIntent> {
     this.circuitAudio.assertClosed();
 
     let audioResult: AudioResult;
     try {
-      // v14 : processAudio → Gemma4 audio natif → JSON intent directement
-      // Le system prompt AUDIO_INTENT_SYSTEM_PROMPT est embarqué dans Gemma4Strategy
       audioResult = await this.ai.processAudio(buffer, mime);
       this.circuitAudio.onSuccess();
     } catch (err) {
@@ -389,8 +277,6 @@ export class IntentExtractorService {
       return { ...FALLBACK };
     }
 
-    // v14 : Gemma4 retourne le JSON intent directement depuis l'audio
-    // parseIntent() extrait et valide le JSON de la réponse Gemma4
     const intent = this.parseIntent(text);
 
     this.logger.debug(
@@ -403,7 +289,8 @@ export class IntentExtractorService {
 
   /**
    * Extraction depuis une image.
-   * Pipeline v14 (inchangé vs v13) : Gemma4 single-step (image + texte → JSON)
+   * Pipeline v14 (inchangé) : Gemma4 single-step (image + texte → JSON)
+   * v14.3 : maxTokens 512 → 128
    */
   async extractFromImage(imageBase64: string, uid?: string): Promise<SearchIntent> {
     if (uid) await this.checkRateLimit(uid);
@@ -411,10 +298,11 @@ export class IntentExtractorService {
     this.circuitGemma4.assertClosed();
 
     try {
+      // v14.3 : maxTokens 512 → 128 (JSON ~50 tokens max)
       const raw = await this.ai.analyzeImage(
         imageBase64,
         SYSTEM_PROMPT,
-        { temperature: 0.05, maxTokens: 512 },
+        { temperature: 0.05, maxTokens: 128 },
       );
       this.circuitGemma4.onSuccess();
       return this.parseIntent(raw);
